@@ -1,0 +1,75 @@
+# 资源调查结果
+
+## 活动概况
+
+- 活动类型：{{ info.event_type }}
+- 时间：{{ info.event_time or "未识别" }}
+- 地点：{{ info.event_location or "未识别" }}
+- 原始文本：{{ input_text }}
+
+## 关键人物
+
+{% if info.people %}
+{% for person in info.people %}
+- {{ person.name or "姓名未识别" }}｜{{ person.organization or "单位未识别" }}｜{{ person.title or "职位未识别" }}
+{% endfor %}
+{% else %}
+未识别到可检索的关键人物或单位。
+{% endif %}
+
+## 公开业务信息
+
+{% if web_search_failed %}
+公开网络信息检索失败。
+{% elif web_fetch_failed %}
+公开网页正文抓取失败。
+{% elif claims %}
+{% for claim in claims %}
+- **{{ claim.subject }}**：{{ claim.claim }}  
+  来源：[{{ claim.source_title }}]({{ claim.source_url }})
+{% endfor %}
+{% else %}
+未从已抓取网页中提取到相关公开业务信息。
+{% endif %}
+
+## 公司内部在建项目
+
+{% if internal_search_failed %}
+公司内部项目信息检索失败。
+{% elif active_projects %}
+{% for project in active_projects %}
+- **{{ project.project_name }}**｜客户：{{ project.customer_name }}｜负责人：{{ project.owner_name }}｜匹配：{{ project.match_type }}  
+  {{ project.description }}
+{% endfor %}
+{% else %}
+未检索到相关在建项目。
+{% endif %}
+
+## 公司内部已结项项目
+
+{% if internal_search_failed %}
+公司内部项目信息检索失败。
+{% elif completed_projects %}
+{% for project in completed_projects %}
+- **{{ project.project_name }}**｜客户：{{ project.customer_name }}｜负责人：{{ project.owner_name }}｜匹配：{{ project.match_type }}  
+  {{ project.description }}
+{% endfor %}
+{% else %}
+未检索到相关已结项项目。
+{% endif %}
+
+## 资源关联总结
+
+- 业务关键词：{{ info.keywords | join("、") if info.keywords else "未识别" }}
+- 公开信息：{{ claims | length }} 条
+- 在建项目：{{ active_projects | length }} 个
+- 已结项项目：{{ completed_projects | length }} 个
+
+## 信息缺口
+
+{% if not info.people and not info.keywords %}- 未识别到可检索的关键人物、单位或业务关键词。
+{% endif %}{% if web_search_failed %}- 公开网络信息检索失败。
+{% endif %}{% if web_fetch_failed %}- 公开网页正文抓取失败。
+{% endif %}{% if internal_search_failed %}- 公司内部项目信息检索失败。
+{% endif %}{% if not web_search_failed and not web_fetch_failed and not claims %}- 未提取到公开业务信息。
+{% endif %}

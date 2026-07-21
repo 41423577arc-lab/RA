@@ -1,0 +1,64 @@
+# 资源推动分析报告
+
+{% macro items(values) %}
+{% if values %}
+{% for item in values %}
+- {{ item.text }}{% if item.statement_type != "FACT" %}（{{ "建议" if item.statement_type == "RECOMMENDATION" else "推测" }}）{% endif %}
+{% for ref in item.evidence_refs %}
+{% if ref in evidence_links %}  
+  来源：[{{ evidence_links[ref].label }}]({{ evidence_links[ref].url }})
+{% elif ref in project_refs %}  
+  内部项目：`{{ project_refs[ref].project_id }}`
+{% endif %}
+{% endfor %}
+
+{% endfor %}
+{% else %}
+暂无可靠信息。
+{% endif %}
+{% endmacro %}
+
+## 活动或任务概况
+
+{{ items(content.task_overview) }}
+
+## 人物和公司背景
+
+{{ items(content.person_and_company_summary) }}
+
+## 公开信息摘要
+
+{% if web_search_failed %}公开网络信息检索失败。
+{% elif web_fetch_failed %}公开网页正文抓取失败。
+{% else %}{{ items(content.public_information_summary) }}{% endif %}
+
+## 重点内部项目
+
+{% if internal_search_failed %}公司内部项目信息检索失败。
+{% else %}{{ items(content.priority_projects) }}{% endif %}
+
+## 资源关联分析
+
+{{ items(content.resource_analysis) }}
+
+## 推荐讨论话题
+
+{{ items(content.recommended_topics) }}
+
+## 项目推动建议
+
+{{ items(content.advancement_advice) }}
+
+## 会前准备事项
+
+{{ items(content.preparation_items) }}
+
+## 信息缺口和风险提示
+
+{{ items(content.gaps_and_risks) }}
+
+## 内部项目明细
+
+{% if projects %}{% for project in projects %}
+- `{{ project.project_id }}` {{ project.project_name }}｜客户：{{ project.customer_name }}｜联系人：{{ project.contact_name or "未记录" }}｜负责人：{{ project.owner_name }}｜状态：{{ "在建" if project.status == "ACTIVE" else "已结项" }}
+{% endfor %}{% else %}未检索到相关内部项目。{% endif %}

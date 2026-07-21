@@ -1,0 +1,127 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: resource_agent
+      POSTGRES_USER: resource_agent
+      POSTGRES_PASSWORD: resource_agent
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./seed/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U resource_agent -d resource_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  model-init:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: python /app/seed/model_init.py
+    environment:
+      MODEL_ROOT: /data/models
+    volumes:
+      - model_cache:/data/models
+
+  seed:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: python /app/seed/seed_projects.py
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  mcp-server:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: python -m mcp_server.server
+    env_file: .env
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8001), 2).close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - audio_data:/data/audio
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mcp-server:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: celery -A app.tasks.celery_app.celery_app worker --loglevel=INFO --pool=solo
+    env_file: .env
+    volumes:
+      - audio_data:/data/audio
+      - model_cache:/data/models:ro
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.tasks.celery_app.celery_app inspect ping -d celery@$$HOSTNAME"]
+      interval: 10s
+      timeout: 8s
+      retries: 20
+    depends_on:
+      backend:
+        condition: service_healthy
+      mcp-server:
+        condition: service_healthy
+      model-init:
+        condition: service_completed_successfully
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+      HOSTNAME: 0.0.0.0
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3000"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  model_cache:
+  audio_data:

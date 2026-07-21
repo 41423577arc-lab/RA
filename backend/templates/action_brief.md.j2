@@ -1,0 +1,9 @@
+# 简短行动说明
+
+- 去哪里：{{ content.action_brief.destination or "未确认" }}
+- 和谁见面：{{ content.action_brief.meeting_people | join("、") if content.action_brief.meeting_people else "未确认" }}
+- 主要目标：{{ content.action_brief.objective }}
+- 讨论什么：{{ content.action_brief.discussion_topics | join("、") if content.action_brief.discussion_topics else "未确认" }}
+- 会前联系谁：{{ content.action_brief.internal_contacts | join("、") if content.action_brief.internal_contacts else "暂无明确内部联系人" }}
+- 会前准备：{{ content.action_brief.preparation_items | join("；") if content.action_brief.preparation_items else "核对会面信息" }}
+{% if content.action_brief.risks %}- 风险提示：{{ content.action_brief.risks | join("；") }}{% endif %}
