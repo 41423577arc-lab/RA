@@ -132,8 +132,13 @@ def confirm_task(
     try:
         request = ConfirmationRequest.model_validate(task.confirmation_request)
         understanding = IntentUnderstanding.model_validate(task.llm_understanding)
+        extracted = ExtractedInfo.model_validate(task.extracted_info)
         context = EntityResolver(settings.seed_dir, settings.llm_confirm_threshold).apply_confirmation(
-            request, payload.selections, understanding
+            request,
+            payload.selections,
+            understanding,
+            task.input_text or "",
+            extracted,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

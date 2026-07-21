@@ -106,11 +106,10 @@ class ResearchPipeline:
                 understanding = IntentUnderstanding.model_validate(task.llm_understanding)
                 context = ConfirmedContext.model_validate(task.confirmed_context)
             else:
-                self.repository.update(task_id, status="RULE_EXTRACTING")
+                self.repository.update(task_id, status="CONTEXT_EXTRACTING")
                 extracted = self.extractor.extract(input_text)
                 self.repository.update(task_id, extracted_info=extracted.model_dump(mode="json"))
 
-                self.repository.update(task_id, status="LLM_UNDERSTANDING")
                 understanding = self._with_fallback(
                     "understanding",
                     degraded,
@@ -121,28 +120,25 @@ class ResearchPipeline:
                     task_id, llm_understanding=understanding.model_dump(mode="json")
                 )
 
-                self.repository.update(task_id, status="RESOLVING_ENTITIES")
                 version = int(task.confirmation_version or 0) + 1
-                external_candidates = []
-                resolve_entities = getattr(self.projects, "resolve_entities", None)
-                if resolve_entities:
-                    mentions = unique_non_empty(
-                        [item.mention for item in understanding.people]
-                        + [item.mention for item in understanding.organizations]
-                    )
-                    organizations = unique_non_empty(
-                        [item.organization for item in understanding.people]
-                        + [item.canonical_name for item in understanding.organizations]
-                    )
-                    try:
-                        external_candidates = asyncio.run(
-                            resolve_entities(mentions, organizations)
-                        )
-                    except Exception:
-                        external_candidates = []
                 context, confirmation = self.entity_resolver.resolve(
-                    input_text, understanding, extracted, version, external_candidates
+                    input_text, understanding, extracted, version
                 )
+                lookup = self.entity_resolver.candidate_lookup(
+                    input_text, understanding, extracted
+                )
+                if confirmation and lookup:
+                    mention, organization = lookup
+                    candidates = self._discover_identity_candidates(
+                        task_id, mention, organization, degraded
+                    )
+                    context, confirmation = self.entity_resolver.resolve(
+                        input_text,
+                        understanding,
+                        extracted,
+                        version,
+                        external_candidates=candidates,
+                    )
                 if confirmation:
                     self.repository.update(
                         task_id,
@@ -307,6 +303,27 @@ class ResearchPipeline:
             if audio_path:
                 audio_path.unlink(missing_ok=True)
                 audio_path.with_suffix(".wav").unlink(missing_ok=True)
+
+    def _discover_identity_candidates(
+        self,
+        task_id: str,
+        mention: str,
+        organization: str,
+        degraded: list[str],
+    ):
+        try:
+            query = f'"{organization}" "{mention}" 董事长 总经理 高管'
+            results = asyncio.run(self.web.search([query]))
+            pages = asyncio.run(self.web.extract(results)) if results else []
+            if not pages:
+                return []
+            return self.entity_resolver.candidates_from_web(
+                mention, organization, pages
+            )
+        except Exception:
+            if "identity_candidates" not in degraded:
+                degraded.append("identity_candidates")
+            return []
 
     def _with_fallback(self, node_name: str, degraded: list[str], call, fallback):
         try:

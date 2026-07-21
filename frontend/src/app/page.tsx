@@ -18,6 +18,11 @@ type Mode = "text" | "audio";
 type ReportTab = "detailed" | "action";
 
 type Person = { name?: string; organization?: string; title?: string };
+type EntityMention = {
+  mention: string;
+  canonical_name?: string;
+  needs_confirmation?: boolean;
+};
 type Task = {
   task_id: string;
   status: string;
@@ -29,6 +34,10 @@ type Task = {
     event_location?: string;
     people: Person[];
     keywords: string[];
+  };
+  llm_understanding?: {
+    people: EntityMention[];
+    organizations: EntityMention[];
   };
   web_search_status?: string;
   web_fetch_status?: string;
@@ -46,6 +55,8 @@ type Task = {
         region?: string;
         reason: string;
         confidence: number;
+        source_url?: string;
+        evidence_quote?: string;
       }>;
     }>;
   };
@@ -61,11 +72,12 @@ const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "NEEDS_CONFIRMATIO
 const STATUS_LABELS: Record<string, string> = {
   PENDING: "任务已创建",
   TRANSCRIBING: "正在识别语音",
+  CONTEXT_EXTRACTING: "正在识别人物与企业",
   EXTRACTING: "正在提取关键信息",
   RULE_EXTRACTING: "正在提取关键信息",
   LLM_UNDERSTANDING: "正在理解任务意图",
   RESOLVING_ENTITIES: "正在核对人物身份",
-  NEEDS_CONFIRMATION: "需要确认关键人物",
+  NEEDS_CONFIRMATION: "需要补充或确认信息",
   PLANNING_WEB_SEARCH: "正在规划公开检索",
   WEB_SEARCHING: "正在搜索公开信息",
   WEB_FETCHING: "正在抓取网页正文",
@@ -84,9 +96,7 @@ const STATUS_LABELS: Record<string, string> = {
 const STATUS_ORDER = [
   "PENDING",
   "TRANSCRIBING",
-  "RULE_EXTRACTING",
-  "LLM_UNDERSTANDING",
-  "RESOLVING_ENTITIES",
+  "CONTEXT_EXTRACTING",
   "PLANNING_WEB_SEARCH",
   "WEB_SEARCHING",
   "WEB_FETCHING",
@@ -120,6 +130,7 @@ export default function Home() {
   const [error, setError] = useState("");
   const [reportTab, setReportTab] = useState<ReportTab>("detailed");
   const [selections, setSelections] = useState<Record<string, string>>({});
+  const [manualValues, setManualValues] = useState<Record<string, string>>({});
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -252,14 +263,17 @@ export default function Home() {
     setError("");
     setRecordingSeconds(0);
     setSelections({});
+    setManualValues({});
     setReportTab("detailed");
   };
 
   const confirmEntities = async () => {
     if (!task?.confirmation_request) return;
-    const missing = task.confirmation_request.items.find((item) => !selections[item.mention]);
+    const missing = task.confirmation_request.items.find(
+      (item) => !selections[item.mention] && !manualValues[item.mention]?.trim()
+    );
     if (missing) {
-      setError(`请选择“${missing.mention}”对应的具体人物`);
+      setError(`请选择或填写“${missing.mention}”`);
       return;
     }
     setIsSubmitting(true);
@@ -272,8 +286,8 @@ export default function Home() {
           confirmation_version: task.confirmation_request.version,
           selections: task.confirmation_request.items.map((item) => ({
             mention: item.mention,
-            candidate_id: selections[item.mention],
-            manual_value: null
+            candidate_id: selections[item.mention] || null,
+            manual_value: selections[item.mention] ? null : manualValues[item.mention]?.trim()
           }))
         })
       });
@@ -397,8 +411,22 @@ export default function Home() {
                 <div className="facts-band">
                   <div><span>活动</span><strong>{task.extracted_info.event_type}</strong></div>
                   <div><span>时间</span><strong>{task.extracted_info.event_time ?? "未识别"}</strong></div>
-                  <div><span>人物</span><strong>{task.extracted_info.people.map((person) => person.name).filter(Boolean).join("、") || "未识别"}</strong></div>
-                  <div><span>关键词</span><strong>{task.extracted_info.keywords.join("、") || "未识别"}</strong></div>
+                  <div>
+                    <span>人物</span>
+                    <strong>
+                      {task.llm_understanding?.people.map((person) =>
+                        `${person.canonical_name ?? person.mention}${person.needs_confirmation ? "（待确认）" : ""}`
+                      ).join("、") || "未识别"}
+                    </strong>
+                  </div>
+                  <div>
+                    <span>企业</span>
+                    <strong>
+                      {task.llm_understanding?.organizations.map((organization) =>
+                        organization.canonical_name ?? organization.mention
+                      ).join("、") || "未识别"}
+                    </strong>
+                  </div>
                 </div>
               )}
 
@@ -406,13 +434,17 @@ export default function Home() {
                 <div className="error-banner"><AlertCircle size={17} />{task.error_message ?? "任务处理失败"}</div>
               )}
 
+              {task.status === "NEEDS_CONFIRMATION" && error && (
+                <div className="error-banner"><AlertCircle size={17} />{error}</div>
+              )}
+
               {task.status === "NEEDS_CONFIRMATION" && task.confirmation_request && (
                 <section className="confirmation-panel">
-                  <div className="section-label">身份确认</div>
-                  <h2>请选择本次调查对应的具体人物</h2>
+                  <div className="section-label">关键信息确认</div>
+                  <h2>请确认候选项，或直接填写缺失的人物与企业信息</h2>
                   {task.confirmation_request.items.map((item) => (
                     <fieldset key={item.mention}>
-                      <legend>输入称呼：{item.mention}</legend>
+                      <legend>{item.mention}</legend>
                       {item.candidates.map((candidate) => (
                         <label key={candidate.candidate_id} className="candidate-option">
                           <input
@@ -420,15 +452,35 @@ export default function Home() {
                             name={item.mention}
                             value={candidate.candidate_id}
                             checked={selections[item.mention] === candidate.candidate_id}
-                            onChange={() => setSelections((current) => ({ ...current, [item.mention]: candidate.candidate_id }))}
+                            onChange={() => {
+                              setSelections((current) => ({ ...current, [item.mention]: candidate.candidate_id }));
+                              setManualValues((current) => ({ ...current, [item.mention]: "" }));
+                            }}
                           />
                           <span>
                             <strong>{candidate.canonical_name}</strong>
                             <small>{[candidate.organization, candidate.title, candidate.region].filter(Boolean).join("｜")}</small>
                             <small>{candidate.reason}｜置信度 {(candidate.confidence * 100).toFixed(0)}%</small>
+                            {candidate.evidence_quote && <small>依据：{candidate.evidence_quote}</small>}
+                            {candidate.source_url && <small className="candidate-source">来源：{candidate.source_url}</small>}
                           </span>
                         </label>
                       ))}
+                      <label className="manual-entry">
+                        <span>手工填写{item.entity_type === "PERSON" ? "人物姓名" : "企业名称"}</span>
+                        <input
+                          type="text"
+                          value={manualValues[item.mention] ?? ""}
+                          placeholder={item.entity_type === "PERSON" ? "例如：王传福" : "例如：比亚迪股份有限公司"}
+                          onChange={(event) => {
+                            const value = event.target.value;
+                            setManualValues((current) => ({ ...current, [item.mention]: value }));
+                            if (value) {
+                              setSelections((current) => ({ ...current, [item.mention]: "" }));
+                            }
+                          }}
+                        />
+                      </label>
                     </fieldset>
                   ))}
                   <button className="primary-button" disabled={isSubmitting} onClick={confirmEntities}>

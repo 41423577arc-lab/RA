@@ -109,6 +109,10 @@ textarea::placeholder { color: #9ca49f; }
 .candidate-option span, .candidate-option small { display: block; }
 .candidate-option strong { font-size: 14px; }
 .candidate-option small { margin-top: 3px; color: #6d7870; font-size: 12px; }
+.candidate-source { overflow-wrap: anywhere; }
+.manual-entry { display: grid; gap: 7px; margin-top: 10px; color: #526057; font-size: 13px; font-weight: 650; }
+.manual-entry input { width: 100%; min-height: 42px; padding: 9px 11px; border: 1px solid #cfd7d1; border-radius: 6px; color: #17211b; outline: none; }
+.manual-entry input:focus { border-color: #2a7656; box-shadow: 0 0 0 3px #2a765618; }
 .report-tabs { display: flex; gap: 2px; margin-top: 14px; border-bottom: 1px solid #dce2dd; }
 .report-tabs button { padding: 10px 14px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: #657169; cursor: pointer; }
 .report-tabs button.selected { color: #176240; border-bottom-color: #176240; font-weight: 700; }

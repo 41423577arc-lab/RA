@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 TaskStatus = Literal[
     "PENDING",
     "TRANSCRIBING",
+    "CONTEXT_EXTRACTING",
     "EXTRACTING",
     "RULE_EXTRACTING",
     "LLM_UNDERSTANDING",
@@ -100,6 +101,8 @@ class CandidateOption(BaseModel):
     region: str | None = None
     reason: str
     confidence: float = Field(ge=0, le=1)
+    source_url: str | None = None
+    evidence_quote: str | None = None
 
 
 class ConfirmationItem(BaseModel):

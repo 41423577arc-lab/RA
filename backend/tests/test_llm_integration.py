@@ -2,10 +2,15 @@ from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from app.config import Settings
 from app.schemas.task import (
+    ConfirmationSelection,
     ConfirmedContext,
     ConfirmedEntity,
+    EntityMention,
+    IntentUnderstanding,
     ProjectResult,
     WebEvidence,
     WebPage,
@@ -15,7 +20,7 @@ from app.schemas.task import (
     WebVerificationBatch,
 )
 from app.services.agent_nodes import validate_web_results
-from app.services.entity_resolver import EntityResolver
+from app.services.entity_resolver import EntityResolver, InsufficientContextError
 from app.services.extractor import RuleExtractor
 from app.services.llm_client import StructuredLLM
 from app.tasks.pipeline import ResearchPipeline
@@ -113,17 +118,156 @@ def test_web_verification_rejects_same_name_page_without_target_company() -> Non
 
 def test_entity_resolver_requires_confirmation_for_huaxing_li_alias() -> None:
     extractor = RuleExtractor(ROOT / "seed")
-    extracted = extractor.extract("华星的李总明天参加会议")
-    from app.services.agent_nodes import fallback_understanding
-
-    understanding = fallback_understanding(extracted)
+    input_text = "华星能源集团的李总明天参加会议"
+    extracted = extractor.extract(input_text)
+    understanding = IntentUnderstanding(
+        intents=["MEETING_PREPARATION"],
+        people=[
+            EntityMention(
+                mention="李总",
+                organization="华星能源集团",
+                evidence_text="华星能源集团的李总",
+                confidence=0.9,
+                needs_confirmation=True,
+            )
+        ],
+        organizations=[
+            EntityMention(
+                mention="华星能源集团",
+                canonical_name="华星能源集团",
+                evidence_text="华星能源集团",
+                confidence=0.98,
+            )
+        ],
+        event_type="会议",
+        overall_confidence=0.9,
+        needs_confirmation=True,
+    )
     context, confirmation = EntityResolver(ROOT / "seed").resolve(
-        "华星的李总明天参加会议", understanding, extracted, 1
+        input_text, understanding, extracted, 1
     )
 
     assert context is None
     assert confirmation is not None
-    assert {item.canonical_name for item in confirmation.items[0].candidates} == {"李明", "李伟"}
+    assert [item.entity_type for item in confirmation.items] == ["PERSON"]
+    assert confirmation.items[0].candidates == []
+    assert EntityResolver(ROOT / "seed").candidate_lookup(
+        input_text, understanding, extracted
+    ) == ("李总", "华星能源集团")
+
+
+def test_entity_resolver_accepts_explicit_person_not_in_internal_data() -> None:
+    input_text = "今天中午去丰收农业有限公司和杜鹏吃饭，沟通农业物联网平台。"
+    extracted = RuleExtractor(ROOT / "seed").extract(input_text)
+    understanding = IntentUnderstanding(
+        intents=["MEETING_PREPARATION"],
+        people=[
+            EntityMention(
+                mention="杜鹏",
+                canonical_name="杜鹏",
+                organization="丰收农业有限公司",
+                evidence_text="丰收农业有限公司和杜鹏",
+                confidence=0.98,
+            )
+        ],
+        organizations=[
+            EntityMention(
+                mention="丰收农业有限公司",
+                canonical_name="丰收农业有限公司",
+                evidence_text="丰收农业有限公司",
+                confidence=0.98,
+            )
+        ],
+        event_type="宴请",
+        overall_confidence=0.98,
+    )
+
+    context, confirmation = EntityResolver(ROOT / "seed").resolve(
+        input_text, understanding, extracted, 1
+    )
+
+    assert confirmation is None
+    assert context is not None
+    assert {(item.entity_type, item.canonical_name) for item in context.entities} == {
+        ("PERSON", "杜鹏"),
+        ("ORGANIZATION", "丰收农业有限公司"),
+    }
+
+
+def test_web_identity_candidates_require_exact_page_evidence() -> None:
+    page = WebPage(
+        web_result_id="W001",
+        title="管理团队",
+        url="https://example.com/team",
+        raw_content="华星能源集团总经理李海负责新能源业务。",
+        rank=0,
+    )
+    resolver = EntityResolver(ROOT / "seed")
+    candidates = resolver.candidates_from_web(
+        "李总",
+        "华星能源集团",
+        [page],
+    )
+
+    assert [item.canonical_name for item in candidates] == ["李海"]
+    assert candidates[0].source_url == page.url
+
+
+def test_missing_organization_can_be_filled_without_internal_match() -> None:
+    input_text = "今天中午和杜鹏吃饭，沟通农业物联网平台。"
+    extracted = RuleExtractor(ROOT / "seed").extract(input_text)
+    understanding = IntentUnderstanding(
+        intents=["MEETING_PREPARATION"],
+        people=[
+            EntityMention(
+                mention="杜鹏",
+                canonical_name="杜鹏",
+                evidence_text="和杜鹏吃饭",
+                confidence=0.98,
+            )
+        ],
+        organizations=[],
+        event_type="宴请",
+        overall_confidence=0.8,
+        needs_confirmation=True,
+    )
+    resolver = EntityResolver(ROOT / "seed")
+    context, confirmation = resolver.resolve(input_text, understanding, extracted, 1)
+
+    assert context is None
+    assert confirmation is not None
+    assert [item.entity_type for item in confirmation.items] == ["ORGANIZATION"]
+
+    context = resolver.apply_confirmation(
+        confirmation,
+        [
+            ConfirmationSelection(
+                mention="企业名称", manual_value="丰收农业有限公司"
+            )
+        ],
+        understanding,
+        input_text,
+        extracted,
+    )
+
+    person = next(item for item in context.entities if item.entity_type == "PERSON")
+    assert person.organization == "丰收农业有限公司"
+
+
+def test_task_without_person_and_organization_stops_clearly() -> None:
+    input_text = "帮我生成一份报告"
+    extracted = RuleExtractor(ROOT / "seed").extract(input_text)
+    understanding = IntentUnderstanding(
+        intents=["REPORT_GENERATION"],
+        people=[],
+        organizations=[],
+        event_type="其他",
+        overall_confidence=0.4,
+        needs_confirmation=True,
+    )
+
+    with pytest.raises(InsufficientContextError, match="人物姓名和企业名称"):
+        EntityResolver(ROOT / "seed").resolve(input_text, understanding, extracted, 1)
 
 
 class Repo:
