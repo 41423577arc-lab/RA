@@ -122,10 +122,10 @@ class ResearchPipeline:
 
                 version = int(task.confirmation_version or 0) + 1
                 context, confirmation = self.entity_resolver.resolve(
-                    input_text, understanding, extracted, version
+                    input_text, understanding, version
                 )
                 lookup = self.entity_resolver.candidate_lookup(
-                    input_text, understanding, extracted
+                    input_text, understanding
                 )
                 if confirmation and lookup:
                     mention, organization = lookup
@@ -135,7 +135,6 @@ class ResearchPipeline:
                     context, confirmation = self.entity_resolver.resolve(
                         input_text,
                         understanding,
-                        extracted,
                         version,
                         external_candidates=candidates,
                     )
@@ -509,6 +508,6 @@ def run_research_pipeline(task_id: str) -> None:
                 settings.action_brief_template,
             ),
             agents=AgentNodes(llm),
-            entity_resolver=EntityResolver(settings.seed_dir, settings.llm_confirm_threshold),
+            entity_resolver=EntityResolver(),
         )
         pipeline.run(task_id)

@@ -5,7 +5,7 @@ import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-from app.schemas.task import CandidateOption, ProjectResult
+from app.schemas.task import ProjectResult
 
 
 class ProjectMcpClient:
@@ -27,15 +27,6 @@ class ProjectMcpClient:
                 if attempt < 2:
                     await asyncio.sleep(2**attempt)
         raise RuntimeError(f"MCP search_projects failed: {last_error}") from last_error
-
-    async def resolve_entities(
-        self, mentions: list[str], organization_names: list[str]
-    ) -> list[CandidateOption]:
-        payload = await self._call_tool(
-            "resolve_entities",
-            {"mentions": mentions, "organization_names": organization_names},
-        )
-        return [CandidateOption.model_validate(item) for item in payload]
 
     async def _search_once(
         self,

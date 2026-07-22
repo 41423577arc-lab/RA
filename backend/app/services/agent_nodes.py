@@ -132,15 +132,16 @@ def fallback_understanding(extracted: ExtractedInfo) -> IntentUnderstanding:
         intents=intents,
         people=[
             EntityMention(
-                mention=person.name or person.organization or "未识别实体",
+                mention=person.name,
                 canonical_name=person.name,
                 organization=person.organization,
                 title=person.title,
-                evidence_text=person.name or person.organization or "",
-                confidence=0.95 if person.name else 0.75,
-                needs_confirmation=False,
+                evidence_text=person.name,
+                confidence=0.95,
+                resolution="CONFIRMED",
             )
             for person in extracted.people
+            if person.name
         ],
         organizations=[
             EntityMention(
@@ -148,7 +149,7 @@ def fallback_understanding(extracted: ExtractedInfo) -> IntentUnderstanding:
                 canonical_name=person.organization,
                 evidence_text=person.organization,
                 confidence=0.95,
-                needs_confirmation=False,
+                resolution="CONFIRMED",
             )
             for person in extracted.people
             if person.organization
@@ -160,7 +161,6 @@ def fallback_understanding(extracted: ExtractedInfo) -> IntentUnderstanding:
         business_directions=extracted.keywords,
         focus_questions=[],
         overall_confidence=0.75,
-        needs_confirmation=False,
     )
 
 
