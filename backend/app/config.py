@@ -27,7 +27,6 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 120
     llm_max_retries: int = 1
     llm_disable_response_storage: bool = True
-    llm_confirm_threshold: float = 0.85
     llm_web_identity_threshold: float = 0.80
     llm_project_confidence_threshold: float = 0.60
     llm_analysis_confidence_threshold: float = 0.60

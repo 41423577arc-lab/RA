@@ -16,16 +16,6 @@ CREATE TABLE IF NOT EXISTS internal_projects (
 ALTER TABLE internal_projects
     ADD COLUMN IF NOT EXISTS project_aliases TEXT[] NOT NULL DEFAULT '{}';
 
-CREATE TABLE IF NOT EXISTS entity_aliases (
-    candidate_id VARCHAR(64) PRIMARY KEY,
-    entity_type VARCHAR(16) NOT NULL CHECK (entity_type IN ('PERSON', 'ORGANIZATION', 'PROJECT')),
-    canonical_name VARCHAR(255) NOT NULL,
-    alias VARCHAR(255) NOT NULL,
-    organization_name VARCHAR(255),
-    title VARCHAR(100),
-    region VARCHAR(100)
-);
-
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'resource_reader') THEN
@@ -37,4 +27,3 @@ $$;
 GRANT CONNECT ON DATABASE resource_agent TO resource_reader;
 GRANT USAGE ON SCHEMA public TO resource_reader;
 GRANT SELECT ON internal_projects TO resource_reader;
-GRANT SELECT ON entity_aliases TO resource_reader;

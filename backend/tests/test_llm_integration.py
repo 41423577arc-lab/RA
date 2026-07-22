@@ -128,7 +128,7 @@ def test_entity_resolver_requires_confirmation_for_huaxing_li_alias() -> None:
                 organization="华星能源集团",
                 evidence_text="华星能源集团的李总",
                 confidence=0.9,
-                needs_confirmation=True,
+                resolution="NEEDS_CONFIRMATION",
             )
         ],
         organizations=[
@@ -137,22 +137,22 @@ def test_entity_resolver_requires_confirmation_for_huaxing_li_alias() -> None:
                 canonical_name="华星能源集团",
                 evidence_text="华星能源集团",
                 confidence=0.98,
+                resolution="CONFIRMED",
             )
         ],
         event_type="会议",
         overall_confidence=0.9,
-        needs_confirmation=True,
     )
-    context, confirmation = EntityResolver(ROOT / "seed").resolve(
-        input_text, understanding, extracted, 1
+    context, confirmation = EntityResolver().resolve(
+        input_text, understanding, 1
     )
 
     assert context is None
     assert confirmation is not None
     assert [item.entity_type for item in confirmation.items] == ["PERSON"]
     assert confirmation.items[0].candidates == []
-    assert EntityResolver(ROOT / "seed").candidate_lookup(
-        input_text, understanding, extracted
+    assert EntityResolver().candidate_lookup(
+        input_text, understanding
     ) == ("李总", "华星能源集团")
 
 
@@ -168,6 +168,7 @@ def test_entity_resolver_accepts_explicit_person_not_in_internal_data() -> None:
                 organization="丰收农业有限公司",
                 evidence_text="丰收农业有限公司和杜鹏",
                 confidence=0.98,
+                resolution="CONFIRMED",
             )
         ],
         organizations=[
@@ -176,14 +177,15 @@ def test_entity_resolver_accepts_explicit_person_not_in_internal_data() -> None:
                 canonical_name="丰收农业有限公司",
                 evidence_text="丰收农业有限公司",
                 confidence=0.98,
+                resolution="CONFIRMED",
             )
         ],
         event_type="宴请",
         overall_confidence=0.98,
     )
 
-    context, confirmation = EntityResolver(ROOT / "seed").resolve(
-        input_text, understanding, extracted, 1
+    context, confirmation = EntityResolver().resolve(
+        input_text, understanding, 1
     )
 
     assert confirmation is None
@@ -194,6 +196,76 @@ def test_entity_resolver_accepts_explicit_person_not_in_internal_data() -> None:
     }
 
 
+def test_model_confirmed_fang_zheng_is_accepted_without_confidence_threshold() -> None:
+    input_text = "我晚上去和新城水务的方正赴宴，讨论水务管网监测项目的现场部署问题。"
+    understanding = IntentUnderstanding(
+        intents=["MEETING_PREPARATION", "PROJECT_ADVANCEMENT_ADVICE"],
+        people=[
+            EntityMention(
+                mention="方正",
+                canonical_name="方正",
+                organization="新城水务",
+                evidence_text="我晚上去和新城水务的方正赴宴",
+                confidence=0.6,
+                resolution="CONFIRMED",
+            )
+        ],
+        organizations=[
+            EntityMention(
+                mention="新城水务",
+                canonical_name="新城水务",
+                evidence_text="我晚上去和新城水务的方正赴宴",
+                confidence=0.7,
+                resolution="CONFIRMED",
+            )
+        ],
+        event_type="宴请",
+        overall_confidence=0.7,
+    )
+
+    context, confirmation = EntityResolver().resolve(input_text, understanding, 1)
+
+    assert confirmation is None
+    assert context is not None
+    person = next(item for item in context.entities if item.entity_type == "PERSON")
+    assert person.canonical_name == "方正"
+    assert person.organization == "新城水务"
+
+
+def test_model_entity_with_fabricated_evidence_is_not_accepted() -> None:
+    input_text = "我晚上去和新城水务的方正赴宴。"
+    understanding = IntentUnderstanding(
+        intents=["MEETING_PREPARATION"],
+        people=[
+            EntityMention(
+                mention="方正",
+                canonical_name="方正",
+                organization="新城水务",
+                evidence_text="方正是新城水务董事长",
+                confidence=0.99,
+                resolution="CONFIRMED",
+            )
+        ],
+        organizations=[
+            EntityMention(
+                mention="新城水务",
+                canonical_name="新城水务",
+                evidence_text="我晚上去和新城水务的方正赴宴",
+                confidence=0.99,
+                resolution="CONFIRMED",
+            )
+        ],
+        event_type="宴请",
+        overall_confidence=0.99,
+    )
+
+    context, confirmation = EntityResolver().resolve(input_text, understanding, 1)
+
+    assert context is None
+    assert confirmation is not None
+    assert [item.entity_type for item in confirmation.items] == ["PERSON"]
+
+
 def test_web_identity_candidates_require_exact_page_evidence() -> None:
     page = WebPage(
         web_result_id="W001",
@@ -202,7 +274,7 @@ def test_web_identity_candidates_require_exact_page_evidence() -> None:
         raw_content="华星能源集团总经理李海负责新能源业务。",
         rank=0,
     )
-    resolver = EntityResolver(ROOT / "seed")
+    resolver = EntityResolver()
     candidates = resolver.candidates_from_web(
         "李总",
         "华星能源集团",
@@ -224,15 +296,15 @@ def test_missing_organization_can_be_filled_without_internal_match() -> None:
                 canonical_name="杜鹏",
                 evidence_text="和杜鹏吃饭",
                 confidence=0.98,
+                resolution="CONFIRMED",
             )
         ],
         organizations=[],
         event_type="宴请",
         overall_confidence=0.8,
-        needs_confirmation=True,
     )
-    resolver = EntityResolver(ROOT / "seed")
-    context, confirmation = resolver.resolve(input_text, understanding, extracted, 1)
+    resolver = EntityResolver()
+    context, confirmation = resolver.resolve(input_text, understanding, 1)
 
     assert context is None
     assert confirmation is not None
@@ -247,7 +319,6 @@ def test_missing_organization_can_be_filled_without_internal_match() -> None:
         ],
         understanding,
         input_text,
-        extracted,
     )
 
     person = next(item for item in context.entities if item.entity_type == "PERSON")
@@ -263,11 +334,10 @@ def test_task_without_person_and_organization_stops_clearly() -> None:
         organizations=[],
         event_type="其他",
         overall_confidence=0.4,
-        needs_confirmation=True,
     )
 
     with pytest.raises(InsufficientContextError, match="人物姓名和企业名称"):
-        EntityResolver(ROOT / "seed").resolve(input_text, understanding, extracted, 1)
+        EntityResolver().resolve(input_text, understanding, 1)
 
 
 class Repo:
@@ -345,7 +415,7 @@ def test_v05_pipeline_completes_with_all_llm_nodes_degraded() -> None:
             ROOT / "backend/templates/action_brief.md.j2",
         ),
         agents=DisabledAgents(),
-        entity_resolver=EntityResolver(ROOT / "seed"),
+        entity_resolver=EntityResolver(),
     )
 
     pipeline.run(task.id)

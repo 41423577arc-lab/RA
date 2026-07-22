@@ -1,7 +1,6 @@
 import hashlib
 import re
 import unicodedata
-from pathlib import Path
 
 from app.schemas.task import (
     CandidateOption,
@@ -9,7 +8,6 @@ from app.schemas.task import (
     ConfirmationRequest,
     ConfirmedContext,
     ConfirmedEntity,
-    ExtractedInfo,
     IntentUnderstanding,
     WebPage,
 )
@@ -20,21 +18,17 @@ class InsufficientContextError(ValueError):
 
 
 class EntityResolver:
-    """Validate model extraction against the input; internal data is not an identity gate."""
-
-    def __init__(self, seed_dir: Path | None = None, confirm_threshold: float = 0.85):
-        self.confirm_threshold = confirm_threshold
+    """Use model decisions after verifying that their evidence exists in the input."""
 
     def resolve(
         self,
         input_text: str,
         understanding: IntentUnderstanding,
-        extracted: ExtractedInfo,
         version: int,
         external_candidates: list[CandidateOption] | None = None,
     ) -> tuple[ConfirmedContext | None, ConfirmationRequest | None]:
         confirmed, uncertain_people, uncertain_organizations = self._supported_entities(
-            input_text, understanding, extracted
+            input_text, understanding
         )
         if external_candidates:
             uncertain_people.extend(
@@ -77,9 +71,8 @@ class EntityResolver:
         self,
         input_text: str,
         understanding: IntentUnderstanding,
-        extracted: ExtractedInfo,
     ) -> tuple[str, str] | None:
-        confirmed, _, _ = self._supported_entities(input_text, understanding, extracted)
+        confirmed, _, _ = self._supported_entities(input_text, understanding)
         if any(item.entity_type == "PERSON" for item in confirmed):
             return None
         organizations = [
@@ -155,9 +148,8 @@ class EntityResolver:
         selections,
         understanding: IntentUnderstanding,
         input_text: str,
-        extracted: ExtractedInfo,
     ) -> ConfirmedContext:
-        confirmed, _, _ = self._supported_entities(input_text, understanding, extracted)
+        confirmed, _, _ = self._supported_entities(input_text, understanding)
         by_mention = {selection.mention: selection for selection in selections}
         for item in request.items:
             selection = by_mention.get(item.mention)
@@ -196,20 +188,20 @@ class EntityResolver:
         organizations = [item for item in confirmed if item.entity_type == "ORGANIZATION"]
         if not people or not organizations:
             raise ValueError("人物姓名和企业名称均为必填项")
-        organization_name = organizations[0].canonical_name
-        confirmed = [
-            item.model_copy(update={"organization": organization_name})
-            if item.entity_type == "PERSON"
-            else item
-            for item in confirmed
-        ]
+        if len(people) == 1 and len(organizations) == 1 and not people[0].organization:
+            organization_name = organizations[0].canonical_name
+            confirmed = [
+                item.model_copy(update={"organization": organization_name})
+                if item.entity_type == "PERSON"
+                else item
+                for item in confirmed
+            ]
         return self._context(understanding, confirmed)
 
     def _supported_entities(
         self,
         input_text: str,
         understanding: IntentUnderstanding,
-        extracted: ExtractedInfo,
     ) -> tuple[list[ConfirmedEntity], list[CandidateOption], list[CandidateOption]]:
         source = self._normalize(input_text)
         confirmed: list[ConfirmedEntity] = []
@@ -220,29 +212,35 @@ class EntityResolver:
             canonical = (person.canonical_name or "").strip()
             mention = person.mention.strip()
             full_name_in_input = bool(canonical and self._normalize(canonical) in source)
-            supported = bool(mention and self._normalize(mention) in source)
+            supported = self._has_source_evidence(input_text, mention, person.evidence_text)
+            source_organization = self._source_value(person.organization, source)
+            source_title = self._source_value(person.title, source)
             if (
-                full_name_in_input
+                person.resolution == "CONFIRMED"
+                and full_name_in_input
                 and supported
-                and person.confidence >= self.confirm_threshold
-                and not person.needs_confirmation
             ):
                 confirmed.append(
                     ConfirmedEntity(
                         entity_type="PERSON",
                         canonical_name=canonical,
                         aliases=[mention] if mention != canonical else [],
-                        organization=person.organization,
-                        title=person.title,
+                        organization=source_organization,
+                        title=source_title,
                         region=person.region,
                         confirmed_by="AUTO",
                     )
                 )
-            elif supported and canonical and full_name_in_input:
+            elif (
+                person.resolution == "NEEDS_CONFIRMATION"
+                and supported
+                and canonical
+                and full_name_in_input
+            ):
                 uncertain_people.append(
                     self._input_candidate(
-                        "PERSON", canonical, mention, person.organization, person.title,
-                        "原文中出现了人物信息，但没有达到自动确认条件",
+                        "PERSON", canonical, mention, source_organization, source_title,
+                        "大模型识别到人物，但明确要求用户确认",
                         person.confidence,
                     )
                 )
@@ -250,13 +248,14 @@ class EntityResolver:
         for organization in understanding.organizations:
             canonical = (organization.canonical_name or "").strip()
             mention = organization.mention.strip()
-            supported = bool(mention and self._normalize(mention) in source)
+            supported = self._has_source_evidence(
+                input_text, mention, organization.evidence_text
+            )
             source_name = canonical if canonical and self._normalize(canonical) in source else mention
             if (
-                source_name
+                organization.resolution == "CONFIRMED"
+                and source_name
                 and supported
-                and organization.confidence >= self.confirm_threshold
-                and not organization.needs_confirmation
             ):
                 confirmed.append(
                     ConfirmedEntity(
@@ -267,61 +266,36 @@ class EntityResolver:
                         confirmed_by="AUTO",
                     )
                 )
-            elif supported and (canonical or mention):
+            elif (
+                organization.resolution == "NEEDS_CONFIRMATION"
+                and supported
+                and (canonical or mention)
+            ):
                 uncertain_organizations.append(
                     self._input_candidate(
                         "ORGANIZATION", source_name, mention, None, None,
-                        "原文中出现了企业信息，但没有达到自动确认条件",
+                        "大模型识别到企业，但明确要求用户确认",
                         organization.confidence,
                     )
                 )
 
-        # Rules only fill an entity type omitted by the model; they do not create a
-        # second interpretation of an already recognized person or organization.
-        model_has_person = any(item.entity_type == "PERSON" for item in confirmed)
-        model_has_organization = any(
-            item.entity_type == "ORGANIZATION" for item in confirmed
+        return (
+            self._deduplicate(confirmed),
+            self._unique_candidates(uncertain_people),
+            self._unique_candidates(uncertain_organizations),
         )
-        for person in extracted.people:
-            if (
-                not model_has_person
-                and person.name
-                and self._normalize(person.name) in source
-            ):
-                confirmed.append(
-                    ConfirmedEntity(
-                        entity_type="PERSON",
-                        canonical_name=person.name,
-                        organization=person.organization,
-                        title=person.title,
-                        confirmed_by="AUTO",
-                    )
-                )
-            if (
-                not model_has_organization
-                and person.organization
-                and self._normalize(person.organization) in source
-            ):
-                confirmed.append(
-                    ConfirmedEntity(
-                        entity_type="ORGANIZATION",
-                        canonical_name=person.organization,
-                        confirmed_by="AUTO",
-                    )
-                )
 
-        confirmed = self._deduplicate(confirmed)
-        people = [item for item in confirmed if item.entity_type == "PERSON"]
-        organizations = [item for item in confirmed if item.entity_type == "ORGANIZATION"]
-        if people and organizations:
-            organization_name = organizations[0].canonical_name
-            confirmed = [
-                item.model_copy(update={"organization": organization_name})
-                if item.entity_type == "PERSON"
-                else item
-                for item in confirmed
-            ]
-        return confirmed, self._unique_candidates(uncertain_people), self._unique_candidates(uncertain_organizations)
+    @classmethod
+    def _has_source_evidence(cls, input_text: str, mention: str, evidence_text: str) -> bool:
+        source = cls._normalize(input_text)
+        mention_text = cls._normalize(mention)
+        evidence = cls._normalize(evidence_text)
+        return bool(mention_text and evidence and mention_text in source and evidence in source)
+
+    @classmethod
+    def _source_value(cls, value: str | None, normalized_source: str) -> str | None:
+        candidate = (value or "").strip()
+        return candidate if candidate and cls._normalize(candidate) in normalized_source else None
 
     @staticmethod
     def _input_candidate(

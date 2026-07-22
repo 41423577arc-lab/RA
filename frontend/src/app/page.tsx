@@ -21,7 +21,7 @@ type Person = { name?: string; organization?: string; title?: string };
 type EntityMention = {
   mention: string;
   canonical_name?: string;
-  needs_confirmation?: boolean;
+  resolution: "CONFIRMED" | "NEEDS_CONFIRMATION" | "MISSING";
 };
 type Task = {
   task_id: string;
@@ -415,7 +415,7 @@ export default function Home() {
                     <span>人物</span>
                     <strong>
                       {task.llm_understanding?.people.map((person) =>
-                        `${person.canonical_name ?? person.mention}${person.needs_confirmation ? "（待确认）" : ""}`
+                        `${person.canonical_name ?? person.mention}${person.resolution === "NEEDS_CONFIRMATION" ? "（待确认）" : ""}`
                       ).join("、") || "未识别"}
                     </strong>
                   </div>

@@ -2,7 +2,7 @@ from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 TaskStatus = Literal[
@@ -38,6 +38,7 @@ IntentType = Literal[
     "REPORT_GENERATION",
 ]
 EntityType = Literal["PERSON", "ORGANIZATION", "PROJECT"]
+EntityResolution = Literal["CONFIRMED", "NEEDS_CONFIRMATION", "MISSING"]
 StatementType = Literal["FACT", "INFERENCE", "RECOMMENDATION"]
 
 
@@ -64,7 +65,20 @@ class EntityMention(BaseModel):
     region: str | None = None
     evidence_text: str = ""
     confidence: float = Field(default=0, ge=0, le=1)
-    needs_confirmation: bool = False
+    resolution: EntityResolution
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_resolution(cls, value):
+        if isinstance(value, dict) and "resolution" not in value:
+            value = dict(value)
+            if value.get("needs_confirmation"):
+                value["resolution"] = "NEEDS_CONFIRMATION"
+            elif value.get("canonical_name"):
+                value["resolution"] = "CONFIRMED"
+            else:
+                value["resolution"] = "MISSING"
+        return value
 
 
 class ProjectMention(BaseModel):
@@ -88,7 +102,6 @@ class IntentUnderstanding(BaseModel):
     business_directions: list[str] = Field(default_factory=list)
     focus_questions: list[str] = Field(default_factory=list)
     overall_confidence: float = Field(ge=0, le=1)
-    needs_confirmation: bool = False
 
 
 class CandidateOption(BaseModel):
