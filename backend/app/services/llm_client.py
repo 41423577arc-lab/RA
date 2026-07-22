@@ -69,22 +69,28 @@ class StructuredLLM:
 
         for attempt in range(self.settings.llm_max_retries + 1):
             try:
-                response = self.client.responses.parse(
-                    model=model,
-                    reasoning={"effort": self.settings.llm_reasoning_effort},
-                    instructions=system_prompt,
-                    input=json.dumps(
-                        {"UNTRUSTED_DATA": input_payload}, ensure_ascii=False, default=str
-                    ),
-                    text_format=output_model,
-                    max_output_tokens=16000 if node_name in LONG_NODES else 8000,
-                    store=False,
-                    safety_identifier=safety_identifier,
-                    timeout=self.settings.llm_timeout_seconds,
-                )
-                parsed = response.output_parsed
-                if parsed is None:
-                    raise ValueError("模型未返回可解析的结构化结果")
+                if self.settings.llm_api_mode == "chat_completions":
+                    parsed, response = self._parse_chat_completion(
+                        model,
+                        node_name,
+                        system_prompt,
+                        input_payload,
+                        output_model,
+                        attempt,
+                    )
+                elif self.settings.llm_api_mode == "responses":
+                    parsed, response = self._parse_response(
+                        model,
+                        node_name,
+                        system_prompt,
+                        input_payload,
+                        output_model,
+                        safety_identifier,
+                    )
+                else:
+                    raise ValueError(
+                        f"不支持的 LLM_API_MODE: {self.settings.llm_api_mode}"
+                    )
                 usage = getattr(response, "usage", None)
                 self._log(
                     task_id,
@@ -112,6 +118,75 @@ class StructuredLLM:
             error_message=str(last_error)[:1000] if last_error else "未知错误",
         )
         raise LLMCallFailed(f"{node_name} 调用失败: {last_error}") from last_error
+
+    def _parse_chat_completion(
+        self,
+        model: str,
+        node_name: str,
+        system_prompt: str,
+        input_payload: dict,
+        output_model: type[OutputT],
+        attempt: int,
+    ) -> tuple[OutputT, object]:
+        schema = json.dumps(
+            output_model.model_json_schema(), ensure_ascii=False, separators=(",", ":")
+        )
+        format_instruction = (
+            "\n\n输出要求：只输出一个符合以下 JSON Schema 的合法 JSON 对象；"
+            "不要输出 Markdown、代码围栏、解释或其他文字。\n"
+            f"JSON Schema: {schema}"
+        )
+        if attempt:
+            format_instruction += "\n上一次输出未通过结构校验，请严格修正格式。"
+
+        response = self.client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt + format_instruction},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"UNTRUSTED_DATA": input_payload},
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                },
+            ],
+            max_tokens=16000 if node_name in LONG_NODES else 8000,
+            store=False,
+            timeout=self.settings.llm_timeout_seconds,
+        )
+        content = response.choices[0].message.content
+        if not content:
+            raise ValueError("模型未返回结构化内容")
+        return output_model.model_validate_json(content), response
+
+    def _parse_response(
+        self,
+        model: str,
+        node_name: str,
+        system_prompt: str,
+        input_payload: dict,
+        output_model: type[OutputT],
+        safety_identifier: str,
+    ) -> tuple[OutputT, object]:
+        response = self.client.responses.parse(
+            model=model,
+            reasoning={"effort": self.settings.llm_reasoning_effort},
+            instructions=system_prompt,
+            input=json.dumps(
+                {"UNTRUSTED_DATA": input_payload}, ensure_ascii=False, default=str
+            ),
+            text_format=output_model,
+            max_output_tokens=16000 if node_name in LONG_NODES else 8000,
+            store=False,
+            safety_identifier=safety_identifier,
+            timeout=self.settings.llm_timeout_seconds,
+        )
+        parsed = response.output_parsed
+        if parsed is None:
+            raise ValueError("模型未返回可解析的结构化结果")
+        return parsed, response
 
     def _log(
         self,

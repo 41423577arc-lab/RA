@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -19,10 +20,11 @@ class Settings(BaseSettings):
     celery_task_always_eager: bool = False
     model_provider: str = "OpenAI"
     openai_api_key: str = ""
-    openai_base_url: str = "https://vftsub.vf-tech.cn"
+    openai_base_url: str = "https://vftllmapi.vf-tech.cn/v1"
     llm_enabled: bool = True
-    llm_model: str = "gpt-5.5"
-    llm_review_model: str = "gpt-5.5"
+    llm_model: str = "MiniMax-M3"
+    llm_review_model: str = "MiniMax-M3"
+    llm_api_mode: Literal["chat_completions", "responses"] = "chat_completions"
     llm_reasoning_effort: str = "xhigh"
     llm_timeout_seconds: float = 120
     llm_max_retries: int = 1

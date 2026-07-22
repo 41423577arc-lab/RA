@@ -1,0 +1,10 @@
+record_type,id,name,parent_id,region_or_territory,phone,email,hired_on
+MANAGER,SM001,周岚,,华东大区,17000000101,zhou.lan@example.invalid,
+MANAGER,SM002,郑凯,,华南大区,17000000102,zheng.kai@example.invalid,
+MANAGER,SM003,吴桐,,战略客户部,17000000103,wu.tong@example.invalid,
+REP,SR001,张伟,SM001,上海及重点制造客户,17000001001,zhang.wei@example.invalid,2021-03-15
+REP,SR002,赵敏,SM001,江苏及医药客户,17000001002,zhao.min@example.invalid,2022-06-01
+REP,SR003,刘芳,SM002,广东及交通客户,17000001003,liu.fang@example.invalid,2020-09-21
+REP,SR004,孙磊,SM002,华南公共事业客户,17000001004,sun.lei@example.invalid,2023-02-13
+REP,SR005,陈杰,SM003,新能源与电子行业,17000001005,chen.jie@example.invalid,2021-11-08
+REP,SR006,李娜,SM003,金融与政企客户,17000001006,li.na@example.invalid,2022-04-18

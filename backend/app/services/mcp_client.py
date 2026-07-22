@@ -42,9 +42,28 @@ class ProjectMcpClient:
                 "keywords": keywords,
             },
         )
+        if not isinstance(payload, list):
+            raise RuntimeError("MCP search_projects returned an invalid payload")
         return [ProjectResult.model_validate(item) for item in payload]
 
-    async def _call_tool(self, name: str, arguments: dict) -> list[dict]:
+    async def get_project_details(self, project_id: str) -> dict:
+        payload = await self._call_tool("get_project_details", {"project_id": project_id})
+        if not isinstance(payload, dict):
+            raise RuntimeError("MCP get_project_details returned an invalid payload")
+        return payload
+
+    async def get_sales_portfolio(
+        self, manager_name: str | None = None, sales_rep_name: str | None = None
+    ) -> list[dict]:
+        payload = await self._call_tool(
+            "get_sales_portfolio",
+            {"manager_name": manager_name, "sales_rep_name": sales_rep_name},
+        )
+        if not isinstance(payload, list):
+            raise RuntimeError("MCP get_sales_portfolio returned an invalid payload")
+        return payload
+
+    async def _call_tool(self, name: str, arguments: dict) -> object:
         async with httpx.AsyncClient(timeout=10) as http_client:
             async with streamable_http_client(
                 self.server_url, http_client=http_client
@@ -53,12 +72,17 @@ class ProjectMcpClient:
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
                     result = await session.call_tool(name, arguments=arguments)
+        if getattr(result, "isError", False):
+            message = (
+                getattr(result.content[0], "text", "unknown MCP error")
+                if result.content
+                else "unknown MCP error"
+            )
+            raise RuntimeError(f"MCP {name} failed: {message}")
         payload = result.structuredContent
         if isinstance(payload, dict) and "result" in payload:
             payload = payload["result"]
         if payload is None and result.content:
             text = getattr(result.content[0], "text", "[]")
             payload = json.loads(text)
-        if not isinstance(payload, list):
-            raise RuntimeError("MCP search_projects returned an invalid payload")
         return payload

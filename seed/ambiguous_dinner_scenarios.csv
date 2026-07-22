@@ -1,0 +1,9 @@
+scenario_id,input_text,expected_behavior,expected_contacts,expected_projects
+DINNER-001,"明晚老板要和中建二局的王总吃饭，帮我查一下相关项目和内部资源。",REQUIRE_CONFIRMATION,"王志远|王海峰|王立新","P021|P022|P023|P024|P025|P026"
+DINNER-002,"周五和中建二局上游做物资供应链的王总吃饭，主要聊集采和履约。",RESOLVE_BY_RELATION,王志远,"P021|P022"
+DINNER-003,"下周宴请中建二局智慧工地合作方的王总，想了解数字施工项目。",RESOLVE_BY_BUSINESS,王海峰,"P023|P024"
+DINNER-004,"今晚和中建二局城市更新项目业主侧的王总吃饭，准备一下相关资料。",RESOLVE_BY_RELATION,王立新,"P025|P026"
+DINNER-005,"安排和中建二局董事长王总的饭局，查他的背景。",FLAG_TITLE_CONFLICT,"王志远|王海峰|王立新","P021|P023|P025"
+DINNER-006,"和华北筑联供应链有限公司王志远总经理吃饭，聊中建二局物资协同。",EXACT_PERSON_AND_ORG,王志远,"P021|P022"
+DINNER-007,"京津智建的王海峰副总经理明天赴宴，重点讨论智慧工地。",EXACT_PERSON_AND_ORG,王海峰,"P023|P024"
+DINNER-008,"北方城建王立新总负责的中建二局产业园项目进展怎么样？",EXACT_PERSON_AND_PROJECT,王立新,"P025|P026"

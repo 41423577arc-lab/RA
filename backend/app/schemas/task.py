@@ -251,6 +251,14 @@ class ProjectResult(BaseModel):
     start_date: date
     end_date: date | None = None
     description: str
+    sales_rep_id: str | None = None
+    project_stage: str | None = None
+    health_status: Literal["GREEN", "AMBER", "RED"] | None = None
+    priority: Literal["P0", "P1", "P2", "P3"] | None = None
+    contract_value: float | None = None
+    win_probability: int | None = Field(default=None, ge=0, le=100)
+    last_activity_date: date | None = None
+    next_followup_date: date | None = None
     match_type: Literal[
         "PERSON_EXACT", "ORG_EXACT", "PROJECT_EXACT", "TEXT_MATCH", "VECTOR_MATCH"
     ]

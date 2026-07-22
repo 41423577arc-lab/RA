@@ -15,7 +15,19 @@ async def main() -> None:
     projects = await client.search_projects(
         ["王传福"], ["比亚迪股份有限公司"], ["新能源", "储能"]
     )
-    print(json.dumps([project.model_dump(mode="json") for project in projects], ensure_ascii=True))
+    project_details = await client.get_project_details("P001")
+    sales_portfolio = await client.get_sales_portfolio(sales_rep_name="张伟")
+    print(
+        json.dumps(
+            {
+                "search_projects": [project.model_dump(mode="json") for project in projects],
+                "get_project_details": project_details,
+                "get_sales_portfolio": sales_portfolio,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

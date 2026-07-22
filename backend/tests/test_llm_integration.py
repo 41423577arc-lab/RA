@@ -22,7 +22,7 @@ from app.schemas.task import (
 from app.services.agent_nodes import validate_web_results
 from app.services.entity_resolver import EntityResolver, InsufficientContextError
 from app.services.extractor import RuleExtractor
-from app.services.llm_client import StructuredLLM
+from app.services.llm_client import LLMCallFailed, StructuredLLM
 from app.tasks.pipeline import ResearchPipeline
 from app.services.report_renderer import ReportRenderer
 
@@ -45,13 +45,70 @@ class FakeResponses:
         )
 
 
-def test_llm_client_uses_fixed_model_reasoning_and_no_storage() -> None:
+class FakeChatCompletions:
+    def __init__(self, content: str):
+        self.content = content
+        self.kwargs = None
+
+    def create(self, **kwargs):
+        self.kwargs = kwargs
+        return SimpleNamespace(
+            id="chat-test",
+            choices=[
+                SimpleNamespace(message=SimpleNamespace(content=self.content))
+            ],
+            usage=SimpleNamespace(input_tokens=10, output_tokens=20),
+        )
+
+
+def test_llm_client_uses_chat_completions_with_pydantic_schema() -> None:
     config = Settings(
         openai_api_key="test-key",
-        openai_base_url="https://vftsub.vf-tech.cn",
-        llm_model="gpt-5.5",
-        llm_review_model="gpt-5.5",
+        openai_base_url="https://vftllmapi.vf-tech.cn/v1",
+        llm_model="MiniMax-M3",
+        llm_review_model="MiniMax-M3",
+        llm_api_mode="chat_completions",
         llm_reasoning_effort="xhigh",
+        llm_disable_response_storage=True,
+        prompt_dir=ROOT / "backend/prompts",
+    )
+    service = StructuredLLM(config)
+    expected = WebSearchPlan(
+        queries=[WebSearchQuery(query="王传福 比亚迪", purpose="身份核验")]
+    )
+    fake = FakeChatCompletions(expected.model_dump_json())
+    service.client = SimpleNamespace(chat=SimpleNamespace(completions=fake))
+
+    result = service.parse("task-1", "web_plan", {"name": "王传福"}, WebSearchPlan)
+
+    assert result.queries[0].query == "王传福 比亚迪"
+    assert fake.kwargs["model"] == "MiniMax-M3"
+    assert fake.kwargs["store"] is False
+    assert "JSON Schema" in fake.kwargs["messages"][0]["content"]
+    assert "UNTRUSTED_DATA" in fake.kwargs["messages"][1]["content"]
+    assert "tools" not in fake.kwargs
+
+
+def test_llm_client_rejects_invalid_chat_completion_json() -> None:
+    config = Settings(
+        openai_api_key="test-key",
+        llm_api_mode="chat_completions",
+        llm_max_retries=0,
+        llm_disable_response_storage=True,
+        prompt_dir=ROOT / "backend/prompts",
+    )
+    service = StructuredLLM(config)
+    fake = FakeChatCompletions("这不是 JSON")
+    service.client = SimpleNamespace(chat=SimpleNamespace(completions=fake))
+
+    with pytest.raises(LLMCallFailed, match="调用失败"):
+        service.parse("task-1", "web_plan", {"name": "王传福"}, WebSearchPlan)
+
+
+def test_llm_client_keeps_responses_mode_available() -> None:
+    config = Settings(
+        openai_api_key="test-key",
+        llm_api_mode="responses",
         llm_disable_response_storage=True,
         prompt_dir=ROOT / "backend/prompts",
     )
@@ -62,10 +119,7 @@ def test_llm_client_uses_fixed_model_reasoning_and_no_storage() -> None:
     result = service.parse("task-1", "web_plan", {"name": "王传福"}, WebSearchPlan)
 
     assert result.queries[0].query == "王传福 比亚迪"
-    assert fake.kwargs["model"] == "gpt-5.5"
     assert fake.kwargs["reasoning"] == {"effort": "xhigh"}
-    assert fake.kwargs["store"] is False
-    assert "tools" not in fake.kwargs
 
 
 def test_web_verification_rejects_same_name_page_without_target_company() -> None:

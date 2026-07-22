@@ -1,10 +1,10 @@
 # 资源推动 Agent Demo
 
-资源调查 Demo：规则提取与确定性降级、`gpt-5.5` Responses API 结构化理解、Tavily Search/Extract、MCP 内部实体与项目查询、证据核验、关联分析和 Jinja2 报告。
+资源调查 Demo：规则提取与确定性降级、`MiniMax-M3` Chat Completions + Pydantic 结构化理解、Tavily Search/Extract、MCP 内部实体与项目查询、证据核验、关联分析和 Jinja2 报告。
 
 ## 启动
 
-1. 在 `.env` 中填写 `TAVILY_API_KEY`、`OPENAI_API_KEY` 和自行生成的随机 `LLM_SAFETY_SALT`。模型网关固定为 `https://vftsub.vf-tech.cn`，主模型与复核模型均为 `gpt-5.5`，推理强度为 `xhigh`。
+1. 在 `.env` 中填写 `TAVILY_API_KEY`、`OPENAI_API_KEY` 和自行生成的随机 `LLM_SAFETY_SALT`。模型网关为 `https://vftllmapi.vf-tech.cn`，主模型与复核模型均为 `MiniMax-M3`，推理强度为 `xhigh`。
 2. 执行：
 
 ```powershell
