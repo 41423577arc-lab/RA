@@ -1,6 +1,14 @@
 services:
   postgres:
     image: pgvector/pgvector:pg16
+    command:
+      - postgres
+      - -c
+      - password_encryption=md5
+      - -c
+      - hba_file=/etc/postgresql/custom_pg_hba.conf
+    ports:
+      - "127.0.0.1:5432:5432"
     environment:
       POSTGRES_DB: resource_agent
       POSTGRES_USER: resource_agent
@@ -8,6 +16,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./seed/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./seed/pg_hba.conf:/etc/postgresql/custom_pg_hba.conf:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U resource_agent -d resource_agent"]
       interval: 5s

@@ -3,19 +3,18 @@
 import {
   AlertCircle,
   Check,
-  FileText,
   LoaderCircle,
-  Mic,
+  MessageSquare,
   RotateCcw,
   Search,
-  Square,
-  X
+  Send
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 
-type Mode = "text" | "audio";
+type InputType = "text" | "audio";
 type ReportTab = "detailed" | "action";
+type ChatMessage = { role: "user" | "assistant"; content: string };
 
 type Person = { name?: string; organization?: string; title?: string };
 type EntityMention = {
@@ -26,7 +25,7 @@ type EntityMention = {
 type Task = {
   task_id: string;
   status: string;
-  input_type: Mode;
+  input_type: InputType;
   input_text?: string;
   extracted_info?: {
     event_type: string;
@@ -65,6 +64,19 @@ type Task = {
   report_markdown?: string;
   degraded_nodes?: string[];
   error_message?: string;
+};
+
+type IntakeResponse = {
+  session_id: string;
+  assistant_reply: string;
+  analysis_input: string;
+  ready_to_analyze: boolean;
+  missing_information: string[];
+};
+
+const INITIAL_MESSAGE: ChatMessage = {
+  role: "assistant",
+  content: "请告诉我这次要了解的人物、企业，以及准备讨论或推动的事情。"
 };
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
@@ -110,32 +122,25 @@ const STATUS_ORDER = [
   "COMPLETED"
 ];
 
-function formatDuration(seconds: number) {
-  const minutes = Math.floor(seconds / 60).toString().padStart(2, "0");
-  const remainder = (seconds % 60).toString().padStart(2, "0");
-  return `${minutes}:${remainder}`;
-}
-
 function safeReportUrl(url: string) {
   return /^https?:\/\//i.test(url) ? url : "";
 }
 
 export default function Home() {
-  const [mode, setMode] = useState<Mode>("text");
-  const [text, setText] = useState("");
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([INITIAL_MESSAGE]);
+  const [chatInput, setChatInput] = useState("");
+  const [chatSessionId, setChatSessionId] = useState<string | null>(null);
+  const [analysisInput, setAnalysisInput] = useState("");
+  const [readyToAnalyze, setReadyToAnalyze] = useState(false);
+  const [missingInformation, setMissingInformation] = useState<string[]>([]);
+  const [isChatting, setIsChatting] = useState(false);
   const [task, setTask] = useState<Task | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
-  const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [error, setError] = useState("");
   const [reportTab, setReportTab] = useState<ReportTab>("detailed");
   const [selections, setSelections] = useState<Record<string, string>>({});
   const [manualValues, setManualValues] = useState<Record<string, string>>({});
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const cancelledRef = useRef(false);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const chatThreadRef = useRef<HTMLDivElement | null>(null);
 
   const fetchTask = useCallback(async (taskId: string) => {
     const response = await fetch(`${API_BASE}/api/v1/tasks/${taskId}`);
@@ -154,15 +159,49 @@ export default function Home() {
   }, [fetchTask, task]);
 
   useEffect(() => {
-    return () => {
-      if (timerRef.current) clearInterval(timerRef.current);
-      streamRef.current?.getTracks().forEach((track) => track.stop());
-    };
-  }, []);
+    chatThreadRef.current?.scrollTo({ top: chatThreadRef.current.scrollHeight });
+  }, [chatMessages, isChatting]);
 
-  const createTextTask = async () => {
-    if (!text.trim()) {
-      setError("请输入要分析的内容");
+  const sendChatMessage = async () => {
+    const content = chatInput.trim();
+    if (!content || isChatting) return;
+    const nextMessages: ChatMessage[] = [...chatMessages, { role: "user", content }];
+    setChatMessages(nextMessages);
+    setChatInput("");
+    setError("");
+    setIsChatting(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/intake/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...(chatSessionId ? { session_id: chatSessionId } : {}),
+          messages: nextMessages
+        })
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        throw new Error(payload.detail ?? "对话助手暂时不可用");
+      }
+      const payload = (await response.json()) as IntakeResponse;
+      setChatSessionId(payload.session_id);
+      setAnalysisInput(payload.analysis_input);
+      setReadyToAnalyze(payload.ready_to_analyze);
+      setMissingInformation(payload.missing_information);
+      setChatMessages((current) => [
+        ...current,
+        { role: "assistant", content: payload.assistant_reply }
+      ]);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "对话助手暂时不可用");
+    } finally {
+      setIsChatting(false);
+    }
+  };
+
+  const startAnalysis = async () => {
+    if (!analysisInput.trim()) {
+      setError("请先通过对话提供本次分析的信息");
       return;
     }
     setError("");
@@ -171,7 +210,7 @@ export default function Home() {
       const response = await fetch(`${API_BASE}/api/v1/tasks/text`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: text.trim() })
+        body: JSON.stringify({ text: analysisInput.trim() })
       });
       if (!response.ok) throw new Error("任务创建失败");
       setTask(await response.json());
@@ -182,86 +221,15 @@ export default function Home() {
     }
   };
 
-  const uploadRecording = async (blob: Blob) => {
-    setIsSubmitting(true);
-    setError("");
-    const body = new FormData();
-    body.append("audio", blob, "recording.webm");
-    try {
-      const response = await fetch(`${API_BASE}/api/v1/tasks/audio`, {
-        method: "POST",
-        body
-      });
-      if (!response.ok) throw new Error("语音上传失败，请重新录制");
-      setTask(await response.json());
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "语音上传失败，请重新录制");
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  const stopTracks = () => {
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    streamRef.current = null;
-    if (timerRef.current) clearInterval(timerRef.current);
-    timerRef.current = null;
-    setIsRecording(false);
-  };
-
-  const startRecording = async () => {
-    if (!navigator.mediaDevices || !window.MediaRecorder) {
-      setError("当前浏览器不支持网页录音，请使用最新版桌面端 Chrome");
-      return;
-    }
-    if (!MediaRecorder.isTypeSupported("audio/webm")) {
-      setError("当前浏览器不支持 WebM 录音，请使用最新版桌面端 Chrome");
-      return;
-    }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
-      streamRef.current = stream;
-      recorderRef.current = recorder;
-      chunksRef.current = [];
-      cancelledRef.current = false;
-      setRecordingSeconds(0);
-      setError("");
-      recorder.ondataavailable = (event) => {
-        if (event.data.size) chunksRef.current.push(event.data);
-      };
-      recorder.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
-        stopTracks();
-        if (!cancelledRef.current && blob.size) void uploadRecording(blob);
-      };
-      recorder.start(1000);
-      setIsRecording(true);
-      timerRef.current = setInterval(() => {
-        setRecordingSeconds((current) => {
-          if (current + 1 >= 900) recorder.stop();
-          return Math.min(current + 1, 900);
-        });
-      }, 1000);
-    } catch {
-      setError("无法使用麦克风，请在浏览器设置中允许麦克风权限");
-      stopTracks();
-    }
-  };
-
-  const stopRecording = () => {
-    if (recorderRef.current?.state === "recording") recorderRef.current.stop();
-  };
-
-  const cancelRecording = () => {
-    cancelledRef.current = true;
-    if (recorderRef.current?.state === "recording") recorderRef.current.stop();
-  };
-
   const reset = () => {
     setTask(null);
     setError("");
-    setRecordingSeconds(0);
+    setChatMessages([INITIAL_MESSAGE]);
+    setChatInput("");
+    setChatSessionId(null);
+    setAnalysisInput("");
+    setReadyToAnalyze(false);
+    setMissingInformation([]);
     setSelections({});
     setManualValues({});
     setReportTab("detailed");
@@ -327,7 +295,13 @@ export default function Home() {
         <aside className="progress-panel" aria-label="处理进度">
           <div className="section-label">处理进度</div>
           <ol className="steps">
-            {visibleStatuses.slice(0, -1).map((status, index) => {
+            {!task && (
+              <li className="active">
+                <span className="step-dot">1</span>
+                <span>对话收集信息</span>
+              </li>
+            )}
+            {task && visibleStatuses.slice(0, -1).map((status, index) => {
               const done = task?.status === "COMPLETED" || visibleCurrentIndex > index;
               const active = task?.status === status;
               return (
@@ -342,57 +316,69 @@ export default function Home() {
 
         <section className="main-column">
           {!task && (
-            <div className="input-panel">
+            <div className="input-panel chat-panel">
               <div className="panel-heading">
                 <div>
-                  <span className="section-label">新建调查</span>
-                  <h2>录入活动信息</h2>
+                  <span className="section-label">信息采集</span>
+                  <h2>会前调查对话</h2>
                 </div>
-                <div className="mode-control" role="tablist">
-                  <button disabled={isRecording || isSubmitting} className={mode === "text" ? "selected" : ""} onClick={() => setMode("text")}>
-                    <FileText size={16} />文字
-                  </button>
-                  <button disabled={isRecording || isSubmitting} className={mode === "audio" ? "selected" : ""} onClick={() => setMode("audio")}>
-                    <Mic size={16} />语音
-                  </button>
+                <div className={`intake-status ${readyToAnalyze ? "ready" : ""}`}>
+                  {readyToAnalyze ? <Check size={14} /> : <MessageSquare size={14} />}
+                  {readyToAnalyze ? "信息已基本齐全" : "正在收集信息"}
                 </div>
               </div>
 
-              {mode === "text" ? (
-                <div className="text-entry">
-                  <textarea
-                    value={text}
-                    onChange={(event) => setText(event.target.value)}
-                    maxLength={10000}
-                    placeholder="老板周五要和比亚迪股份有限公司的王传福董事长兼总裁吃饭，主要聊新能源和储能项目。"
-                  />
-                  <div className="entry-footer">
-                    <span>{text.length.toLocaleString()} / 10,000</span>
-                    <button className="primary-button" disabled={isSubmitting} onClick={createTextTask}>
-                      {isSubmitting ? <LoaderCircle className="spin" size={17} /> : <Search size={17} />}
-                      开始分析
-                    </button>
+              <div className="chat-thread" ref={chatThreadRef} aria-live="polite">
+                {chatMessages.map((message, index) => (
+                  <div key={`${message.role}-${index}`} className={`chat-row ${message.role}`}>
+                    <div className="chat-bubble">{message.content}</div>
                   </div>
+                ))}
+                {isChatting && (
+                  <div className="chat-row assistant">
+                    <div className="chat-bubble chat-typing"><LoaderCircle className="spin" size={15} />正在整理</div>
+                  </div>
+                )}
+              </div>
+
+              <div className="chat-composer">
+                <textarea
+                  value={chatInput}
+                  onChange={(event) => setChatInput(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey) {
+                      event.preventDefault();
+                      void sendChatMessage();
+                    }
+                  }}
+                  maxLength={2000}
+                  rows={3}
+                  placeholder="输入本次会面或项目的信息"
+                  disabled={isChatting || isSubmitting}
+                />
+                <button
+                  className="send-button"
+                  onClick={sendChatMessage}
+                  disabled={!chatInput.trim() || isChatting || isSubmitting}
+                  title="发送"
+                >
+                  <Send size={18} />
+                </button>
+              </div>
+
+              <div className="chat-actions">
+                <div className="intake-hint">
+                  {missingInformation.length > 0
+                    ? `待补充：${missingInformation.join("、")}`
+                    : analysisInput
+                      ? "可以继续补充，也可以立即开始分析"
+                      : "发送第一条消息后可开始分析"}
                 </div>
-              ) : (
-                <div className={`voice-entry ${isRecording ? "recording" : ""}`}>
-                  <button
-                    className="record-button"
-                    onClick={isRecording ? stopRecording : startRecording}
-                    disabled={isSubmitting}
-                    title={isRecording ? "停止并上传" : "开始录音"}
-                  >
-                    {isRecording ? <Square size={25} fill="currentColor" /> : <Mic size={29} />}
-                  </button>
-                  <strong>{isRecording ? "正在录音" : isSubmitting ? "正在上传" : "准备录音"}</strong>
-                  <span className="timer">{formatDuration(recordingSeconds)}</span>
-                  {isRecording && (
-                    <button className="cancel-button" onClick={cancelRecording} title="取消录音">
-                      <X size={16} />取消
-                    </button>
-                  )}
-                </div>
-              )}
+                <button className="primary-button" disabled={!analysisInput || isSubmitting || isChatting} onClick={startAnalysis}>
+                  {isSubmitting ? <LoaderCircle className="spin" size={17} /> : <Search size={17} />}
+                  立即分析
+                </button>
+              </div>
               {error && <div className="error-banner"><AlertCircle size={17} />{error}</div>}
             </div>
           )}

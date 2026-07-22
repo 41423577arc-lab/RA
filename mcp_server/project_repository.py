@@ -1,7 +1,7 @@
 from collections.abc import Iterable
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Date, String, Text, create_engine, or_, select
+from sqlalchemy import ARRAY, Date, Numeric, SmallInteger, String, Text, create_engine, or_, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from app.schemas.task import ProjectResult
@@ -25,6 +25,17 @@ class InternalProject(Base):
     end_date: Mapped[object | None] = mapped_column(Date)
     description: Mapped[str] = mapped_column(Text)
     project_embedding: Mapped[list[float]] = mapped_column(Vector(512))
+    project_aliases: Mapped[list[str]] = mapped_column(ARRAY(String), default=list)
+    customer_id: Mapped[str] = mapped_column(String(16))
+    customer_contact_id: Mapped[str] = mapped_column(String(16))
+    sales_rep_id: Mapped[str] = mapped_column(String(16))
+    project_stage: Mapped[str] = mapped_column(String(24))
+    health_status: Mapped[str] = mapped_column(String(8))
+    priority: Mapped[str] = mapped_column(String(8))
+    contract_value: Mapped[object] = mapped_column(Numeric(14, 2))
+    win_probability: Mapped[int] = mapped_column(SmallInteger)
+    last_activity_date: Mapped[object] = mapped_column(Date)
+    next_followup_date: Mapped[object | None] = mapped_column(Date)
 
 
 PRIORITY = {"PERSON_EXACT": 0, "ORG_EXACT": 1, "TEXT_MATCH": 2, "VECTOR_MATCH": 3}
@@ -60,6 +71,52 @@ class ProjectRepository:
             key=lambda item: (PRIORITY[item[0]], -(item[1] or 0.0), item[2].project_id),
         )[:10]
         return [self._to_result(project, match_type, similarity) for match_type, similarity, project in ordered]
+
+    def get_project_details(self, project_id: str) -> dict | None:
+        statement = text(
+            """
+            SELECT
+                p.project_id, p.project_name, p.customer_name, p.status, p.project_stage,
+                p.health_status, p.priority, CAST(p.contract_value AS DOUBLE PRECISION) AS contract_value,
+                p.win_probability, p.start_date, p.end_date, p.last_activity_date,
+                p.next_followup_date, p.description,
+                cc.contact_name AS customer_contact_name, cc.job_title AS customer_contact_title,
+                cc.phone AS customer_contact_phone,
+                sr.sales_rep_id, sr.sales_rep_name, sr.phone AS sales_rep_phone,
+                sm.manager_id, sm.manager_name, sm.region_name
+            FROM internal_projects p
+            JOIN customer_contacts cc ON cc.contact_id = p.customer_contact_id
+            JOIN sales_representatives sr ON sr.sales_rep_id = p.sales_rep_id
+            JOIN sales_managers sm ON sm.manager_id = sr.manager_id
+            WHERE p.project_id = :project_id
+            """
+        )
+        with self.session_factory() as session:
+            row = session.execute(statement, {"project_id": project_id}).mappings().one_or_none()
+            return dict(row) if row else None
+
+    def get_sales_portfolio(
+        self, manager_name: str | None = None, sales_rep_name: str | None = None
+    ) -> list[dict]:
+        statement = text(
+            """
+            SELECT
+                sales_rep_id, sales_rep_name, sales_rep_phone, manager_id, manager_name,
+                region_name, status, project_stage, project_count,
+                CAST(total_contract_value AS DOUBLE PRECISION) AS total_contract_value,
+                CAST(average_win_probability AS DOUBLE PRECISION) AS average_win_probability
+            FROM sales_rep_project_status_summary
+            WHERE (CAST(:manager_name AS TEXT) IS NULL OR manager_name = :manager_name)
+              AND (CAST(:sales_rep_name AS TEXT) IS NULL OR sales_rep_name = :sales_rep_name)
+            ORDER BY manager_id, sales_rep_id, status, project_stage
+            """
+        )
+        with self.session_factory() as session:
+            rows = session.execute(
+                statement,
+                {"manager_name": manager_name, "sales_rep_name": sales_rep_name},
+            ).mappings()
+            return [dict(row) for row in rows]
 
     def _add_exact_matches(
         self,
@@ -132,6 +189,7 @@ class ProjectRepository:
         return ProjectResult(
             project_id=project.project_id,
             project_name=project.project_name,
+            project_aliases=project.project_aliases,
             customer_name=project.customer_name,
             contact_name=project.contact_name,
             status=project.status,
@@ -139,6 +197,14 @@ class ProjectRepository:
             start_date=project.start_date,
             end_date=project.end_date,
             description=project.description,
+            sales_rep_id=project.sales_rep_id,
+            project_stage=project.project_stage,
+            health_status=project.health_status,
+            priority=project.priority,
+            contract_value=float(project.contract_value),
+            win_probability=project.win_probability,
+            last_activity_date=project.last_activity_date,
+            next_followup_date=project.next_followup_date,
             match_type=match_type,
             similarity=similarity,
         )
