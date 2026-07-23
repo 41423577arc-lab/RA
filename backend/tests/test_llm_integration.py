@@ -414,12 +414,10 @@ class NoopTranscriber:
 
 class Web:
     async def search(self, queries):
-        from app.schemas.task import SearchResult
-
-        return [SearchResult(title="比亚迪动态", url="https://example.com/byd", query=queries[0], rank=0)]
+        raise AssertionError("Pipeline must not search the public web")
 
     async def extract(self, _):
-        return [WebPage(title="比亚迪动态", url="https://example.com/byd", raw_content="王传福表示比亚迪股份有限公司继续推进新能源和储能业务。", rank=0)]
+        raise AssertionError("Pipeline must not extract public pages")
 
 
 class Projects:
@@ -474,11 +472,9 @@ def test_v05_pipeline_completes_with_all_llm_nodes_degraded() -> None:
 
     pipeline.run(task.id)
 
-    assert task.status == "COMPLETED"
+    assert task.status == "COMPLETED", getattr(task, "error_message", None)
     assert set(task.degraded_nodes) == {
         "understanding",
-        "web_plan",
-        "web_verify",
         "project_query",
         "project_rerank",
         "association",

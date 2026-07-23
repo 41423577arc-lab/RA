@@ -142,7 +142,7 @@ def confirm_task(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     repository.update(
         str(task_id),
-        status="PLANNING_WEB_SEARCH",
+        status="PLANNING_PROJECT_SEARCH",
         confirmed_context=context.model_dump(mode="json"),
         confirmed_at=datetime.now(timezone.utc),
         error_message=None,

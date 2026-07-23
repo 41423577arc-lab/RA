@@ -396,7 +396,7 @@ def fallback_association(
     ]
     gaps = []
     if not claims:
-        gaps.append(EvidenceBackedItem(text="缺少通过身份核验的公开信息", statement_type="FACT", evidence_refs=["INPUT:ORIGINAL"], confidence=1))
+        gaps.append(EvidenceBackedItem(text="本次未使用联网身份来源", statement_type="FACT", evidence_refs=["INPUT:ORIGINAL"], confidence=1))
     if not projects:
         gaps.append(EvidenceBackedItem(text="未检索到相关内部项目", statement_type="FACT", evidence_refs=["INPUT:ORIGINAL"], confidence=1))
     return AssociationAnalysis(
@@ -434,13 +434,22 @@ def fallback_report_content(
     input_text: str,
     context: ConfirmedContext,
     analysis: AssociationAnalysis,
+    claims: list[PublicClaim],
     projects: list[ProjectResult],
 ) -> GeneratedReportContent:
     people = [entity.canonical_name for entity in context.entities if entity.entity_type == "PERSON"]
     return GeneratedReportContent(
         task_overview=build_task_overview(context),
-        person_and_company_summary=[],
-        public_information_summary=analysis.key_findings,
+        person_and_company_summary=[
+            EvidenceBackedItem(
+                text=claim.claim,
+                statement_type="FACT",
+                evidence_refs=[f"WEB:{claim.web_result_id}:{claim.evidence_id}"],
+                confidence=claim.confidence,
+            )
+            for claim in claims[:5]
+        ],
+        public_information_summary=[],
         priority_projects=analysis.related_projects,
         resource_analysis=analysis.available_resources,
         recommended_topics=analysis.recommended_topics,
@@ -453,7 +462,7 @@ def fallback_report_content(
             objective="围绕用户关注的业务方向了解合作机会",
             discussion_topics=context.business_directions,
             internal_contacts=unique([project.owner_name for project in projects]),
-            preparation_items=["核对公开信息来源", "联系相关项目负责人了解最新进展"],
+            preparation_items=["核对关键人身份", "联系相关项目负责人了解最新进展"],
             risks=[item.text for item in analysis.risks],
             evidence_refs=unique(
                 [ref for section in analysis.model_dump().values() if isinstance(section, list) for item in section for ref in item.get("evidence_refs", [])]
@@ -493,9 +502,7 @@ def validate_report_content(
         "person_and_company_summary": clean(
             content.person_and_company_summary, allowed
         ),
-        "public_information_summary": clean(
-            content.public_information_summary, web_refs
-        ),
+        "public_information_summary": [],
         "priority_projects": clean(content.priority_projects, project_refs),
         "resource_analysis": clean(content.resource_analysis, web_refs | project_refs),
         "recommended_topics": clean(content.recommended_topics, allowed),

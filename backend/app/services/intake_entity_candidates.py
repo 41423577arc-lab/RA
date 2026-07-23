@@ -5,6 +5,7 @@ from collections.abc import Callable
 
 from app.schemas.intake import (
     ExternalIdentityNormalizationResult,
+    IntakeEntityResolution,
     IntakeStructuredContext,
 )
 from app.schemas.task import CandidateOption, ConfirmationItem, ConfirmationRequest
@@ -27,6 +28,21 @@ class IntakeEntityCandidateService:
             [list[dict], list[dict]], ExternalIdentityNormalizationResult
         ]
         | None = None,
+    ) -> tuple[list[dict], ConfirmationRequest | None]:
+        resolutions, confirmation = self.lookup_internal(context, version, source_text)
+        if confirmation and external_normalizer and any(
+            len(item.candidates) != 1 for item in confirmation.items
+        ):
+            confirmation = self.search_key_person_identity_web(
+                context, confirmation, external_normalizer
+            )
+        return self.apply_automatic_candidates(resolutions, confirmation)
+
+    def lookup_internal(
+        self,
+        context: IntakeStructuredContext,
+        version: int,
+        source_text: str | None = None,
     ) -> tuple[list[dict], ConfirmationRequest | None]:
         if not context.people and not context.organizations:
             return [], None
@@ -96,15 +112,43 @@ class IntakeEntityCandidateService:
                     )
                 )
 
-        external_pending = [item for item in pending if not item[2]]
-        pages = self._external_pages(person, organization) if external_pending else []
+        items = [
+            ConfirmationItem(
+                mention=mention,
+                entity_type=entity_type,
+                candidates=self._unique(options)[:5],
+            )
+            for entity_type, mention, options in pending
+        ]
+        return resolutions, ConfirmationRequest(version=version, items=items)
+
+    def search_key_person_identity_web(
+        self,
+        context: IntakeStructuredContext,
+        confirmation: ConfirmationRequest,
+        external_normalizer: Callable[
+            [list[dict], list[dict]], ExternalIdentityNormalizationResult
+        ],
+    ) -> ConfirmationRequest:
+        external_pending = [
+            item for item in confirmation.items if len(item.candidates) != 1
+        ]
+        if not external_pending:
+            return confirmation
+        person = context.people[0] if context.people else None
+        organization = context.organizations[0] if context.organizations else None
+        pages = self._external_pages(person, organization)
         normalized_external: list[tuple[str, CandidateOption]] = []
-        if pages and external_normalizer:
+        if pages:
             try:
                 normalized = external_normalizer(
                     [
-                        {"entity_type": entity_type, "mention": mention}
-                        for entity_type, mention, _ in external_pending
+                        {
+                            "entity_type": item.entity_type,
+                            "mention": item.mention,
+                            "known_organization": organization,
+                        }
+                        for item in external_pending
                     ],
                     [page.model_dump(mode="json") for page in pages],
                 )
@@ -114,37 +158,80 @@ class IntakeEntityCandidateService:
             except Exception:
                 normalized_external = []
         items: list[ConfirmationItem] = []
-        for entity_type, mention, options in pending:
-            if not options:
+        for item in confirmation.items:
+            options = list(item.candidates)
+            if len(options) != 1:
                 options.extend(
-                    item
-                    for normalized_mention, item in normalized_external
-                    if normalized_mention == mention and item.entity_type == entity_type
+                    option
+                    for normalized_mention, option in normalized_external
+                    if normalized_mention == item.mention
+                    and option.entity_type == item.entity_type
                 )
                 options.extend(
                     self._rule_external_options(
                         pages,
-                        mention,
-                        entity_type,
-                        organization if entity_type == "PERSON" else None,
+                        item.mention,
+                        item.entity_type,
+                        organization if item.entity_type == "PERSON" else None,
                     )
                 )
             items.append(
                 ConfirmationItem(
-                    mention=mention,
-                    entity_type=entity_type,
+                    mention=item.mention,
+                    entity_type=item.entity_type,
                     candidates=self._unique(options)[:5],
                 )
             )
+        return ConfirmationRequest(version=confirmation.version, items=items)
 
-        if items:
-            return resolutions, ConfirmationRequest(version=version, items=items)
+    @staticmethod
+    def apply_automatic_candidates(
+        resolutions: list[dict],
+        confirmation: ConfirmationRequest | None,
+        threshold: float = 0.80,
+    ) -> tuple[list[dict], ConfirmationRequest | None]:
+        if confirmation is None:
+            return resolutions, None
+        pending: list[ConfirmationItem] = []
+        for item in confirmation.items:
+            eligible = [
+                option for option in item.candidates if option.confidence >= threshold
+            ]
+            external_eligible = [
+                option
+                for option in eligible
+                if option.source_url
+            ]
+            if len(external_eligible) == 1:
+                eligible = external_eligible
+            canonical_names = {option.canonical_name for option in eligible}
+            if len(eligible) == 1 and len(canonical_names) == 1:
+                option = eligible[0]
+                resolutions.append(
+                    IntakeEntityResolution(
+                        **option.model_dump(mode="json"),
+                        mention=item.mention,
+                        confirmed_by=(
+                            "EXTERNAL_AUTO"
+                            if option.source_url
+                            else "INTERNAL"
+                        ),
+                    ).model_dump(mode="json")
+                )
+            else:
+                pending.append(item)
+        if pending:
+            return resolutions, ConfirmationRequest(
+                version=confirmation.version, items=pending
+            )
         return resolutions, None
 
     def _external_pages(self, person: str | None, organization: str | None):
         query = " ".join(f'"{value}"' for value in (person, organization) if value)
         try:
-            results = asyncio.run(self.web.search([f"{query} 身份 职务"]))
+            results = asyncio.run(
+                self.web.search([f"{query} 完整姓名 企业全称 职位"])
+            )
             return asyncio.run(self.web.extract(results)) if results else []
         except Exception:
             return []
@@ -189,7 +276,7 @@ class IntakeEntityCandidateService:
                         canonical_name=item.canonical_name,
                         organization=item.organization,
                         title=item.title,
-                        reason="联网公开资料补充的标准身份候选，必须由用户确认",
+                        reason="联网公开资料补充的关键人标准身份候选",
                         confidence=item.confidence,
                         source_url=item.source_url,
                         evidence_quote=item.evidence_quote,
@@ -264,6 +351,7 @@ def user_provided_entity_resolutions(
                         if entity_type == "PERSON"
                         else None,
                         "title": detail.title if detail else None,
+                        "confidence": 1.0,
                         "confirmed_by": "USER_INPUT",
                     }
                 )

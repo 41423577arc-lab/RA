@@ -1,6 +1,6 @@
 # 资源推动 Agent Demo
 
-资源调查 Demo：规则提取与确定性降级、`MiniMax-M3` Chat Completions + Pydantic 结构化理解、Tavily Search/Extract、MCP 内部实体与项目查询、证据核验、关联分析和 Jinja2 报告。
+资源调查 Demo：规则提取与确定性降级、`MiniMax-M3` Chat Completions + Pydantic 结构化理解、intake 阶段受控的 Tavily 关键人身份补全、MCP 内部实体与项目查询、关联分析和 Jinja2 报告。
 
 ## 启动
 

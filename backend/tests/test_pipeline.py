@@ -5,7 +5,10 @@ from types import SimpleNamespace
 from app.schemas.task import ProjectResult, SearchResult, WebPage
 from app.services.extractor import RuleExtractor
 from app.services.report_renderer import ReportRenderer
-from app.tasks.pipeline import ResearchPipeline, build_search_queries
+from app.tasks.pipeline import (
+    ResearchPipeline,
+    identity_claims_from_intake_snapshot,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -65,7 +68,7 @@ class FakeWeb:
 
 class FailedWeb:
     async def search(self, _):
-        raise RuntimeError("offline")
+        raise AssertionError("Pipeline must not search the public web")
 
     async def extract(self, _):
         raise AssertionError("Extract must be skipped after search failure")
@@ -119,17 +122,31 @@ def make_pipeline(repository, web):
     )
 
 
-def test_query_builder_omits_null_fields_and_deduplicates() -> None:
-    extracted = RuleExtractor(ROOT / "seed").extract(
-        "王传福董事长兼总裁和比亚迪股份有限公司参加会议。"
+def test_pipeline_reuses_only_intake_identity_evidence() -> None:
+    claims = identity_claims_from_intake_snapshot(
+        {
+            "structured_context": {
+                "entity_resolutions": [
+                    {
+                        "entity_type": "PERSON",
+                        "mention": "王总",
+                        "canonical_name": "王传福",
+                        "organization": "比亚迪股份有限公司",
+                        "title": "董事长兼总裁",
+                        "confidence": 0.9,
+                        "confirmed_by": "EXTERNAL_AUTO",
+                        "source_url": "https://example.com/identity",
+                        "evidence_quote": "王传福任比亚迪股份有限公司董事长兼总裁。",
+                    }
+                ]
+            }
+        }
     )
-    queries = build_search_queries(extracted)
 
-    assert queries == [
-        "王传福 比亚迪股份有限公司 董事长兼总裁 负责业务",
-        "比亚迪股份有限公司 主营业务 项目",
-    ]
-    assert "None" not in " ".join(queries)
+    assert len(claims) == 1
+    assert claims[0].claim == "王传福（比亚迪股份有限公司、董事长兼总裁）"
+    assert claims[0].matched_keywords == []
+    assert "业务" not in claims[0].claim
 
 
 def test_full_text_pipeline_generates_report_and_all_states() -> None:
@@ -141,20 +158,17 @@ def test_full_text_pipeline_generates_report_and_all_states() -> None:
     )
     repository = FakeRepository(task)
 
-    make_pipeline(repository, FakeWeb()).run(task.id)
+    make_pipeline(repository, FailedWeb()).run(task.id)
 
     assert repository.statuses == [
         "EXTRACTING",
-        "WEB_SEARCHING",
-        "WEB_FETCHING",
         "PROJECT_SEARCHING",
         "GENERATING",
         "COMPLETED",
     ]
-    assert "比亚迪公司简介" in task.report_markdown
     assert "比亚迪园区储能管理平台" in task.report_markdown
     assert "比亚迪新能源汽车供应链分析" in task.report_markdown
-    assert task.web_search_status == "SUCCESS"
+    assert task.web_search_status == "SKIPPED"
     assert task.internal_search_status == "SUCCESS"
 
 
@@ -170,9 +184,9 @@ def test_search_failure_is_partial_and_internal_projects_continue() -> None:
     make_pipeline(repository, FailedWeb()).run(task.id)
 
     assert task.status == "COMPLETED"
-    assert task.web_search_status == "FAILED"
+    assert task.web_search_status == "SKIPPED"
     assert task.web_fetch_status == "SKIPPED"
-    assert "公开网络信息检索失败" in task.report_markdown
+    assert "本次没有可复用的联网身份来源" in task.report_markdown
     assert "比亚迪园区储能管理平台" in task.report_markdown
 
 
@@ -190,7 +204,7 @@ def test_audio_pipeline_transcribes_and_deletes_shared_file(tmp_path) -> None:
         repository=repository,
         transcriber=FakeTranscriber(),
         extractor=RuleExtractor(ROOT / "seed"),
-        web=FakeWeb(),
+        web=FailedWeb(),
         projects=FakeProjects(),
         renderer=ReportRenderer(ROOT / "backend/templates/report.md.j2"),
     )
@@ -215,7 +229,7 @@ def test_mcp_failure_is_partial_and_public_information_continues() -> None:
         repository=repository,
         transcriber=NoopTranscriber(),
         extractor=RuleExtractor(ROOT / "seed"),
-        web=FakeWeb(),
+        web=FailedWeb(),
         projects=FailedProjects(),
         renderer=ReportRenderer(ROOT / "backend/templates/report.md.j2"),
     )
@@ -225,4 +239,4 @@ def test_mcp_failure_is_partial_and_public_information_continues() -> None:
     assert task.status == "COMPLETED"
     assert task.internal_search_status == "FAILED"
     assert "公司内部项目信息检索失败" in task.report_markdown
-    assert "比亚迪公司简介" in task.report_markdown
+    assert task.web_search_status == "SKIPPED"

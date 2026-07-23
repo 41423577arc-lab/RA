@@ -356,44 +356,79 @@ def chat(
                     ],
                 }
             )
+            lookup_internal = getattr(entity_candidates, "lookup_internal", None)
+            if callable(lookup_internal):
+                resolutions, confirmation = lookup_internal(
+                    candidate_context, next_version, source_text
+                )
+            else:
+                resolutions, confirmation = entity_candidates.resolve(
+                    candidate_context, next_version, source_text
+                )
+            apply_automatic = getattr(
+                entity_candidates, "apply_automatic_candidates", None
+            )
+            if callable(apply_automatic):
+                resolutions, confirmation = apply_automatic(
+                    resolutions,
+                    confirmation,
+                    settings.llm_web_identity_threshold,
+                )
+            tool_decision = None
+            follow_up = getattr(intake_agent, "follow_up", None)
+            if confirmation and settings.intake_react_enabled and callable(follow_up):
+                internal_observation = {
+                    "tool": "lookup_internal_identity",
+                    "resolved_count": len(resolutions),
+                    "unresolved": [
+                        {
+                            "mention": item.mention,
+                            "entity_type": item.entity_type,
+                            "candidate_count": len(item.candidates),
+                        }
+                        for item in confirmation.items
+                    ],
+                    "external_search_allowed": any(
+                        len(item.candidates) != 1 for item in confirmation.items
+                    ),
+                }
+                try:
+                    tool_decision = follow_up(
+                        request, result, internal_observation
+                    )
+                except (LLMUnavailable, LLMCallFailed):
+                    pass
+
             external_normalizer = getattr(
                 intake_agent, "normalize_external_identity", None
             )
-            resolutions, confirmation = entity_candidates.resolve(
-                candidate_context,
-                next_version,
-                source_text,
-                (
+            if (
+                confirmation
+                and tool_decision is not None
+                and tool_decision.next_action == "SEARCH_EXTERNAL"
+                and any(len(item.candidates) != 1 for item in confirmation.items)
+                and callable(external_normalizer)
+            ):
+                confirmation = entity_candidates.search_key_person_identity_web(
+                    candidate_context,
+                    confirmation,
                     lambda mentions, pages: external_normalizer(
                         request, mentions, pages
-                    )
+                    ),
                 )
-                if settings.intake_react_enabled and callable(external_normalizer)
-                else None,
-            )
+                resolutions, confirmation = apply_automatic(
+                    resolutions,
+                    confirmation,
+                    settings.llm_web_identity_threshold,
+                )
             resolutions = _merge_resolutions(existing_resolutions, resolutions)
             resolutions = _align_resolution_relationships(
                 resolutions, result.structured_context
             )
             stored_context = _standardized_context(stored_context, resolutions)
-            observation = {
-                "resolved_count": len(resolutions),
-                "needs_confirmation": confirmation is not None,
-                "candidate_count": sum(
-                    len(item.candidates) for item in confirmation.items
-                )
-                if confirmation
-                else 0,
-            }
-            follow_up_reply = None
-            follow_up = getattr(intake_agent, "follow_up", None)
-            if confirmation and settings.intake_react_enabled and callable(follow_up):
-                try:
-                    follow_up_reply = follow_up(
-                        request, result, observation
-                    ).assistant_reply
-                except (LLMUnavailable, LLMCallFailed):
-                    pass
+            follow_up_reply = (
+                tool_decision.assistant_reply if tool_decision is not None else None
+            )
             if confirmation:
                 confirmation_request = confirmation.model_dump(mode="json")
                 ready = False
@@ -401,8 +436,8 @@ def chat(
                     "请确认人物或企业候选，确认后即可开始分析。"
                 )
                 result.missing_information = ["人物或企业身份确认"]
-            elif follow_up_reply:
-                result.assistant_reply = follow_up_reply
+            else:
+                result.assistant_reply = "关键人身份已经标准化，可以开始分析。"
         else:
             stored_context = _standardized_context(
                 stored_context, existing_resolutions
