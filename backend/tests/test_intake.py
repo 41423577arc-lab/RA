@@ -151,6 +151,23 @@ def test_intake_chat_rejects_empty_messages() -> None:
     assert response.status_code == 422
 
 
+def test_intake_activity_endpoint_reports_current_tool() -> None:
+    session_id = uuid4()
+    intake_api.intake_activity.update(
+        str(session_id),
+        "CALLING_TOOL",
+        "正在联网补全关键人身份",
+        tool_name="search_key_person_identity_web",
+    )
+
+    with TestClient(app) as client:
+        response = client.get(f"/api/v1/intake/{session_id}/activity")
+
+    assert response.status_code == 200
+    assert response.json()["active"] is True
+    assert response.json()["tool_name"] == "search_key_person_identity_web"
+
+
 def test_ready_requires_server_side_context_validation() -> None:
     result = IntakeChatResult(
         assistant_reply="可以开始分析。",

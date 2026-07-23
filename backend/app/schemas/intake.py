@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Literal
 from uuid import UUID, uuid4
 
@@ -109,6 +110,24 @@ class IntakeSessionResponse(IntakeChatResponse):
     messages: list[IntakeMessage]
     research_task_id: UUID | None = None
     active_audio_job: dict | None = None
+
+
+class IntakeActivityResponse(BaseModel):
+    session_id: UUID
+    phase: Literal[
+        "IDLE",
+        "THINKING",
+        "CHECKING_CONTEXT",
+        "CALLING_TOOL",
+        "PROCESSING_TOOL_RESULT",
+        "COMPLETED",
+        "FAILED",
+    ]
+    detail: str
+    active: bool
+    tool_name: str | None = None
+    sequence: int = Field(ge=0)
+    updated_at: datetime | None = None
 
 
 class StartAnalysisRequest(BaseModel):

@@ -10,6 +10,7 @@ from app.config import settings
 from app.database import IntakeSessionRepository, get_session
 from app.models.database import IntakeAudioJob, IntakeSession, ResearchTask
 from app.schemas.intake import (
+    IntakeActivityResponse,
     IntakeChatRequest,
     IntakeChatResponse,
     IntakeChatResult,
@@ -20,6 +21,7 @@ from app.schemas.intake import (
 )
 from app.schemas.task import TaskCreated
 from app.schemas.task import ConfirmationPayload
+from app.services.intake_activity import intake_activity
 from app.services.intake_agent import IntakeAgent
 from app.services.intake_completeness import (
     is_intake_ready,
@@ -268,6 +270,7 @@ def chat(
 ) -> IntakeChatResponse:
     repository = IntakeSessionRepository(session)
     session_id = str(request.session_id)
+    intake_activity.update(session_id, "THINKING", "大模型正在理解当前对话")
     intake_session = repository.get(session_id)
     incoming_messages = [message.model_dump() for message in request.messages]
 
@@ -280,6 +283,9 @@ def chat(
             and stored_messages[:-1] == incoming_messages
             and stored_messages[-1].get("role") == "assistant"
         ):
+            intake_activity.update(
+                session_id, "COMPLETED", "已返回当前对话结果", active=False
+            )
             return _chat_response(intake_session)
         if stored_messages and incoming_messages[: len(stored_messages)] != stored_messages:
             raise HTTPException(status_code=409, detail="会话内容已更新，请刷新后重试")
@@ -296,6 +302,8 @@ def chat(
         result = intake_agent.respond(request)
     except (LLMUnavailable, LLMCallFailed):
         result = _fallback_result(request)
+
+    intake_activity.update(session_id, "CHECKING_CONTEXT", "正在检查关键人信息")
 
     source_text = "\n".join(
         message.content for message in request.messages if message.role == "user"
@@ -358,6 +366,12 @@ def chat(
             )
             lookup_internal = getattr(entity_candidates, "lookup_internal", None)
             if callable(lookup_internal):
+                intake_activity.update(
+                    session_id,
+                    "CALLING_TOOL",
+                    "正在查询内部身份候选",
+                    tool_name="lookup_internal_identity",
+                )
                 resolutions, confirmation = lookup_internal(
                     candidate_context, next_version, source_text
                 )
@@ -377,6 +391,12 @@ def chat(
             tool_decision = None
             follow_up = getattr(intake_agent, "follow_up", None)
             if confirmation and settings.intake_react_enabled and callable(follow_up):
+                intake_activity.update(
+                    session_id,
+                    "PROCESSING_TOOL_RESULT",
+                    "大模型正在判断内部查询结果",
+                    tool_name="lookup_internal_identity",
+                )
                 internal_observation = {
                     "tool": "lookup_internal_identity",
                     "resolved_count": len(resolutions),
@@ -409,6 +429,12 @@ def chat(
                 and any(len(item.candidates) != 1 for item in confirmation.items)
                 and callable(external_normalizer)
             ):
+                intake_activity.update(
+                    session_id,
+                    "CALLING_TOOL",
+                    "正在联网补全关键人身份",
+                    tool_name="search_key_person_identity_web",
+                )
                 confirmation = entity_candidates.search_key_person_identity_web(
                     candidate_context,
                     confirmation,
@@ -420,6 +446,12 @@ def chat(
                     resolutions,
                     confirmation,
                     settings.llm_web_identity_threshold,
+                )
+                intake_activity.update(
+                    session_id,
+                    "PROCESSING_TOOL_RESULT",
+                    "大模型正在整理联网身份候选",
+                    tool_name="search_key_person_identity_web",
                 )
             resolutions = _merge_resolutions(existing_resolutions, resolutions)
             resolutions = _align_resolution_relationships(
@@ -476,7 +508,15 @@ def chat(
         if audio_path:
             audio_path.unlink(missing_ok=True)
             audio_path.with_suffix(".wav").unlink(missing_ok=True)
+    intake_activity.update(
+        session_id, "COMPLETED", "本轮对话处理完成", active=False
+    )
     return _chat_response(intake_session)
+
+
+@router.get("/{session_id}/activity", response_model=IntakeActivityResponse)
+def get_intake_activity(session_id: UUID) -> IntakeActivityResponse:
+    return IntakeActivityResponse.model_validate(intake_activity.get(str(session_id)))
 
 
 @router.get("/{session_id}", response_model=IntakeSessionResponse)
