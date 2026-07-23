@@ -143,6 +143,36 @@ def test_model_cannot_confirm_organization_canonical_name_absent_from_source() -
     assert confirmation.items[0].candidates == []
 
 
+def test_unsupported_organization_canonical_keeps_empty_confirmation_item() -> None:
+    understanding = _understanding(
+        organizations=[
+            EntityMention(
+                mention="华星",
+                canonical_name="华星能源集团有限公司",
+                evidence_text="华星",
+                confidence=0.99,
+                resolution="NEEDS_CONFIRMATION",
+            )
+        ]
+    )
+
+    context, confirmation = EntityResolver().resolve(
+        "与华星开会", understanding, version=1
+    )
+
+    assert context is None
+    assert confirmation is not None
+    organization_item = next(
+        item for item in confirmation.items if item.entity_type == "ORGANIZATION"
+    )
+    assert organization_item.candidates == []
+    assert all(
+        candidate.canonical_name
+        for item in confirmation.items
+        for candidate in item.candidates
+    )
+
+
 def test_entity_deduplication_uses_normalized_identity_key() -> None:
     understanding = _understanding(
         organizations=[

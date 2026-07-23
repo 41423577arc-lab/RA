@@ -79,7 +79,14 @@ class EntityResolver:
         has_person = any(item.entity_type == "PERSON" for item in confirmed)
         has_organization = any(item.entity_type == "ORGANIZATION" for item in confirmed)
 
-        if not has_person and not has_organization and not uncertain_people and not uncertain_organizations:
+        if (
+            not has_person
+            and not has_organization
+            and not uncertain_people
+            and not uncertain_organizations
+            and not understanding.people
+            and not understanding.organizations
+        ):
             raise InsufficientContextError(
                 "未识别到明确的人物姓名和企业名称，请补充后重新提交"
             )
@@ -320,7 +327,7 @@ class EntityResolver:
             elif (
                 organization.resolution == "NEEDS_CONFIRMATION"
                 and supported
-                and (canonical or mention)
+                and source_name
             ):
                 uncertain_organizations.append(
                     self._input_candidate(
