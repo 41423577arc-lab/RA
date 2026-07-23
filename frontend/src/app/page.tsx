@@ -83,7 +83,7 @@ type IntakeResponse = {
   analysis_input: string;
   ready_to_analyze: boolean;
   missing_information: string[];
-  status: "COLLECTING" | "NEEDS_CONFIRMATION" | "READY" | "STARTING_ANALYSIS" | "ANALYZING";
+  status: "COLLECTING" | "PROCESSING_AUDIO" | "NEEDS_CONFIRMATION" | "READY" | "STARTING_ANALYSIS" | "ANALYZING";
   version: number;
   messages?: ChatMessage[];
   research_task_id?: string;
@@ -303,6 +303,12 @@ export default function Home() {
   };
 
   const reset = () => {
+    if (
+      (chatSessionId || task) &&
+      !window.confirm("将清空当前页面并新建调查；已经创建的分析任务不会被取消。是否继续？")
+    ) {
+      return;
+    }
     setTask(null);
     setError("");
     setChatMessages([INITIAL_MESSAGE]);
@@ -448,11 +454,10 @@ export default function Home() {
           <h1>资源推动 Agent</h1>
           <p>企业人物与项目资源调查</p>
         </div>
-        {task && (
-          <button className="icon-button reset-button" onClick={reset} title="新建调查">
-            <RotateCcw size={17} />
-          </button>
-        )}
+        <button className="reset-button" onClick={reset} title="清空当前页面并新建调查">
+          <RotateCcw size={16} />
+          <span>重新开始</span>
+        </button>
       </header>
 
       <div className="workspace">

@@ -505,8 +505,8 @@ def context_from_intake_snapshot(
         intents=understanding.intents,
         entities=entities,
         event_type=understanding.event_type,
-        event_time=understanding.event_time,
-        event_location=understanding.event_location,
+        event_time=structured.get("event_time") or understanding.event_time,
+        event_location=structured.get("event_location") or understanding.event_location,
         business_directions=understanding.business_directions,
         focus_questions=understanding.focus_questions,
     )

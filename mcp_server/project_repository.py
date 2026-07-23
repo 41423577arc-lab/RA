@@ -112,10 +112,6 @@ class ProjectRepository:
                         FROM customer_contacts cc
                         JOIN customers c ON c.customer_id = cc.customer_id
                         WHERE cc.contact_name ILIKE :person_pattern
-                          AND (
-                            CAST(:organization_pattern AS TEXT) IS NULL
-                            OR c.customer_name ILIKE :organization_pattern
-                          )
                         ORDER BY
                             CASE WHEN cc.contact_name = :person_mention THEN 0 ELSE 1 END,
                             cc.contact_id
@@ -125,9 +121,6 @@ class ProjectRepository:
                     {
                         "person_mention": person_mention,
                         "person_pattern": f"%{person_mention}%",
-                        "organization_pattern": f"%{organization_mention}%"
-                        if organization_mention
-                        else None,
                     },
                 ).mappings()
                 output.extend(

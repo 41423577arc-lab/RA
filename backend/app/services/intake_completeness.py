@@ -11,17 +11,25 @@ def required_missing_information(
     result: IntakeChatResult, source_text: str | None = None
 ) -> list[str]:
     context = result.structured_context
-    targets = [*context.people, *context.organizations, *context.projects]
+    targets = [*context.people, *context.organizations]
     has_target = bool(targets)
     if source_text is not None:
         normalized_source = _normalize(source_text)
-        has_target = any(_normalize(target) in normalized_source for target in targets)
-    has_focus = bool(context.focus_questions)
+        source_candidates = [
+            *targets,
+            *(
+                value
+                for item in context.entity_resolutions
+                for value in (item.get("mention"), item.get("canonical_name"))
+                if value
+            ),
+        ]
+        has_target = any(
+            _normalize(target) in normalized_source for target in source_candidates
+        )
     missing: list[str] = []
     if not has_target:
-        missing.append("人物、企业或项目")
-    if not has_focus:
-        missing.append("希望分析或推动的事项")
+        missing.append("候选人姓名或候选企业")
     return missing
 
 

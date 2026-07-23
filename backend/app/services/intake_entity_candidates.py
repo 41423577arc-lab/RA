@@ -1,8 +1,12 @@
 import asyncio
 import hashlib
 import re
+from collections.abc import Callable
 
-from app.schemas.intake import IntakeStructuredContext
+from app.schemas.intake import (
+    ExternalIdentityNormalizationResult,
+    IntakeStructuredContext,
+)
 from app.schemas.task import CandidateOption, ConfirmationItem, ConfirmationRequest
 from app.services.mcp_client import ProjectMcpClient
 from app.services.entity_resolver import EntityResolver
@@ -19,11 +23,51 @@ class IntakeEntityCandidateService:
         context: IntakeStructuredContext,
         version: int,
         source_text: str | None = None,
+        external_normalizer: Callable[
+            [list[dict], list[dict]], ExternalIdentityNormalizationResult
+        ]
+        | None = None,
     ) -> tuple[list[dict], ConfirmationRequest | None]:
-        person = context.people[0] if context.people else None
-        organization = context.organizations[0] if context.organizations else None
-        if not person and not organization:
+        if not context.people and not context.organizations:
             return [], None
+
+        resolutions: list[dict] = []
+        unresolved: dict[str, list[str]] = {"PERSON": [], "ORGANIZATION": []}
+        for entity_type, mentions in (
+            ("PERSON", context.people),
+            ("ORGANIZATION", context.organizations),
+        ):
+            for mention in mentions:
+                if source_text and _is_standard_user_entity(
+                    context, mention, entity_type, source_text
+                ):
+                    detail = next(
+                        (item for item in context.people_details if item.name == mention),
+                        None,
+                    )
+                    resolutions.append(
+                        {
+                            "candidate_id": None,
+                            "entity_type": entity_type,
+                            "canonical_name": mention,
+                            "mention": mention,
+                            "organization": detail.organization if detail else None,
+                            "title": detail.title if detail else None,
+                            "confirmed_by": "USER_INPUT",
+                        }
+                    )
+                else:
+                    unresolved[entity_type].append(mention)
+
+        if not unresolved["PERSON"] and not unresolved["ORGANIZATION"]:
+            return resolutions, None
+
+        person = unresolved["PERSON"][0] if unresolved["PERSON"] else None
+        organization = (
+            unresolved["ORGANIZATION"][0]
+            if unresolved["ORGANIZATION"]
+            else (context.organizations[0] if context.organizations else None)
+        )
 
         try:
             internal = asyncio.run(
@@ -32,11 +76,10 @@ class IntakeEntityCandidateService:
         except Exception:
             internal = []
 
-        resolutions: list[dict] = []
         pending: list[tuple[str, str, list[CandidateOption]]] = []
         for entity_type, mentions in (
-            ("PERSON", context.people),
-            ("ORGANIZATION", context.organizations),
+            ("PERSON", unresolved["PERSON"]),
+            ("ORGANIZATION", unresolved["ORGANIZATION"]),
         ):
             for index, mention in enumerate(mentions):
                 candidates = [
@@ -45,33 +88,6 @@ class IntakeEntityCandidateService:
                     if item.get("entity_type") == entity_type
                     and (index == 0 or item.get("canonical_name") == mention)
                 ]
-                exact = [
-                    item
-                    for item in candidates
-                    if item.get("match_type") == "EXACT"
-                    and item.get("canonical_name") == mention
-                ]
-                if len(exact) == 1:
-                    resolutions.append({**exact[0], "confirmed_by": "INTERNAL"})
-                    continue
-
-                if source_text and _is_explicit_user_entity(
-                    mention, entity_type, source_text
-                ):
-                    resolutions.append(
-                        {
-                            "candidate_id": None,
-                            "entity_type": entity_type,
-                            "canonical_name": mention,
-                            "mention": mention,
-                            "organization": organization
-                            if entity_type == "PERSON"
-                            else None,
-                            "confirmed_by": "USER_INPUT",
-                        }
-                    )
-                    continue
-
                 pending.append(
                     (
                         entity_type,
@@ -80,17 +96,39 @@ class IntakeEntityCandidateService:
                     )
                 )
 
-        pages = self._external_pages(person, organization) if pending else []
+        external_pending = [item for item in pending if not item[2]]
+        pages = self._external_pages(person, organization) if external_pending else []
+        normalized_external: list[tuple[str, CandidateOption]] = []
+        if pages and external_normalizer:
+            try:
+                normalized = external_normalizer(
+                    [
+                        {"entity_type": entity_type, "mention": mention}
+                        for entity_type, mention, _ in external_pending
+                    ],
+                    [page.model_dump(mode="json") for page in pages],
+                )
+                normalized_external = self._validated_normalized_candidates(
+                    normalized, pages
+                )
+            except Exception:
+                normalized_external = []
         items: list[ConfirmationItem] = []
         for entity_type, mention, options in pending:
-            options.extend(
-                self._external_options(
-                    pages,
-                    mention,
-                    entity_type,
-                    organization if entity_type == "PERSON" else None,
+            if not options:
+                options.extend(
+                    item
+                    for normalized_mention, item in normalized_external
+                    if normalized_mention == mention and item.entity_type == entity_type
                 )
-            )
+                options.extend(
+                    self._rule_external_options(
+                        pages,
+                        mention,
+                        entity_type,
+                        organization if entity_type == "PERSON" else None,
+                    )
+                )
             items.append(
                 ConfirmationItem(
                     mention=mention,
@@ -112,7 +150,7 @@ class IntakeEntityCandidateService:
             return []
 
     @staticmethod
-    def _external_options(
+    def _rule_external_options(
         pages, mention: str, entity_type: str, organization: str | None
     ) -> list[CandidateOption]:
         output: list[CandidateOption] = []
@@ -120,25 +158,42 @@ class IntakeEntityCandidateService:
             output.extend(
                 EntityResolver().candidates_from_web(mention, organization, pages)
             )
-        for page in pages[:5]:
-            evidence = verify_identity_evidence(
-                page.raw_content, mention, organization
-            )
-            if evidence is None:
+        return output
+
+    @staticmethod
+    def _validated_normalized_candidates(
+        result: ExternalIdentityNormalizationResult, pages
+    ) -> list[tuple[str, CandidateOption]]:
+        by_url = {page.url: page for page in pages}
+        output: list[tuple[str, CandidateOption]] = []
+        for item in result.candidates:
+            page = by_url.get(item.source_url)
+            if (
+                page is None
+                or item.evidence_quote not in page.raw_content
+                or item.canonical_name not in page.raw_content
+            ):
                 continue
             candidate_id = hashlib.sha256(
-                f"{entity_type}|{mention}|{page.url}".encode("utf-8")
+                (
+                    f"{item.entity_type}|{item.mention}|{item.canonical_name}|"
+                    f"{item.source_url}"
+                ).encode("utf-8")
             ).hexdigest()[:24]
             output.append(
-                CandidateOption(
-                    candidate_id=f"external:{candidate_id}",
-                    entity_type=entity_type,
-                    canonical_name=mention,
-                    organization=organization,
-                    reason="公开网页中出现该身份信息，必须由用户确认",
-                    confidence=0.6,
-                    source_url=page.url,
-                    evidence_quote=evidence,
+                (
+                    item.mention,
+                    CandidateOption(
+                        candidate_id=f"external:{candidate_id}",
+                        entity_type=item.entity_type,
+                        canonical_name=item.canonical_name,
+                        organization=item.organization,
+                        title=item.title,
+                        reason="联网公开资料补充的标准身份候选，必须由用户确认",
+                        confidence=item.confidence,
+                        source_url=item.source_url,
+                        evidence_quote=item.evidence_quote,
+                    ),
                 )
             )
         return output
@@ -192,7 +247,13 @@ def user_provided_entity_resolutions(
         ("ORGANIZATION", context.organizations),
     ):
         for mention in mentions:
-            if _is_explicit_user_entity(mention, entity_type, source_text):
+            if _is_standard_user_entity(
+                context, mention, entity_type, source_text
+            ):
+                detail = next(
+                    (item for item in context.people_details if item.name == mention),
+                    None,
+                )
                 output.append(
                     {
                         "candidate_id": None,
@@ -202,21 +263,45 @@ def user_provided_entity_resolutions(
                         "organization": organization
                         if entity_type == "PERSON"
                         else None,
+                        "title": detail.title if detail else None,
                         "confirmed_by": "USER_INPUT",
                     }
                 )
     return output
 
 
-def _is_explicit_user_entity(
-    mention: str, entity_type: str, source_text: str
+def _is_standard_user_entity(
+    context: IntakeStructuredContext,
+    mention: str,
+    entity_type: str,
+    source_text: str,
 ) -> bool:
     normalized_mention = "".join(mention.split())
     normalized_source = "".join(source_text.split())
     if not normalized_mention or normalized_mention not in normalized_source:
         return False
+    assessment = next(
+        (
+            item
+            for item in context.entity_assessments
+            if item.entity_type == entity_type and item.mention == mention
+        ),
+        None,
+    )
+    if assessment is not None and not assessment.is_standard:
+        return False
     if entity_type == "ORGANIZATION":
-        return len(normalized_mention) >= 2
+        standard_suffixes = (
+            "有限公司",
+            "股份有限公司",
+            "集团有限公司",
+            "集团",
+            "大学",
+            "银行",
+            "委员会",
+            "人民政府",
+        )
+        return normalized_mention.endswith(standard_suffixes)
     title_suffixes = ("总", "经理", "主任", "董事长", "负责人", "领导")
     if normalized_mention.endswith(title_suffixes):
         return False

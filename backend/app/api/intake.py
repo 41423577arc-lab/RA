@@ -52,9 +52,11 @@ def _has_resolved_entities(structured_context: dict) -> bool:
         return True
     resolutions = structured_context.get("entity_resolutions", [])
     resolved = {
-        item.get("mention") or item.get("canonical_name")
+        value
         for item in resolutions
         if item.get("confirmed_by")
+        for value in (item.get("mention"), item.get("canonical_name"))
+        if value
     }
     return targets.issubset(resolved)
 
@@ -117,6 +119,110 @@ def _source_text(intake_session: IntakeSession) -> str:
         for item in (intake_session.messages or [])
         if item.get("role") == "user"
     )
+
+
+def _standardized_analysis_input(text: str, resolutions: list[dict]) -> str:
+    standardized = text
+    identities: list[str] = []
+    ordered = sorted(
+        resolutions,
+        key=lambda item: len((item.get("mention") or "").strip()),
+        reverse=True,
+    )
+    for item in ordered:
+        mention = (item.get("mention") or "").strip()
+        canonical = (item.get("canonical_name") or "").strip()
+        if mention and canonical and mention != canonical:
+            standardized = standardized.replace(mention, canonical)
+        if not canonical:
+            continue
+        if item.get("entity_type") == "PERSON":
+            details = "、".join(
+                value
+                for value in (item.get("organization"), item.get("title"))
+                if value
+            )
+            identities.append(f"人物：{canonical}{f'（{details}）' if details else ''}")
+        elif item.get("entity_type") == "ORGANIZATION":
+            identities.append(f"企业：{canonical}")
+    if identities:
+        standardized = f"{standardized.rstrip()}\n已确认标准身份：{'；'.join(dict.fromkeys(identities))}。"
+    return standardized
+
+
+def _align_resolution_relationships(
+    resolutions: list[dict], context: IntakeStructuredContext
+) -> list[dict]:
+    organizations = [
+        item.get("canonical_name")
+        for item in resolutions
+        if item.get("entity_type") == "ORGANIZATION" and item.get("canonical_name")
+    ]
+    if len(organizations) != 1:
+        return resolutions
+    canonical_organization = organizations[0]
+    return [
+        {
+            **item,
+            "organization": canonical_organization,
+        }
+        if item.get("entity_type") == "PERSON"
+        and (
+            not item.get("organization")
+            or item.get("organization") in context.organizations
+        )
+        else item
+        for item in resolutions
+    ]
+
+
+def _standardized_context(context: dict, resolutions: list[dict] | None) -> dict:
+    resolutions = resolutions or []
+    output = dict(context)
+    person_names = {
+        item.get("mention"): item.get("canonical_name")
+        for item in resolutions
+        if item.get("entity_type") == "PERSON" and item.get("canonical_name")
+    }
+    organization_names = {
+        item.get("mention"): item.get("canonical_name")
+        for item in resolutions
+        if item.get("entity_type") == "ORGANIZATION" and item.get("canonical_name")
+    }
+    output["people"] = [person_names.get(name, name) for name in output.get("people", [])]
+    output["organizations"] = [
+        organization_names.get(name, name) for name in output.get("organizations", [])
+    ]
+    output["people_details"] = [
+        {
+            **item,
+            "name": person_names.get(item.get("name"), item.get("name")),
+            "organization": organization_names.get(
+                item.get("organization"), item.get("organization")
+            ),
+            "title": next(
+                (
+                    resolution.get("title")
+                    for resolution in resolutions
+                    if resolution.get("entity_type") == "PERSON"
+                    and resolution.get("mention") == item.get("name")
+                    and resolution.get("title")
+                ),
+                item.get("title"),
+            ),
+        }
+        for item in output.get("people_details", [])
+    ]
+    output["entity_resolutions"] = resolutions
+    return output
+
+
+def _merge_resolutions(existing: list[dict], additions: list[dict]) -> list[dict]:
+    merged: dict[tuple[str | None, str | None], dict] = {}
+    for item in [*existing, *additions]:
+        key = (item.get("entity_type"), item.get("mention"))
+        merged[key] = item
+    return list(merged.values())
 
 
 def _repair_ready_session(
@@ -217,14 +323,59 @@ def chat(
             *result.structured_context.organizations,
         }
         confirmed_names = {
-            item.get("mention") or item.get("canonical_name")
+            value
             for item in existing_resolutions
+            for value in (item.get("mention"), item.get("canonical_name"))
+            if value
         }
         if not targets.issubset(confirmed_names):
-            resolutions, confirmation = entity_candidates.resolve(
-                result.structured_context, next_version, source_text
+            unresolved_people = [
+                name
+                for name in result.structured_context.people
+                if name not in confirmed_names
+            ]
+            unresolved_organizations = [
+                name
+                for name in result.structured_context.organizations
+                if name not in confirmed_names
+            ]
+            unresolved_targets = {*unresolved_people, *unresolved_organizations}
+            candidate_context = result.structured_context.model_copy(
+                update={
+                    "people": unresolved_people,
+                    "organizations": unresolved_organizations,
+                    "people_details": [
+                        item
+                        for item in result.structured_context.people_details
+                        if item.name in unresolved_people
+                    ],
+                    "entity_assessments": [
+                        item
+                        for item in result.structured_context.entity_assessments
+                        if item.mention in unresolved_targets
+                    ],
+                }
             )
-            stored_context["entity_resolutions"] = resolutions
+            external_normalizer = getattr(
+                intake_agent, "normalize_external_identity", None
+            )
+            resolutions, confirmation = entity_candidates.resolve(
+                candidate_context,
+                next_version,
+                source_text,
+                (
+                    lambda mentions, pages: external_normalizer(
+                        request, mentions, pages
+                    )
+                )
+                if settings.intake_react_enabled and callable(external_normalizer)
+                else None,
+            )
+            resolutions = _merge_resolutions(existing_resolutions, resolutions)
+            resolutions = _align_resolution_relationships(
+                resolutions, result.structured_context
+            )
+            stored_context = _standardized_context(stored_context, resolutions)
             observation = {
                 "resolved_count": len(resolutions),
                 "needs_confirmation": confirmation is not None,
@@ -236,7 +387,7 @@ def chat(
             }
             follow_up_reply = None
             follow_up = getattr(intake_agent, "follow_up", None)
-            if settings.intake_react_enabled and callable(follow_up):
+            if confirmation and settings.intake_react_enabled and callable(follow_up):
                 try:
                     follow_up_reply = follow_up(
                         request, result, observation
@@ -253,7 +404,14 @@ def chat(
             elif follow_up_reply:
                 result.assistant_reply = follow_up_reply
         else:
-            stored_context["entity_resolutions"] = existing_resolutions
+            stored_context = _standardized_context(
+                stored_context, existing_resolutions
+            )
+
+    result.analysis_input = _standardized_analysis_input(
+        result.analysis_input,
+        stored_context.get("entity_resolutions", []),
+    )
     persisted_messages = [
         *incoming_messages,
         {"role": "assistant", "content": result.assistant_reply},
@@ -420,6 +578,9 @@ def confirm_intake_entities(
         raise HTTPException(status_code=409, detail="确认版本已过期，请刷新后重试")
 
     selections = {item.mention: item for item in payload.selections}
+    base_context = IntakeStructuredContext.model_validate(
+        intake_session.structured_context or {}
+    )
     resolutions = list((intake_session.structured_context or {}).get("entity_resolutions", []))
     for item in request.get("items", []):
         selection = selections.get(item["mention"])
@@ -447,17 +608,43 @@ def confirm_intake_entities(
                 "entity_type": item["entity_type"],
                 "canonical_name": manual_value,
                 "mention": item["mention"],
+                "organization": base_context.organizations[0]
+                if item["entity_type"] == "PERSON" and base_context.organizations
+                else None,
+                "title": next(
+                    (
+                        person.title
+                        for person in base_context.people_details
+                        if person.name == item["mention"]
+                    ),
+                    None,
+                ),
                 "confirmed_by": "USER",
             }
-        resolutions.append(resolution)
+        resolutions = _merge_resolutions(resolutions, [resolution])
 
     structured_context = with_default_requester_context(
         dict(intake_session.structured_context or {})
     )
-    structured_context["entity_resolutions"] = resolutions
+    resolutions = _align_resolution_relationships(resolutions, base_context)
+    structured_context = _standardized_context(structured_context, resolutions)
+    standardized_input = _standardized_analysis_input(
+        intake_session.analysis_input, resolutions
+    )
+    confirmed_names = list(
+        dict.fromkeys(
+            item.get("canonical_name")
+            for item in resolutions
+            if item.get("canonical_name")
+        )
+    )
     validation_result = IntakeChatResult(
-        assistant_reply="身份已确认，可以开始分析。",
-        analysis_input=intake_session.analysis_input,
+        assistant_reply=(
+            f"已确认标准身份：{'、'.join(confirmed_names)}。可以开始分析。"
+            if confirmed_names
+            else "身份已确认，可以开始分析。"
+        ),
+        analysis_input=standardized_input,
         ready_to_analyze=True,
         missing_information=[],
         structured_context=structured_context,
@@ -479,6 +666,7 @@ def confirm_intake_entities(
         status="READY" if ready else "COLLECTING",
         messages=messages,
         structured_context=structured_context,
+        analysis_input=standardized_input,
         missing_information=[] if ready else ["分析目标或重点"],
         confirmation_request=None,
         ready_to_analyze=ready,

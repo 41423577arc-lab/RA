@@ -9,6 +9,9 @@ from app.config import settings
 from app.main import app
 from app.models.database import IntakeAudioJob, ResearchTask
 from app.schemas.intake import (
+    ExternalIdentityCandidate,
+    ExternalIdentityNormalizationResult,
+    IntakeEntityAssessment,
     IntakeChatResult,
     IntakeFollowupResult,
     IntakeStructuredContext,
@@ -58,7 +61,7 @@ class ReadyIntakeAgent:
 
 
 class AutoConfirmEntityCandidates:
-    def resolve(self, context, version, source_text=None):
+    def resolve(self, context, version, source_text=None, external_normalizer=None):
         return (
             [
                 {
@@ -81,7 +84,7 @@ class AutoConfirmEntityCandidates:
 
 
 class ExternalConfirmationCandidates:
-    def resolve(self, context, version, source_text=None):
+    def resolve(self, context, version, source_text=None, external_normalizer=None):
         return (
             [
                 {
@@ -137,7 +140,7 @@ def test_intake_chat_collects_information_without_creating_task(monkeypatch) -> 
     payload = response.json()
     assert UUID(payload["session_id"])
     assert payload["ready_to_analyze"] is False
-    assert payload["missing_information"] == ["人物、企业或项目", "希望分析或推动的事项"]
+    assert payload["missing_information"] == ["候选人姓名或候选企业"]
     assert fake.request.messages[0].content.endswith("赴宴。")
 
 
@@ -182,6 +185,24 @@ def test_optional_missing_information_does_not_block_ready() -> None:
     assert is_intake_ready(result, result.analysis_input) is True
 
 
+def test_person_or_organization_alone_can_continue() -> None:
+    person_only = IntakeChatResult(
+        assistant_reply="继续处理。",
+        analysis_input="了解王传福。",
+        ready_to_analyze=False,
+        structured_context=IntakeStructuredContext(people=["王传福"]),
+    )
+    organization_only = IntakeChatResult(
+        assistant_reply="继续处理。",
+        analysis_input="了解比亚迪。",
+        ready_to_analyze=False,
+        structured_context=IntakeStructuredContext(organizations=["比亚迪"]),
+    )
+
+    assert is_intake_ready(person_only, person_only.analysis_input) is True
+    assert is_intake_ready(organization_only, organization_only.analysis_input) is True
+
+
 def test_intake_session_can_be_restored(monkeypatch) -> None:
     monkeypatch.setattr(intake_api, "intake_agent", FakeIntakeAgent())
 
@@ -212,7 +233,7 @@ def test_get_repairs_existing_complete_session_to_ready() -> None:
                 messages=[
                     {
                         "role": "user",
-                        "content": "我要和中建二局总经理张伟聊上游物资供应",
+                        "content": "我要和比亚迪股份有限公司的王传福聊储能",
                     },
                     {
                         "role": "assistant",
@@ -220,13 +241,13 @@ def test_get_repairs_existing_complete_session_to_ready() -> None:
                     },
                 ],
                 structured_context={
-                    "people": ["张伟"],
-                    "organizations": ["中建二局"],
-                    "projects": ["上游物资供应"],
-                    "focus_questions": ["上游物资供应合作机会"],
+                    "people": ["王传福"],
+                    "organizations": ["比亚迪股份有限公司"],
+                    "projects": ["储能"],
+                    "focus_questions": ["储能合作机会"],
                 },
                 missing_information=["具体物资类别"],
-                analysis_input="与中建二局总经理张伟讨论上游物资供应。",
+                analysis_input="与比亚迪股份有限公司的王传福讨论储能。",
                 ready_to_analyze=False,
                 version=3,
             )
@@ -349,6 +370,25 @@ class NoInternalCandidates:
         return []
 
 
+class InternalMustNotRun:
+    async def find_entity_candidates(self, *_):
+        raise AssertionError("Standard identity must not call internal search")
+
+
+class InternalOrganizationCandidate:
+    async def find_entity_candidates(self, *_):
+        return [
+            {
+                "candidate_id": "internal:customer:C001",
+                "entity_type": "ORGANIZATION",
+                "canonical_name": "比亚迪股份有限公司",
+                "customer_id": "C001",
+                "source": "INTERNAL",
+                "match_type": "PARTIAL",
+            }
+        ]
+
+
 class IdentityWeb:
     async def search(self, queries):
         return [
@@ -372,43 +412,161 @@ class IdentityWeb:
 
 
 class WebMustNotRun:
+    def __init__(self):
+        self.calls = 0
+
     async def search(self, _):
-        raise AssertionError("Explicit user identity must not require web confirmation")
+        self.calls += 1
+        return []
 
     async def extract(self, _):
-        raise AssertionError
+        self.calls += 1
+        return []
 
 
 def test_explicit_full_user_identity_does_not_require_web_confirmation() -> None:
-    service = IntakeEntityCandidateService(NoInternalCandidates(), WebMustNotRun())
+    web = WebMustNotRun()
+    service = IntakeEntityCandidateService(InternalMustNotRun(), web)
     resolutions, confirmation = service.resolve(
         IntakeStructuredContext(
-            people=["张伟"],
-            organizations=["中建二局"],
-            focus_questions=["上游物资供应合作机会"],
+            people=["王传福"],
+            organizations=["比亚迪股份有限公司"],
+            focus_questions=["储能合作机会"],
+            entity_assessments=[
+                IntakeEntityAssessment(
+                    entity_type="PERSON", mention="王传福", is_standard=True
+                ),
+                IntakeEntityAssessment(
+                    entity_type="ORGANIZATION",
+                    mention="比亚迪股份有限公司",
+                    is_standard=True,
+                ),
+            ],
         ),
         1,
-        "我要和中建二局总经理张伟聊上游物资供应",
+        "我要和比亚迪股份有限公司的王传福聊储能",
     )
 
     assert confirmation is None
-    assert {item["canonical_name"] for item in resolutions} == {"张伟", "中建二局"}
+    assert {item["canonical_name"] for item in resolutions} == {
+        "王传福",
+        "比亚迪股份有限公司",
+    }
     assert {item["confirmed_by"] for item in resolutions} == {"USER_INPUT"}
+    assert web.calls == 0
+
+
+def test_nonstandard_organization_uses_internal_candidate_before_web() -> None:
+    web = WebMustNotRun()
+    service = IntakeEntityCandidateService(InternalOrganizationCandidate(), web)
+    resolutions, confirmation = service.resolve(
+        IntakeStructuredContext(
+            organizations=["比亚迪"],
+            entity_assessments=[
+                IntakeEntityAssessment(
+                    entity_type="ORGANIZATION", mention="比亚迪", is_standard=False
+                )
+            ],
+        ),
+        1,
+        "我想了解比亚迪",
+    )
+
+    assert resolutions == []
+    assert confirmation is not None
+    assert confirmation.items[0].candidates[0].canonical_name == "比亚迪股份有限公司"
+    assert web.calls == 0
+
+
+def test_model_cannot_mark_organization_abbreviation_as_standard() -> None:
+    web = WebMustNotRun()
+    service = IntakeEntityCandidateService(InternalOrganizationCandidate(), web)
+    resolutions, confirmation = service.resolve(
+        IntakeStructuredContext(
+            organizations=["比亚迪"],
+            entity_assessments=[
+                IntakeEntityAssessment(
+                    entity_type="ORGANIZATION", mention="比亚迪", is_standard=True
+                )
+            ],
+        ),
+        1,
+        "我想了解比亚迪",
+    )
+
+    assert resolutions == []
+    assert confirmation is not None
+    assert confirmation.items[0].candidates[0].canonical_name == "比亚迪股份有限公司"
+    assert web.calls == 0
 
 def test_entity_service_keeps_external_results_as_candidates() -> None:
     service = IntakeEntityCandidateService(NoInternalCandidates(), IdentityWeb())
     resolutions, confirmation = service.resolve(
         IntakeStructuredContext(
-            people=["王传福"],
-            organizations=["比亚迪股份有限公司"],
+            people=["王总"],
+            organizations=["比亚迪"],
             focus_questions=["储能项目如何推进"],
+            entity_assessments=[
+                IntakeEntityAssessment(
+                    entity_type="PERSON", mention="王总", is_standard=False
+                ),
+                IntakeEntityAssessment(
+                    entity_type="ORGANIZATION", mention="比亚迪", is_standard=False
+                ),
+            ],
         ),
         1,
+        external_normalizer=lambda mentions, pages: ExternalIdentityNormalizationResult(
+            candidates=[
+                ExternalIdentityCandidate(
+                    mention="王总",
+                    entity_type="PERSON",
+                    canonical_name="王传福",
+                    organization="比亚迪股份有限公司",
+                    title="董事长兼总裁",
+                    source_url="https://example.com/identity",
+                    evidence_quote="王传福是比亚迪股份有限公司负责人。",
+                    confidence=0.9,
+                ),
+                ExternalIdentityCandidate(
+                    mention="比亚迪",
+                    entity_type="ORGANIZATION",
+                    canonical_name="比亚迪股份有限公司",
+                    source_url="https://example.com/identity",
+                    evidence_quote="王传福是比亚迪股份有限公司负责人。",
+                    confidence=0.9,
+                ),
+            ]
+        ),
     )
 
     assert resolutions == []
     assert confirmation is not None
     assert confirmation.items[0].candidates[0].candidate_id.startswith("external:")
+
+
+def test_standardized_analysis_input_uses_confirmed_names_and_title() -> None:
+    output = intake_api._standardized_analysis_input(
+        "与王总讨论比亚迪的储能合作。",
+        [
+            {
+                "mention": "王总",
+                "canonical_name": "王传福",
+                "entity_type": "PERSON",
+                "organization": "比亚迪股份有限公司",
+                "title": "董事长兼总裁",
+            },
+            {
+                "mention": "比亚迪",
+                "canonical_name": "比亚迪股份有限公司",
+                "entity_type": "ORGANIZATION",
+            },
+        ],
+    )
+
+    assert "王传福" in output
+    assert "比亚迪股份有限公司" in output
+    assert "董事长兼总裁" in output
 
 
 def test_audio_is_transcribed_and_reviewed_before_analysis(monkeypatch, tmp_path: Path) -> None:
@@ -513,6 +671,8 @@ def test_pipeline_reuses_confirmed_entities_from_input_snapshot() -> None:
     context = context_from_intake_snapshot(
         {
             "structured_context": {
+                "event_time": "明天下午",
+                "event_location": "深圳",
                 "entity_resolutions": [
                     {
                         "candidate_id": "internal:contact:C001",
@@ -530,3 +690,5 @@ def test_pipeline_reuses_confirmed_entities_from_input_snapshot() -> None:
     assert context is not None
     assert context.entities[0].canonical_name == "王传福"
     assert context.entities[0].confirmed_by == "AUTO"
+    assert context.event_time == "明天下午"
+    assert context.event_location == "深圳"
