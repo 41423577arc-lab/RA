@@ -133,10 +133,10 @@ const STATUS_LABELS: Record<string, string> = {
   WEB_SEARCHING: "正在搜索公开信息",
   WEB_FETCHING: "正在抓取网页正文",
   VERIFYING_WEB_RESULTS: "正在核验网页身份",
-  PLANNING_PROJECT_SEARCH: "正在扩展项目条件",
+  PLANNING_PROJECT_SEARCH: "正在准备内部项目检索",
   PROJECT_SEARCHING: "正在检索内部项目",
   RERANKING_PROJECTS: "正在评估项目价值",
-  ANALYZING_ASSOCIATIONS: "正在关联公开与内部信息",
+  ANALYZING_ASSOCIATIONS: "正在关联关键人与内部项目",
   GENERATING_REPORT_CONTENT: "正在生成报告内容",
   GENERATING: "正在生成总结",
   RENDERING_REPORT: "正在排版报告",
@@ -144,7 +144,19 @@ const STATUS_LABELS: Record<string, string> = {
   FAILED: "分析失败",
   CANCELLED: "任务已取消"
 };
-const STATUS_ORDER = [
+const CURRENT_STATUS_ORDER = [
+  "PENDING",
+  "TRANSCRIBING",
+  "CONTEXT_EXTRACTING",
+  "PLANNING_PROJECT_SEARCH",
+  "PROJECT_SEARCHING",
+  "RERANKING_PROJECTS",
+  "ANALYZING_ASSOCIATIONS",
+  "GENERATING_REPORT_CONTENT",
+  "RENDERING_REPORT",
+  "COMPLETED"
+];
+const LEGACY_STATUS_ORDER = [
   "PENDING",
   "TRANSCRIBING",
   "CONTEXT_EXTRACTING",
@@ -160,6 +172,12 @@ const STATUS_ORDER = [
   "RENDERING_REPORT",
   "COMPLETED"
 ];
+const LEGACY_WEB_STATUSES = new Set([
+  "PLANNING_WEB_SEARCH",
+  "WEB_SEARCHING",
+  "WEB_FETCHING",
+  "VERIFYING_WEB_RESULTS"
+]);
 
 function safeReportUrl(url: string) {
   return /^https?:\/\//i.test(url) ? url : "";
@@ -506,9 +524,17 @@ export default function Home() {
     setAudioJob(payload as IntakeAudioJob);
   };
 
+  const usesLegacyWebProgress = Boolean(
+    task && (
+      LEGACY_WEB_STATUSES.has(task.status)
+      || task.web_search_status === "SUCCESS"
+      || task.web_search_status === "FAILED"
+    )
+  );
+  const statusOrder = usesLegacyWebProgress ? LEGACY_STATUS_ORDER : CURRENT_STATUS_ORDER;
   const visibleStatuses = task?.input_type === "text"
-    ? STATUS_ORDER.filter((status) => status !== "TRANSCRIBING")
-    : STATUS_ORDER;
+    ? statusOrder.filter((status) => status !== "TRANSCRIBING")
+    : statusOrder;
   const visibleCurrentIndex = task ? visibleStatuses.indexOf(task.status) : -1;
 
   return (
