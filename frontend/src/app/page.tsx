@@ -4,7 +4,9 @@ import {
   AlertCircle,
   Check,
   LoaderCircle,
+  Mic,
   MessageSquare,
+  RefreshCw,
   RotateCcw,
   Search,
   Send
@@ -15,6 +17,15 @@ import ReactMarkdown from "react-markdown";
 type InputType = "text" | "audio";
 type ReportTab = "detailed" | "action";
 type ChatMessage = { role: "user" | "assistant"; content: string };
+type IntakeAudioJob = {
+  job_id: string;
+  session_id: string;
+  status: "QUEUED" | "TRANSCRIBING" | "NEEDS_REVIEW" | "TRANSCRIBED" | "FAILED";
+  transcript?: string;
+  corrected_transcript?: string;
+  error_message?: string;
+  retry_count: number;
+};
 
 type Person = { name?: string; organization?: string; title?: string };
 type EntityMention = {
@@ -72,6 +83,12 @@ type IntakeResponse = {
   analysis_input: string;
   ready_to_analyze: boolean;
   missing_information: string[];
+  status: "COLLECTING" | "NEEDS_CONFIRMATION" | "READY" | "STARTING_ANALYSIS" | "ANALYZING";
+  version: number;
+  messages?: ChatMessage[];
+  research_task_id?: string;
+  confirmation_request?: Task["confirmation_request"];
+  active_audio_job?: IntakeAudioJob;
 };
 
 const INITIAL_MESSAGE: ChatMessage = {
@@ -80,6 +97,7 @@ const INITIAL_MESSAGE: ChatMessage = {
 };
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+const INTAKE_SESSION_STORAGE_KEY = "resource-agent-intake-session-id";
 const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "NEEDS_CONFIRMATION"]);
 const STATUS_LABELS: Record<string, string> = {
   PENDING: "任务已创建",
@@ -130,9 +148,13 @@ export default function Home() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([INITIAL_MESSAGE]);
   const [chatInput, setChatInput] = useState("");
   const [chatSessionId, setChatSessionId] = useState<string | null>(null);
+  const [chatSessionVersion, setChatSessionVersion] = useState<number | null>(null);
   const [analysisInput, setAnalysisInput] = useState("");
   const [readyToAnalyze, setReadyToAnalyze] = useState(false);
   const [missingInformation, setMissingInformation] = useState<string[]>([]);
+  const [intakeConfirmationRequest, setIntakeConfirmationRequest] = useState<Task["confirmation_request"]>();
+  const [audioJob, setAudioJob] = useState<IntakeAudioJob>();
+  const [audioTranscript, setAudioTranscript] = useState("");
   const [isChatting, setIsChatting] = useState(false);
   const [task, setTask] = useState<Task | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -151,6 +173,54 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    const sessionId = window.localStorage.getItem(INTAKE_SESSION_STORAGE_KEY);
+    if (!sessionId) return;
+    fetch(`${API_BASE}/api/v1/intake/${sessionId}`)
+      .then(async (response) => {
+        if (!response.ok) {
+          window.localStorage.removeItem(INTAKE_SESSION_STORAGE_KEY);
+          return null;
+        }
+        return (await response.json()) as IntakeResponse;
+      })
+      .then((payload) => {
+        if (!payload) return;
+        setChatSessionId(payload.session_id);
+        setChatSessionVersion(payload.version);
+        setAnalysisInput(payload.analysis_input);
+        setReadyToAnalyze(payload.ready_to_analyze);
+        setMissingInformation(payload.missing_information);
+        setIntakeConfirmationRequest(payload.confirmation_request);
+        if (payload.active_audio_job) {
+          setAudioJob(payload.active_audio_job);
+          setAudioTranscript(payload.active_audio_job.transcript ?? "");
+        }
+        if (payload.messages?.length) setChatMessages(payload.messages);
+        if (payload.research_task_id) {
+          void fetchTask(payload.research_task_id).catch((reason) => setError(reason.message));
+        }
+      })
+      .catch(() => window.localStorage.removeItem(INTAKE_SESSION_STORAGE_KEY));
+  }, [fetchTask]);
+
+  useEffect(() => {
+    if (!chatSessionId || !audioJob || !new Set(["QUEUED", "TRANSCRIBING"]).has(audioJob.status)) return;
+    const interval = window.setInterval(() => {
+      fetch(`${API_BASE}/api/v1/intake/${chatSessionId}/audio/${audioJob.job_id}`)
+        .then(async (response) => {
+          if (!response.ok) throw new Error("音频状态获取失败");
+          return (await response.json()) as IntakeAudioJob;
+        })
+        .then((job) => {
+          setAudioJob(job);
+          if (job.transcript) setAudioTranscript(job.transcript);
+        })
+        .catch((reason) => setError(reason.message));
+    }, 1500);
+    return () => window.clearInterval(interval);
+  }, [audioJob, chatSessionId]);
+
+  useEffect(() => {
     if (!task || TERMINAL.has(task.status)) return;
     const interval = setInterval(() => {
       fetchTask(task.task_id).catch((reason) => setError(reason.message));
@@ -162,8 +232,8 @@ export default function Home() {
     chatThreadRef.current?.scrollTo({ top: chatThreadRef.current.scrollHeight });
   }, [chatMessages, isChatting]);
 
-  const sendChatMessage = async () => {
-    const content = chatInput.trim();
+  const sendChatMessage = async (contentOverride?: string, audioJobId?: string) => {
+    const content = (contentOverride ?? chatInput).trim();
     if (!content || isChatting) return;
     const nextMessages: ChatMessage[] = [...chatMessages, { role: "user", content }];
     setChatMessages(nextMessages);
@@ -176,7 +246,8 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           ...(chatSessionId ? { session_id: chatSessionId } : {}),
-          messages: nextMessages
+          messages: nextMessages,
+          ...(audioJobId ? { audio_job_id: audioJobId } : {})
         })
       });
       if (!response.ok) {
@@ -185,13 +256,20 @@ export default function Home() {
       }
       const payload = (await response.json()) as IntakeResponse;
       setChatSessionId(payload.session_id);
+      setChatSessionVersion(payload.version);
+      window.localStorage.setItem(INTAKE_SESSION_STORAGE_KEY, payload.session_id);
       setAnalysisInput(payload.analysis_input);
       setReadyToAnalyze(payload.ready_to_analyze);
       setMissingInformation(payload.missing_information);
+      setIntakeConfirmationRequest(payload.confirmation_request);
       setChatMessages((current) => [
         ...current,
         { role: "assistant", content: payload.assistant_reply }
       ]);
+      if (audioJobId) {
+        setAudioJob(undefined);
+        setAudioTranscript("");
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "对话助手暂时不可用");
     } finally {
@@ -200,19 +278,22 @@ export default function Home() {
   };
 
   const startAnalysis = async () => {
-    if (!analysisInput.trim()) {
+    if (!chatSessionId || !readyToAnalyze || !analysisInput.trim()) {
       setError("请先通过对话提供本次分析的信息");
       return;
     }
     setError("");
     setIsSubmitting(true);
     try {
-      const response = await fetch(`${API_BASE}/api/v1/tasks/text`, {
+      const response = await fetch(`${API_BASE}/api/v1/intake/${chatSessionId}/start-analysis`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: analysisInput.trim() })
+        body: JSON.stringify({ expected_version: chatSessionVersion })
       });
-      if (!response.ok) throw new Error("任务创建失败");
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        throw new Error(payload.detail ?? "任务创建失败");
+      }
       setTask(await response.json());
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "任务创建失败");
@@ -227,9 +308,14 @@ export default function Home() {
     setChatMessages([INITIAL_MESSAGE]);
     setChatInput("");
     setChatSessionId(null);
+    setChatSessionVersion(null);
+    window.localStorage.removeItem(INTAKE_SESSION_STORAGE_KEY);
     setAnalysisInput("");
     setReadyToAnalyze(false);
     setMissingInformation([]);
+    setIntakeConfirmationRequest(undefined);
+    setAudioJob(undefined);
+    setAudioTranscript("");
     setSelections({});
     setManualValues({});
     setReportTab("detailed");
@@ -269,6 +355,84 @@ export default function Home() {
     } finally {
       setIsSubmitting(false);
     }
+  };
+
+  const confirmIntakeEntities = async () => {
+    if (!chatSessionId || !intakeConfirmationRequest) return;
+    const missing = intakeConfirmationRequest.items.find(
+      (item) => !selections[item.mention] && !manualValues[item.mention]?.trim()
+    );
+    if (missing) {
+      setError(`请选择或填写“${missing.mention}”`);
+      return;
+    }
+    setIsSubmitting(true);
+    setError("");
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/intake/${chatSessionId}/confirm`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          confirmation_version: intakeConfirmationRequest.version,
+          selections: intakeConfirmationRequest.items.map((item) => ({
+            mention: item.mention,
+            candidate_id: selections[item.mention] || null,
+            manual_value: selections[item.mention] ? null : manualValues[item.mention]?.trim()
+          }))
+        })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.detail ?? "身份确认提交失败");
+      const intake = payload as IntakeResponse;
+      setChatSessionVersion(intake.version);
+      setAnalysisInput(intake.analysis_input);
+      setReadyToAnalyze(intake.ready_to_analyze);
+      setMissingInformation(intake.missing_information);
+      setIntakeConfirmationRequest(intake.confirmation_request);
+      if (intake.messages?.length) setChatMessages(intake.messages);
+      setSelections({});
+      setManualValues({});
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "身份确认提交失败");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const uploadAudio = async (file: File) => {
+    const sessionId = chatSessionId ?? crypto.randomUUID();
+    setChatSessionId(sessionId);
+    window.localStorage.setItem(INTAKE_SESSION_STORAGE_KEY, sessionId);
+    setError("");
+    const form = new FormData();
+    form.append("audio", file, file.name || "recording.webm");
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/intake/${sessionId}/audio`, {
+        method: "POST",
+        body: form
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.detail ?? "音频上传失败");
+      setAudioJob(payload as IntakeAudioJob);
+      setReadyToAnalyze(false);
+      setMissingInformation(["等待音频转写和确认"]);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "音频上传失败");
+    }
+  };
+
+  const retryAudio = async () => {
+    if (!chatSessionId || !audioJob) return;
+    const response = await fetch(
+      `${API_BASE}/api/v1/intake/${chatSessionId}/audio/${audioJob.job_id}/retry`,
+      { method: "POST" }
+    );
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      setError(payload.detail ?? "音频重试失败");
+      return;
+    }
+    setAudioJob(payload as IntakeAudioJob);
   };
 
   const visibleStatuses = task?.input_type === "text"
@@ -341,6 +505,48 @@ export default function Home() {
                 )}
               </div>
 
+              <div className="audio-controls">
+                <label className="icon-button" title="上传 WebM 录音">
+                  <Mic size={17} />
+                  <input
+                    type="file"
+                    accept="audio/webm"
+                    hidden
+                    disabled={isSubmitting || Boolean(audioJob)}
+                    onChange={(event) => {
+                      const file = event.target.files?.[0];
+                      if (file) void uploadAudio(file);
+                      event.target.value = "";
+                    }}
+                  />
+                </label>
+                {audioJob && <span>音频：{audioJob.status}</span>}
+                {audioJob?.status === "FAILED" && (
+                  <button className="icon-button" onClick={() => void retryAudio()} title="重试转写">
+                    <RefreshCw size={17} />
+                  </button>
+                )}
+              </div>
+
+              {audioJob?.status === "NEEDS_REVIEW" && (
+                <div className="audio-review">
+                  <textarea
+                    value={audioTranscript}
+                    onChange={(event) => setAudioTranscript(event.target.value)}
+                    rows={4}
+                    maxLength={10000}
+                  />
+                  <button
+                    className="primary-button"
+                    disabled={!audioTranscript.trim() || isChatting}
+                    onClick={() => void sendChatMessage(audioTranscript, audioJob.job_id)}
+                  >
+                    <Check size={17} />
+                    确认转写
+                  </button>
+                </div>
+              )}
+
               <div className="chat-composer">
                 <textarea
                   value={chatInput}
@@ -358,7 +564,7 @@ export default function Home() {
                 />
                 <button
                   className="send-button"
-                  onClick={sendChatMessage}
+                  onClick={() => void sendChatMessage()}
                   disabled={!chatInput.trim() || isChatting || isSubmitting}
                   title="发送"
                 >
@@ -366,15 +572,62 @@ export default function Home() {
                 </button>
               </div>
 
+              {intakeConfirmationRequest && (
+                <section className="confirmation-panel">
+                  <div className="section-label">身份确认</div>
+                  {intakeConfirmationRequest.items.map((item) => (
+                    <fieldset key={item.mention}>
+                      <legend>{item.mention}</legend>
+                      {item.candidates.map((candidate) => (
+                        <label key={candidate.candidate_id} className="candidate-option">
+                          <input
+                            type="radio"
+                            name={`intake-${item.mention}`}
+                            checked={selections[item.mention] === candidate.candidate_id}
+                            onChange={() => {
+                              setSelections((current) => ({ ...current, [item.mention]: candidate.candidate_id }));
+                              setManualValues((current) => ({ ...current, [item.mention]: "" }));
+                            }}
+                          />
+                          <span>
+                            <strong>{candidate.canonical_name}</strong>
+                            <small>{[candidate.organization, candidate.title, candidate.region].filter(Boolean).join(" · ")}</small>
+                            <small>{candidate.reason}</small>
+                            {candidate.evidence_quote && <small>依据：{candidate.evidence_quote}</small>}
+                            {candidate.source_url && <small className="candidate-source">来源：{candidate.source_url}</small>}
+                          </span>
+                        </label>
+                      ))}
+                      <label className="manual-entry">
+                        <span>手工填写确认名称</span>
+                        <input
+                          type="text"
+                          value={manualValues[item.mention] ?? ""}
+                          onChange={(event) => {
+                            const value = event.target.value;
+                            setManualValues((current) => ({ ...current, [item.mention]: value }));
+                            if (value) setSelections((current) => ({ ...current, [item.mention]: "" }));
+                          }}
+                        />
+                      </label>
+                    </fieldset>
+                  ))}
+                  <button className="primary-button" disabled={isSubmitting} onClick={confirmIntakeEntities}>
+                    {isSubmitting ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}
+                    确认身份
+                  </button>
+                </section>
+              )}
+
               <div className="chat-actions">
                 <div className="intake-hint">
                   {missingInformation.length > 0
                     ? `待补充：${missingInformation.join("、")}`
-                    : analysisInput
+                    : readyToAnalyze
                       ? "可以继续补充，也可以立即开始分析"
-                      : "发送第一条消息后可开始分析"}
+                      : "正在确认信息是否完整"}
                 </div>
-                <button className="primary-button" disabled={!analysisInput || isSubmitting || isChatting} onClick={startAnalysis}>
+                <button className="primary-button" disabled={!readyToAnalyze || !analysisInput || isSubmitting || isChatting} onClick={startAnalysis}>
                   {isSubmitting ? <LoaderCircle className="spin" size={17} /> : <Search size={17} />}
                   立即分析
                 </button>

@@ -70,6 +70,10 @@ textarea::placeholder { color: #9ca49f; }
 .chat-bubble { max-width: min(78%, 620px); padding: 10px 13px; border-radius: 6px; background: #fff; border: 1px solid #dce2dd; color: #26332b; font-size: 14px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
 .chat-row.user .chat-bubble { color: #fff; background: #176240; border-color: #176240; }
 .chat-typing { display: flex; align-items: center; gap: 7px; color: #68736b; }
+.audio-controls { min-height: 34px; display: flex; align-items: center; gap: 9px; margin-top: 10px; color: #68736b; font-size: 12px; }
+.audio-review { display: grid; gap: 10px; margin-top: 10px; }
+.audio-review textarea { min-height: 92px; resize: vertical; padding: 11px 12px; }
+.audio-review .primary-button { justify-self: end; }
 .chat-composer { display: grid; grid-template-columns: minmax(0, 1fr) 42px; gap: 9px; align-items: end; margin-top: 12px; }
 .chat-composer textarea { min-height: 76px; max-height: 150px; resize: vertical; padding: 11px 12px; }
 .send-button { width: 42px; height: 42px; display: grid; place-items: center; border: 0; border-radius: 5px; color: #fff; background: #176240; cursor: pointer; }

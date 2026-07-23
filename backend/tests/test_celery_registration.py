@@ -9,3 +9,9 @@ def test_pipeline_task_registers_after_module_import() -> None:
     import app.tasks.pipeline  # noqa: F401
 
     assert "run_research_pipeline" in celery_app.tasks
+
+
+def test_intake_audio_task_registers_after_module_import() -> None:
+    import app.tasks.intake_audio  # noqa: F401
+
+    assert "run_intake_audio_transcription" in celery_app.tasks

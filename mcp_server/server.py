@@ -18,6 +18,15 @@ repository = ProjectRepository(
 
 
 @mcp.tool()
+def find_entity_candidates(
+    person_mention: str | None = None,
+    organization_mention: str | None = None,
+) -> list[dict]:
+    """Find read-only internal customer and contact candidates."""
+    return repository.find_entity_candidates(person_mention, organization_mention)
+
+
+@mcp.tool()
 def search_projects(
     person_names: list[str], organization_names: list[str], keywords: list[str]
 ) -> list[dict]:

@@ -28,6 +28,33 @@ class ProjectMcpClient:
                     await asyncio.sleep(2**attempt)
         raise RuntimeError(f"MCP search_projects failed: {last_error}") from last_error
 
+    async def find_entity_candidates(
+        self,
+        person_mention: str | None = None,
+        organization_mention: str | None = None,
+    ) -> list[dict]:
+        payload = await self._call_with_retry(
+            "find_entity_candidates",
+            {
+                "person_mention": person_mention,
+                "organization_mention": organization_mention,
+            },
+        )
+        if not isinstance(payload, list):
+            raise RuntimeError("MCP find_entity_candidates returned an invalid payload")
+        return [item for item in payload if isinstance(item, dict)]
+
+    async def _call_with_retry(self, name: str, arguments: dict) -> object:
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                return await self._call_tool(name, arguments)
+            except Exception as exc:
+                last_error = exc
+                if attempt < 2:
+                    await asyncio.sleep(2**attempt)
+        raise RuntimeError(f"MCP {name} failed: {last_error}") from last_error
+
     async def _search_once(
         self,
         person_names: list[str],
