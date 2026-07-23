@@ -1,0 +1,3 @@
+# Codex-managed worktrees copy only ignored runtime configuration.
+# Dependency directories are linked by scripts/setup_worktree.ps1 instead of copied.
+.env

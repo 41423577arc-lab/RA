@@ -7,6 +7,9 @@
 - A feature task may commit and push only its own branch. The integration task owns merges and pushes `main` explicitly to both `origin` and `vftci`.
 - Do not use `git reset --hard`, overwrite another task's changes, or delete branches that belong to another task.
 - Before editing, confirm the current branch/worktree and keep unrelated changes untouched.
+- Codex-managed worktrees should run `powershell -ExecutionPolicy Bypass -File scripts/setup_worktree.ps1` once before testing. The script links the main worktree's `.venv` and `frontend/node_modules` without copying them.
+- Feature worktrees must not run package installation or upgrade commands against these shared dependency links. Dependency changes belong to the integration task and are installed from the main worktree.
+- Next.js Turbopack rejects a `node_modules` junction that points outside the worktree. Feature worktrees using the shared junction must run frontend commands with Webpack, for example `npm run build -- --webpack` or `npm run dev -- --webpack`. The main integration worktree can use the normal scripts.
 
 ## Functional ownership
 
@@ -64,7 +67,7 @@ When a feature needs a shared change, stop before editing it and report a compac
 ## Verification
 
 - Add or update focused tests for changed behavior.
-- Backend changes: run the focused test file, then `python -m pytest backend/tests -q` when practical.
-- Frontend changes: run `npm run build` from `frontend`.
+- Backend changes: run the focused test file, then `.\.venv\Scripts\python -m pytest backend\tests -q` when practical.
+- Frontend changes in a feature worktree: run `npm run build -- --webpack` from `frontend`. The integration task runs the normal `npm run build` from the main worktree.
 - Before handoff, run `git diff --check`, review `git status`, and summarize changed files, tests, and any shared-contract proposal.
 - The integration task merges in this order unless dependencies require otherwise: identity resolution, intake web lookup, intake activity UI. It then runs the complete backend suite and frontend production build before updating `main` on both remotes.
