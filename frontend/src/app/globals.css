@@ -26,7 +26,22 @@ button { letter-spacing: 0; }
 }
 .topbar h1 { margin: 0; font-size: 17px; line-height: 1.2; font-weight: 700; }
 .topbar p { margin: 3px 0 0; color: #6c776f; font-size: 12px; }
-.reset-button { margin-left: auto; }
+.reset-button {
+  min-height: 34px;
+  margin-left: auto;
+  padding: 0 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #d5dbd6;
+  border-radius: 5px;
+  background: #fff;
+  color: #4f5c53;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 650;
+}
+.reset-button:hover { border-color: #9eaaa1; background: #f7f9f7; }
 
 .workspace {
   width: min(1220px, calc(100% - 40px));

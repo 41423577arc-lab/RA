@@ -11,7 +11,12 @@ from app.config import Settings
 
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
-REVIEW_NODES = {"web_verify", "project_rerank", "association"}
+REVIEW_NODES = {
+    "web_verify",
+    "project_rerank",
+    "association",
+    "intake_identity_normalize",
+}
 LONG_NODES = {"association", "report_content"}
 
 
