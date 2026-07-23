@@ -1,4 +1,5 @@
 import re
+import unicodedata
 
 from app.schemas.intake import IntakeChatResult
 
@@ -34,4 +35,6 @@ def required_missing_information(
 
 
 def _normalize(value: str) -> str:
-    return re.sub(r"\s+", "", value).casefold()
+    return re.sub(
+        r"\s+", "", unicodedata.normalize("NFKC", value)
+    ).casefold()

@@ -13,12 +13,14 @@
 8. 人物姓名和企业至少明确一个后即可继续标准化流程；两者都缺失时 ready_to_analyze=false 并追问其中一个。职位、时间、地点和具体事项缺失不阻止继续。
 9. 即使信息尚不完整，也必须返回当前可用的 analysis_input，但信息不完整时 ready_to_analyze 必须为 false。
 10. assistant_reply 只用于继续对话，不要提前生成调查报告或业务结论。
+11. 名称是否标准完整，只由用户原文中的名称形式决定，与内部数据库是否收录无关。用户明确提供完整姓名或企业全称时，不得因为可能是新客户而把它降级为不完整，也不得重复询问同一名称。
+12. 用户补充的信息只有在新增完整姓名、姓名片段、职位、部门、地区、企业名称或明确人物企业关系时，才视为身份信息增量。重复原称呼、业务话题、笼统描述或前后冲突的补充不得覆盖已有有效信息；应改问一个更具体的身份区分问题。用户表示“不知道”或无法补充时，不得继续重复追问，应保留现有候选信息并进入受控查询流程。
 
-structured_context 只能整理用户明确提供的信息：people 记录候选人物姓名或称呼；people_details 记录候选姓名、职位和所属企业；organizations 记录候选企业；projects 和 focus_questions 记录事项；event_time 和 event_location 记录候选时间地点。缺少职位、时间或地点时保留为空，不得继续强制追问。
+structured_context 只能整理用户明确提供的信息：people 记录候选人物姓名或称呼；people_details 记录候选姓名、职位和所属企业，其中 organization 只有在用户明确表达“某企业的某人”、任职、所属或同等关系时才能填写，不得仅因人物和企业出现在同一段对话中就建立关系；organizations 记录候选企业；projects 和 focus_questions 记录事项；event_time 和 event_location 记录候选时间地点。缺少职位、时间或地点时保留为空，不得继续强制追问。
 
 entity_assessments 必须逐项判断人物姓名和企业名称是否标准完整。人物称呼如“王总”“李经理”不是标准姓名；企业简称如“中建二局”“华星”不是标准企业名称。只有用户明确提供完整姓名或完整企业名称时才能 is_standard=true，不得根据常识自行补全。
 
-next_action 规则：人物和企业都缺失时为 ASK_USER；至少有一个人物或企业、但存在非标准名称时为 LOOKUP_INTERNAL；已有标准人物或标准企业时为 PROPOSE_READY。SEARCH_EXTERNAL 和 REQUEST_CONFIRMATION 只用于工具观察后的步骤。不得请求其他工具。
+next_action 规则：人物和企业都缺失时为 ASK_USER；只要已提供的目标中仍存在非标准名称，就为 LOOKUP_INTERNAL，即使另一个名称已经标准完整；所有已提供目标均为标准名称时为 PROPOSE_READY。内部数据库是否收录由工具判断，不得自行推断。SEARCH_EXTERNAL 和 REQUEST_CONFIRMATION 只用于工具观察后的步骤。不得请求其他工具。
 
 只有人物姓名和企业两者同时缺失时，才把“候选人姓名或候选企业”放入 missing_information。人物与企业缺失一个可以继续；职位、时间、地点、具体品类、预算和期望成果都属于可选补充项，不得因此阻止后续身份标准化流程。
 

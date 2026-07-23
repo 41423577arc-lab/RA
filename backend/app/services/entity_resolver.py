@@ -20,6 +20,45 @@ class InsufficientContextError(ValueError):
 class EntityResolver:
     """Use model decisions after verifying that their evidence exists in the input."""
 
+    _PERSON_TITLES = (
+        "副董事长",
+        "董事长",
+        "副总经理",
+        "总经理",
+        "副总裁",
+        "总裁",
+        "负责人",
+        "经理",
+        "主任",
+        "书记",
+        "院长",
+        "校长",
+        "先生",
+        "女士",
+        "领导",
+        "总",
+        "董",
+    )
+    _COURTESY_TITLES = {"先生", "女士"}
+    _TITLE_EQUIVALENTS = {
+        "总": ("董事长", "副董事长", "总经理", "副总经理", "总裁", "副总裁", "负责人"),
+        "董": ("董事长", "副董事长", "董事"),
+    }
+    _ORGANIZATION_SUFFIXES = (
+        "股份有限公司",
+        "集团有限公司",
+        "有限责任公司",
+        "集团公司",
+        "有限公司",
+        "人民政府",
+        "委员会",
+        "研究院",
+        "工程局",
+        "集团",
+        "大学",
+        "银行",
+    )
+
     def resolve(
         self,
         input_text: str,
@@ -82,8 +121,10 @@ class EntityResolver:
             return None
         for person in understanding.people:
             mention = person.mention.strip()
-            match = re.fullmatch(r"([\u4e00-\u9fff]{1,2})(?:总|董|经理|主任|书记|院长|校长)", mention)
-            if match and self._normalize(mention) in self._normalize(input_text):
+            if (
+                self._person_reference(mention) is not None
+                and self._normalize(mention) in self._normalize(input_text)
+            ):
                 return mention, organizations[0]
         return None
 
@@ -93,21 +134,21 @@ class EntityResolver:
         organization: str,
         pages: list[WebPage],
     ) -> list[CandidateOption]:
-        surname_match = re.fullmatch(
-            r"([\u4e00-\u9fff]{1,2})(?:总|董|经理|主任|书记|院长|校长)", mention
-        )
-        if not surname_match:
+        reference = self._person_reference(mention)
+        if reference is None:
             return []
-        surname = surname_match.group(1)
+        name_fragment, reference_title = reference
+        if reference_title in self._COURTESY_TITLES:
+            return []
         title_pattern = "董事长|副董事长|总经理|副总经理|总裁|副总裁|负责人|法定代表人"
         patterns = [
             re.compile(
-                rf"(?P<name>{re.escape(surname)}[\u4e00-\u9fff]{{1,2}})"
+                rf"(?P<name>{re.escape(name_fragment)}[\u4e00-\u9fff]{{1,2}})"
                 rf"[^。！？!?；;\n]{{0,14}}?(?P<title>{title_pattern})"
             ),
             re.compile(
                 rf"(?P<title>{title_pattern})[^。！？!?；;\n]{{0,14}}?"
-                rf"(?P<name>{re.escape(surname)}[\u4e00-\u9fff]{{1,2}})"
+                rf"(?P<name>{re.escape(name_fragment)}[\u4e00-\u9fff]{{1,2}})"
                 rf"(?=负责|现任|任职|[，,。；;、\s（(]|$)"
             ),
         ]
@@ -125,7 +166,12 @@ class EntityResolver:
                 for pattern in patterns:
                     for match in pattern.finditer(sentence):
                         name = match.group("name")
-                        if name == mention or any(term in name for term in invalid_name_terms):
+                        title = match.group("title")
+                        if (
+                            name == mention
+                            or any(term in name for term in invalid_name_terms)
+                            or not self.person_candidate_matches(mention, name, title)
+                        ):
                             continue
                         output.append(
                             self._input_candidate(
@@ -133,7 +179,7 @@ class EntityResolver:
                                 name,
                                 mention,
                                 organization,
-                                match.group("title"),
+                                title,
                                 "联网公开资料在同一段文字中同时出现该人物、企业和职务",
                                 0.82,
                                 source_url=page.url,
@@ -251,7 +297,12 @@ class EntityResolver:
             supported = self._has_source_evidence(
                 input_text, mention, organization.evidence_text
             )
-            source_name = canonical if canonical and self._normalize(canonical) in source else mention
+            canonical_in_source = bool(
+                canonical and self._normalize(canonical) in source
+            )
+            source_name = canonical if canonical_in_source else (
+                mention if not canonical else ""
+            )
             if (
                 organization.resolution == "CONFIRMED"
                 and source_name
@@ -337,15 +388,106 @@ class EntityResolver:
     def _deduplicate(entities: list[ConfirmedEntity]) -> list[ConfirmedEntity]:
         output = {}
         for entity in entities:
-            output[(entity.entity_type, entity.canonical_name)] = entity
+            key = (
+                entity.entity_type,
+                EntityResolver._normalize(entity.canonical_name),
+            )
+            output[key] = entity
         return list(output.values())
 
     @staticmethod
     def _unique_candidates(candidates: list[CandidateOption]) -> list[CandidateOption]:
         output = {}
         for candidate in candidates:
-            output[candidate.canonical_name] = candidate
+            output[EntityResolver._normalize(candidate.canonical_name)] = candidate
         return list(output.values())
+
+    @classmethod
+    def organization_candidate_matches(
+        cls, mention: str, canonical_name: str
+    ) -> bool:
+        mention_name = cls._organization_base(mention)
+        candidate_name = cls._organization_base(canonical_name)
+        if not mention_name or not candidate_name:
+            return False
+        if mention_name == candidate_name:
+            return True
+        return len(mention_name) >= 2 and mention_name in candidate_name
+
+    @classmethod
+    def person_candidate_matches(
+        cls,
+        mention: str,
+        canonical_name: str,
+        title: str | None = None,
+    ) -> bool:
+        mention_name = cls._normalize(mention)
+        candidate_name = cls._normalize(canonical_name)
+        if not mention_name or not candidate_name:
+            return False
+        if mention_name == candidate_name:
+            return True
+        reference = cls._person_reference(mention)
+        if reference is None:
+            return False
+        fragment, reference_title = reference
+        name_matches = (
+            fragment in candidate_name
+            if reference_title in cls._COURTESY_TITLES
+            else candidate_name.startswith(fragment)
+        )
+        if not name_matches:
+            return False
+        if reference_title in cls._COURTESY_TITLES:
+            return True
+        candidate_title = cls._normalize(title or "")
+        if not candidate_title:
+            return False
+        expected_titles = cls._TITLE_EQUIVALENTS.get(
+            reference_title, (reference_title,)
+        )
+        return any(cls._normalize(value) in candidate_title for value in expected_titles)
+
+    @classmethod
+    def relationship_candidate_matches(
+        cls,
+        person_mention: str,
+        organization_mention: str,
+        *,
+        candidate_name: str,
+        candidate_organization: str | None,
+        candidate_title: str | None = None,
+    ) -> bool:
+        return bool(
+            candidate_organization
+            and cls.organization_candidate_matches(
+                organization_mention, candidate_organization
+            )
+            and cls.person_candidate_matches(
+                person_mention, candidate_name, candidate_title
+            )
+        )
+
+    @classmethod
+    def _person_reference(cls, value: str) -> tuple[str, str] | None:
+        normalized = cls._normalize(value)
+        for title in cls._PERSON_TITLES:
+            normalized_title = cls._normalize(title)
+            if not normalized.endswith(normalized_title):
+                continue
+            fragment = normalized[: -len(normalized_title)]
+            if re.fullmatch(r"[\u4e00-\u9fff]{1,3}", fragment):
+                return fragment, title
+        return None
+
+    @classmethod
+    def _organization_base(cls, value: str) -> str:
+        normalized = cls._normalize(value)
+        for suffix in cls._ORGANIZATION_SUFFIXES:
+            normalized_suffix = cls._normalize(suffix)
+            if normalized.endswith(normalized_suffix):
+                return normalized[: -len(normalized_suffix)]
+        return normalized
 
     @staticmethod
     def _context(
