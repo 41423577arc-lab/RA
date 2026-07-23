@@ -6,6 +6,7 @@ from app.config import settings
 from app.database import SessionLocal, TaskRepository
 from app.schemas.task import (
     ConfirmedContext,
+    ConfirmedEntity,
     ExtractedInfo,
     IntentUnderstanding,
     ProjectQueryPlan,
@@ -120,24 +121,29 @@ class ResearchPipeline:
                     task_id, llm_understanding=understanding.model_dump(mode="json")
                 )
 
-                version = int(task.confirmation_version or 0) + 1
-                context, confirmation = self.entity_resolver.resolve(
-                    input_text, understanding, version
+                context = context_from_intake_snapshot(
+                    getattr(task, "input_snapshot", None), understanding
                 )
-                lookup = self.entity_resolver.candidate_lookup(
-                    input_text, understanding
-                )
-                if confirmation and lookup:
-                    mention, organization = lookup
-                    candidates = self._discover_identity_candidates(
-                        task_id, mention, organization, degraded
-                    )
+                confirmation = None
+                if context is None:
+                    version = int(task.confirmation_version or 0) + 1
                     context, confirmation = self.entity_resolver.resolve(
-                        input_text,
-                        understanding,
-                        version,
-                        external_candidates=candidates,
+                        input_text, understanding, version
                     )
+                    lookup = self.entity_resolver.candidate_lookup(
+                        input_text, understanding
+                    )
+                    if confirmation and lookup:
+                        mention, organization = lookup
+                        candidates = self._discover_identity_candidates(
+                            task_id, mention, organization, degraded
+                        )
+                        context, confirmation = self.entity_resolver.resolve(
+                            input_text,
+                            understanding,
+                            version,
+                            external_candidates=candidates,
+                        )
                 if confirmation:
                     self.repository.update(
                         task_id,
@@ -466,6 +472,44 @@ def sanitize_project_plan(
 
 def unique_non_empty(values) -> list[str]:
     return list(dict.fromkeys(value for value in values if value))
+
+
+def context_from_intake_snapshot(
+    snapshot: dict | None, understanding: IntentUnderstanding
+) -> ConfirmedContext | None:
+    structured = (snapshot or {}).get("structured_context", {})
+    resolutions = structured.get("entity_resolutions", [])
+    entities: list[ConfirmedEntity] = []
+    for item in resolutions:
+        entity_type = item.get("entity_type")
+        canonical_name = (item.get("canonical_name") or "").strip()
+        if entity_type not in {"PERSON", "ORGANIZATION", "PROJECT"} or not canonical_name:
+            continue
+        entities.append(
+            ConfirmedEntity(
+                candidate_id=item.get("candidate_id"),
+                entity_type=entity_type,
+                canonical_name=canonical_name,
+                aliases=item.get("aliases") or [],
+                organization=item.get("organization"),
+                title=item.get("title"),
+                region=item.get("region"),
+                confirmed_by="AUTO"
+                if item.get("confirmed_by") == "INTERNAL"
+                else "USER",
+            )
+        )
+    if not entities:
+        return None
+    return ConfirmedContext(
+        intents=understanding.intents,
+        entities=entities,
+        event_type=understanding.event_type,
+        event_time=understanding.event_time,
+        event_location=understanding.event_location,
+        business_directions=understanding.business_directions,
+        focus_questions=understanding.focus_questions,
+    )
 
 
 def build_search_queries(extracted: ExtractedInfo) -> list[str]:

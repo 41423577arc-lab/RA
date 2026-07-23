@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     llm_project_confidence_threshold: float = 0.60
     llm_analysis_confidence_threshold: float = 0.60
     llm_safety_salt: str = "resource-agent-demo"
+    intake_entity_resolution_enabled: bool = True
+    intake_audio_enabled: bool = True
+    intake_react_enabled: bool = True
     prompt_dir: Path = Path("./backend/prompts")
     detailed_report_template: Path = Path("./backend/templates/detailed_report.md.j2")
     action_brief_template: Path = Path("./backend/templates/action_brief.md.j2")

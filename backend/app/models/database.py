@@ -2,11 +2,15 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import DateTime, JSON, String, Text, func
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class Base(DeclarativeBase):
     pass
+
+
+INTAKE_JSON = JSON().with_variant(JSONB(), "postgresql")
 
 
 class ResearchTask(Base):
@@ -17,6 +21,8 @@ class ResearchTask(Base):
     input_type: Mapped[str] = mapped_column(String(16), nullable=False)
     audio_path: Mapped[str | None] = mapped_column(Text)
     input_text: Mapped[str | None] = mapped_column(Text)
+    intake_session_id: Mapped[str | None] = mapped_column(String(36), unique=True)
+    input_snapshot: Mapped[dict | None] = mapped_column(INTAKE_JSON)
     extracted_info: Mapped[dict | None] = mapped_column(JSON)
     llm_understanding: Mapped[dict | None] = mapped_column(JSON)
     confirmation_request: Mapped[dict | None] = mapped_column(JSON)
@@ -42,6 +48,42 @@ class ResearchTask(Base):
     prompt_versions: Mapped[dict | None] = mapped_column(JSON, default=dict)
     report_markdown: Mapped[str | None] = mapped_column(Text)
     error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class IntakeSession(Base):
+    __tablename__ = "intake_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="COLLECTING")
+    messages: Mapped[list] = mapped_column(INTAKE_JSON, nullable=False, default=list)
+    structured_context: Mapped[dict] = mapped_column(INTAKE_JSON, nullable=False, default=dict)
+    missing_information: Mapped[list] = mapped_column(INTAKE_JSON, nullable=False, default=list)
+    confirmation_request: Mapped[dict | None] = mapped_column(INTAKE_JSON)
+    analysis_input: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    ready_to_analyze: Mapped[bool] = mapped_column(nullable=False, default=False)
+    version: Mapped[int] = mapped_column(nullable=False, default=0)
+    research_task_id: Mapped[str | None] = mapped_column(String(36), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class IntakeAudioJob(Base):
+    __tablename__ = "intake_audio_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="QUEUED")
+    audio_path: Mapped[str | None] = mapped_column(Text)
+    transcript: Mapped[str | None] = mapped_column(Text)
+    corrected_transcript: Mapped[str | None] = mapped_column(Text)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    retry_count: Mapped[int] = mapped_column(nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

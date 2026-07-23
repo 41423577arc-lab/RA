@@ -1,10 +1,10 @@
 from collections.abc import Iterator
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
-from app.models.database import Base, LlmCallLog, ResearchTask
+from app.models.database import Base, IntakeSession, LlmCallLog, ResearchTask
 
 
 engine = create_engine(settings.database_url, pool_pre_ping=True)
@@ -12,8 +12,24 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
 def init_database() -> None:
+    if inspect(engine).has_table("research_tasks"):
+        _migrate_research_tasks()
     Base.metadata.create_all(engine)
-    _migrate_research_tasks()
+    _migrate_intake_sessions()
+
+
+def _migrate_intake_sessions() -> None:
+    if engine.dialect.name != "postgresql":
+        return
+    columns = ("messages", "structured_context", "missing_information", "confirmation_request")
+    with engine.begin() as connection:
+        for column in columns:
+            connection.execute(
+                text(
+                    f"ALTER TABLE intake_sessions ALTER COLUMN {column} "
+                    f"TYPE JSONB USING {column}::jsonb"
+                )
+            )
 
 
 def _migrate_research_tasks() -> None:
@@ -36,11 +52,21 @@ def _migrate_research_tasks() -> None:
         "action_brief_markdown": "TEXT",
         "degraded_nodes": json_type,
         "prompt_versions": json_type,
+        "intake_session_id": "VARCHAR(36)",
+        "input_snapshot": json_type,
     }
     with engine.begin() as connection:
         for name, sql_type in additions.items():
             if name not in columns:
                 connection.execute(text(f"ALTER TABLE research_tasks ADD COLUMN {name} {sql_type}"))
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "idx_research_tasks_intake_session_id "
+                "ON research_tasks (intake_session_id) "
+                "WHERE intake_session_id IS NOT NULL"
+            )
+        )
 
 
 def get_session() -> Iterator[Session]:
@@ -74,3 +100,30 @@ class TaskRepository:
     def log_llm_call(self, task_id: str, **values: object) -> None:
         self.session.add(LlmCallLog(task_id=task_id, **values))
         self.session.commit()
+
+
+class IntakeSessionRepository:
+    def __init__(self, session: Session):
+        self.session = session
+
+    def get(self, session_id: str, *, for_update: bool = False) -> IntakeSession | None:
+        statement = select(IntakeSession).where(IntakeSession.id == session_id)
+        if for_update:
+            statement = statement.with_for_update()
+        return self.session.scalar(statement)
+
+    def add(self, intake_session: IntakeSession) -> IntakeSession:
+        self.session.add(intake_session)
+        self.session.commit()
+        self.session.refresh(intake_session)
+        return intake_session
+
+    def update(self, session_id: str, **values: object) -> IntakeSession:
+        intake_session = self.get(session_id)
+        if intake_session is None:
+            raise KeyError(f"Intake session {session_id} not found")
+        for key, value in values.items():
+            setattr(intake_session, key, value)
+        self.session.commit()
+        self.session.refresh(intake_session)
+        return intake_session

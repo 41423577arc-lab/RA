@@ -10,5 +10,5 @@ celery_app.conf.update(
     result_serializer="json",
     accept_content=["json"],
     task_always_eager=settings.celery_task_always_eager,
-    imports=("app.tasks.pipeline",),
+    imports=("app.tasks.pipeline", "app.tasks.intake_audio"),
 )

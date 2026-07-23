@@ -95,6 +95,91 @@ class ProjectRepository:
             row = session.execute(statement, {"project_id": project_id}).mappings().one_or_none()
             return dict(row) if row else None
 
+    def find_entity_candidates(
+        self,
+        person_mention: str | None = None,
+        organization_mention: str | None = None,
+    ) -> list[dict]:
+        output: list[dict] = []
+        with self.session_factory() as session:
+            if person_mention:
+                rows = session.execute(
+                    text(
+                        """
+                        SELECT
+                            cc.contact_id, cc.contact_name, cc.job_title,
+                            c.customer_id, c.customer_name
+                        FROM customer_contacts cc
+                        JOIN customers c ON c.customer_id = cc.customer_id
+                        WHERE cc.contact_name ILIKE :person_pattern
+                          AND (
+                            CAST(:organization_pattern AS TEXT) IS NULL
+                            OR c.customer_name ILIKE :organization_pattern
+                          )
+                        ORDER BY
+                            CASE WHEN cc.contact_name = :person_mention THEN 0 ELSE 1 END,
+                            cc.contact_id
+                        LIMIT 10
+                        """
+                    ),
+                    {
+                        "person_mention": person_mention,
+                        "person_pattern": f"%{person_mention}%",
+                        "organization_pattern": f"%{organization_mention}%"
+                        if organization_mention
+                        else None,
+                    },
+                ).mappings()
+                output.extend(
+                    {
+                        "candidate_id": f"internal:contact:{row['contact_id']}",
+                        "entity_type": "PERSON",
+                        "canonical_name": row["contact_name"],
+                        "contact_id": row["contact_id"],
+                        "customer_id": row["customer_id"],
+                        "organization": row["customer_name"],
+                        "title": row["job_title"],
+                        "source": "INTERNAL",
+                        "match_type": "EXACT"
+                        if row["contact_name"] == person_mention
+                        else "PARTIAL",
+                    }
+                    for row in rows
+                )
+            if organization_mention:
+                rows = session.execute(
+                    text(
+                        """
+                        SELECT customer_id, customer_name, industry, region_name
+                        FROM customers
+                        WHERE customer_name ILIKE :organization_pattern
+                        ORDER BY
+                            CASE WHEN customer_name = :organization_mention THEN 0 ELSE 1 END,
+                            customer_id
+                        LIMIT 10
+                        """
+                    ),
+                    {
+                        "organization_mention": organization_mention,
+                        "organization_pattern": f"%{organization_mention}%",
+                    },
+                ).mappings()
+                output.extend(
+                    {
+                        "candidate_id": f"internal:customer:{row['customer_id']}",
+                        "entity_type": "ORGANIZATION",
+                        "canonical_name": row["customer_name"],
+                        "customer_id": row["customer_id"],
+                        "region": row["region_name"],
+                        "source": "INTERNAL",
+                        "match_type": "EXACT"
+                        if row["customer_name"] == organization_mention
+                        else "PARTIAL",
+                    }
+                    for row in rows
+                )
+        return output
+
     def get_sales_portfolio(
         self, manager_name: str | None = None, sales_rep_name: str | None = None
     ) -> list[dict]:
