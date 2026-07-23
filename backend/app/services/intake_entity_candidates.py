@@ -245,6 +245,38 @@ class IntakeEntityCandidateService:
             output.extend(
                 EntityResolver().candidates_from_web(mention, organization, pages)
             )
+        elif entity_type == "ORGANIZATION":
+            suffix = (
+                r"股份有限公司|有限责任公司|集团有限公司|有限公司|集团公司|"
+                r"工程局|研究院|委员会|人民政府|大学|银行"
+            )
+            alias = re.escape(mention)
+            pattern = re.compile(
+                rf"(?P<name>[\u4e00-\u9fff]{{2,40}}(?:{suffix}))"
+                rf"[^。！？!?；;\n]{{0,20}}?(?:以下简称|简称)[“\"']?{alias}"
+            )
+            for page in pages[:10]:
+                for sentence in re.split(r"(?<=[。！？!?；;\n])", page.raw_content):
+                    match = pattern.search(sentence)
+                    if match is None:
+                        continue
+                    canonical_name = match.group("name")
+                    candidate_id = hashlib.sha256(
+                        f"ORGANIZATION|{mention}|{canonical_name}|{page.url}".encode(
+                            "utf-8"
+                        )
+                    ).hexdigest()[:24]
+                    output.append(
+                        CandidateOption(
+                            candidate_id=f"external:{candidate_id}",
+                            entity_type="ORGANIZATION",
+                            canonical_name=canonical_name,
+                            reason="网页原文明确标注该企业全称及简称",
+                            confidence=0.92,
+                            source_url=page.url,
+                            evidence_quote=sentence.strip()[:500],
+                        )
+                    )
         return output
 
     @staticmethod

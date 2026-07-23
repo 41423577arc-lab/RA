@@ -422,13 +422,13 @@ def chat(
             external_normalizer = getattr(
                 intake_agent, "normalize_external_identity", None
             )
+            external_attempted = False
             if (
                 confirmation
-                and tool_decision is not None
-                and tool_decision.next_action == "SEARCH_EXTERNAL"
                 and any(len(item.candidates) != 1 for item in confirmation.items)
                 and callable(external_normalizer)
             ):
+                external_attempted = True
                 intake_activity.update(
                     session_id,
                     "CALLING_TOOL",
@@ -464,9 +464,26 @@ def chat(
             if confirmation:
                 confirmation_request = confirmation.model_dump(mode="json")
                 ready = False
-                result.assistant_reply = follow_up_reply or (
-                    "请确认人物或企业候选，确认后即可开始分析。"
+                candidate_count = sum(
+                    len(item.candidates) for item in confirmation.items
                 )
+                if external_attempted and candidate_count:
+                    result.assistant_reply = (
+                        "内部与联网检索仍未能唯一确定全部关键人身份，"
+                        "请确认候选或手工填写缺失信息。"
+                    )
+                elif external_attempted:
+                    unresolved_mentions = "、".join(
+                        item.mention for item in confirmation.items
+                    )
+                    result.assistant_reply = (
+                        f"内部与联网检索后，仍无法可靠确定：{unresolved_mentions}。"
+                        "请手工填写以下缺失信息。"
+                    )
+                else:
+                    result.assistant_reply = follow_up_reply or (
+                        "请确认人物或企业候选，确认后即可开始分析。"
+                    )
                 result.missing_information = ["人物或企业身份确认"]
             else:
                 result.assistant_reply = "关键人身份已经标准化，可以开始分析。"

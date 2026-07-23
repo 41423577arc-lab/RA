@@ -432,6 +432,53 @@ class IdentityWeb:
         ]
 
 
+class OrganizationIdentityWeb:
+    async def search(self, queries):
+        return [
+            SearchResult(
+                title="中建二局",
+                url="https://example.com/cscec2b",
+                query=queries[0],
+                rank=0,
+            )
+        ]
+
+    async def extract(self, _):
+        return [
+            WebPage(
+                title="中建二局",
+                url="https://example.com/cscec2b",
+                raw_content=(
+                    "中国建筑第二工程局有限公司（以下简称“中建二局”）"
+                    "组建于1952年。"
+                ),
+                rank=0,
+            )
+        ]
+
+
+class NoIdentityWeb:
+    async def search(self, queries):
+        return [
+            SearchResult(
+                title="无关页面",
+                url="https://example.com/unrelated",
+                query=queries[0],
+                rank=0,
+            )
+        ]
+
+    async def extract(self, _):
+        return [
+            WebPage(
+                title="无关页面",
+                url="https://example.com/unrelated",
+                raw_content="页面没有目标人物或企业身份信息。",
+                rank=0,
+            )
+        ]
+
+
 class WebMustNotRun:
     def __init__(self):
         self.calls = 0
@@ -522,6 +569,37 @@ def test_intake_model_calls_external_identity_tool_only_after_internal_miss(
     resolutions = payload["structured_context"]["entity_resolutions"]
     assert {item["confirmed_by"] for item in resolutions} == {"EXTERNAL_AUTO"}
     assert web.queries == ['"王总" "比亚迪" 完整姓名 企业全称 职位']
+
+
+def test_intake_requests_manual_identity_only_after_external_lookup_fails(
+    monkeypatch,
+) -> None:
+    agent = ExternalToolIntakeAgent()
+    agent.normalize_external_identity = lambda request, mentions, pages: (
+        ExternalIdentityNormalizationResult(candidates=[])
+    )
+    monkeypatch.setattr(intake_api, "intake_agent", agent)
+    monkeypatch.setattr(
+        intake_api,
+        "entity_candidates",
+        IntakeEntityCandidateService(NoInternalCandidates(), NoIdentityWeb()),
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/intake/chat",
+            json={"messages": [{"role": "user", "content": "与比亚迪的王总会面"}]},
+        )
+
+    payload = response.json()
+    assert payload["status"] == "NEEDS_CONFIRMATION"
+    assert payload["assistant_reply"].startswith(
+        "内部与联网检索后，仍无法可靠确定："
+    )
+    assert all(
+        item["candidates"] == []
+        for item in payload["confirmation_request"]["items"]
+    )
 
 
 def test_explicit_full_user_identity_does_not_require_web_confirmation() -> None:
@@ -718,6 +796,34 @@ def test_identity_web_query_is_limited_to_identity_completion() -> None:
     assert not any(
         term in web.queries[0] for term in ("业务", "项目", "新闻", "产品", "背景")
     )
+
+
+def test_external_page_alias_evidence_auto_completes_organization_name() -> None:
+    service = IntakeEntityCandidateService(
+        NoInternalCandidates(), OrganizationIdentityWeb()
+    )
+    context = IntakeStructuredContext(
+        organizations=["中建二局"],
+        entity_assessments=[
+            IntakeEntityAssessment(
+                entity_type="ORGANIZATION", mention="中建二局", is_standard=False
+            )
+        ],
+    )
+    resolutions, confirmation = service.lookup_internal(context, 1, "中建二局")
+    assert confirmation is not None
+    confirmation = service.search_key_person_identity_web(
+        context,
+        confirmation,
+        lambda mentions, pages: ExternalIdentityNormalizationResult(candidates=[]),
+    )
+    resolutions, confirmation = service.apply_automatic_candidates(
+        resolutions, confirmation, 0.80
+    )
+
+    assert confirmation is None
+    assert resolutions[0]["canonical_name"] == "中国建筑第二工程局有限公司"
+    assert resolutions[0]["confirmed_by"] == "EXTERNAL_AUTO"
 
 
 def test_external_candidate_without_exact_page_evidence_is_rejected() -> None:
