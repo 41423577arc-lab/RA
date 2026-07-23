@@ -20,7 +20,7 @@ def required_missing_information(
             *(
                 value
                 for item in context.entity_resolutions
-                for value in (item.get("mention"), item.get("canonical_name"))
+                for value in (item.mention, item.canonical_name)
                 if value
             ),
         ]

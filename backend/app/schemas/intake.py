@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Literal
 from uuid import UUID, uuid4
 
@@ -17,6 +18,22 @@ class IntakeChatRequest(BaseModel):
     audio_job_id: UUID | None = None
 
 
+class IntakeEntityResolution(BaseModel):
+    candidate_id: str | None = None
+    entity_type: Literal["PERSON", "ORGANIZATION"]
+    canonical_name: str
+    mention: str
+    organization: str | None = None
+    title: str | None = None
+    region: str | None = None
+    confidence: float = Field(default=1, ge=0, le=1)
+    confirmed_by: Literal[
+        "USER_INPUT", "INTERNAL", "EXTERNAL_AUTO", "AUTO", "USER"
+    ]
+    source_url: str | None = None
+    evidence_quote: str | None = None
+
+
 class IntakeStructuredContext(BaseModel):
     people: list[str] = Field(default_factory=list, max_length=20)
     people_details: list["IntakePersonCandidate"] = Field(default_factory=list, max_length=20)
@@ -26,7 +43,7 @@ class IntakeStructuredContext(BaseModel):
     event_time: str | None = None
     event_location: str | None = None
     entity_assessments: list["IntakeEntityAssessment"] = Field(default_factory=list, max_length=40)
-    entity_resolutions: list[dict] = Field(default_factory=list, max_length=40)
+    entity_resolutions: list[IntakeEntityResolution] = Field(default_factory=list, max_length=40)
 
 
 class IntakePersonCandidate(BaseModel):
@@ -55,6 +72,9 @@ class IntakeChatResult(BaseModel):
 
 class IntakeFollowupResult(BaseModel):
     assistant_reply: str = Field(min_length=1, max_length=1_000)
+    next_action: Literal["SEARCH_EXTERNAL", "REQUEST_CONFIRMATION", "PROPOSE_READY"] = (
+        "REQUEST_CONFIRMATION"
+    )
 
 
 class ExternalIdentityCandidate(BaseModel):
@@ -90,6 +110,24 @@ class IntakeSessionResponse(IntakeChatResponse):
     messages: list[IntakeMessage]
     research_task_id: UUID | None = None
     active_audio_job: dict | None = None
+
+
+class IntakeActivityResponse(BaseModel):
+    session_id: UUID
+    phase: Literal[
+        "IDLE",
+        "THINKING",
+        "CHECKING_CONTEXT",
+        "CALLING_TOOL",
+        "PROCESSING_TOOL_RESULT",
+        "COMPLETED",
+        "FAILED",
+    ]
+    detail: str
+    active: bool
+    tool_name: str | None = None
+    sequence: int = Field(ge=0)
+    updated_at: datetime | None = None
 
 
 class StartAnalysisRequest(BaseModel):

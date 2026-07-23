@@ -2,7 +2,10 @@
 
 import {
   AlertCircle,
+  Bot,
   Check,
+  Database,
+  Globe2,
   LoaderCircle,
   Mic,
   MessageSquare,
@@ -17,6 +20,14 @@ import ReactMarkdown from "react-markdown";
 type InputType = "text" | "audio";
 type ReportTab = "detailed" | "action";
 type ChatMessage = { role: "user" | "assistant"; content: string };
+type IntakeActivity = {
+  session_id?: string;
+  phase: "IDLE" | "THINKING" | "CHECKING_CONTEXT" | "CALLING_TOOL" | "PROCESSING_TOOL_RESULT" | "COMPLETED" | "FAILED";
+  detail: string;
+  active: boolean;
+  tool_name?: string;
+  sequence: number;
+};
 type IntakeAudioJob = {
   job_id: string;
   session_id: string;
@@ -98,6 +109,16 @@ const INITIAL_MESSAGE: ChatMessage = {
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 const INTAKE_SESSION_STORAGE_KEY = "resource-agent-intake-session-id";
+const IDLE_ACTIVITY: IntakeActivity = {
+  phase: "IDLE",
+  detail: "大模型待命",
+  active: false,
+  sequence: 0
+};
+const TOOL_LABELS: Record<string, string> = {
+  lookup_internal_identity: "内部身份查询",
+  search_key_person_identity_web: "联网身份补全"
+};
 const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "NEEDS_CONFIRMATION"]);
 const STATUS_LABELS: Record<string, string> = {
   PENDING: "任务已创建",
@@ -112,10 +133,10 @@ const STATUS_LABELS: Record<string, string> = {
   WEB_SEARCHING: "正在搜索公开信息",
   WEB_FETCHING: "正在抓取网页正文",
   VERIFYING_WEB_RESULTS: "正在核验网页身份",
-  PLANNING_PROJECT_SEARCH: "正在扩展项目条件",
+  PLANNING_PROJECT_SEARCH: "正在准备内部项目检索",
   PROJECT_SEARCHING: "正在检索内部项目",
   RERANKING_PROJECTS: "正在评估项目价值",
-  ANALYZING_ASSOCIATIONS: "正在关联公开与内部信息",
+  ANALYZING_ASSOCIATIONS: "正在关联关键人与内部项目",
   GENERATING_REPORT_CONTENT: "正在生成报告内容",
   GENERATING: "正在生成总结",
   RENDERING_REPORT: "正在排版报告",
@@ -123,7 +144,19 @@ const STATUS_LABELS: Record<string, string> = {
   FAILED: "分析失败",
   CANCELLED: "任务已取消"
 };
-const STATUS_ORDER = [
+const CURRENT_STATUS_ORDER = [
+  "PENDING",
+  "TRANSCRIBING",
+  "CONTEXT_EXTRACTING",
+  "PLANNING_PROJECT_SEARCH",
+  "PROJECT_SEARCHING",
+  "RERANKING_PROJECTS",
+  "ANALYZING_ASSOCIATIONS",
+  "GENERATING_REPORT_CONTENT",
+  "RENDERING_REPORT",
+  "COMPLETED"
+];
+const LEGACY_STATUS_ORDER = [
   "PENDING",
   "TRANSCRIBING",
   "CONTEXT_EXTRACTING",
@@ -139,6 +172,12 @@ const STATUS_ORDER = [
   "RENDERING_REPORT",
   "COMPLETED"
 ];
+const LEGACY_WEB_STATUSES = new Set([
+  "PLANNING_WEB_SEARCH",
+  "WEB_SEARCHING",
+  "WEB_FETCHING",
+  "VERIFYING_WEB_RESULTS"
+]);
 
 function safeReportUrl(url: string) {
   return /^https?:\/\//i.test(url) ? url : "";
@@ -156,6 +195,7 @@ export default function Home() {
   const [audioJob, setAudioJob] = useState<IntakeAudioJob>();
   const [audioTranscript, setAudioTranscript] = useState("");
   const [isChatting, setIsChatting] = useState(false);
+  const [intakeActivity, setIntakeActivity] = useState<IntakeActivity>(IDLE_ACTIVITY);
   const [task, setTask] = useState<Task | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState("");
@@ -232,6 +272,25 @@ export default function Home() {
     chatThreadRef.current?.scrollTo({ top: chatThreadRef.current.scrollHeight });
   }, [chatMessages, isChatting]);
 
+  useEffect(() => {
+    if (!chatSessionId || !isChatting) return;
+    let cancelled = false;
+    const fetchActivity = async () => {
+      const response = await fetch(`${API_BASE}/api/v1/intake/${chatSessionId}/activity`);
+      if (!response.ok) return;
+      const activity = (await response.json()) as IntakeActivity;
+      if (!cancelled) setIntakeActivity(activity);
+    };
+    void fetchActivity().catch(() => undefined);
+    const interval = window.setInterval(() => {
+      void fetchActivity().catch(() => undefined);
+    }, 400);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [chatSessionId, isChatting]);
+
   const sendChatMessage = async (contentOverride?: string, audioJobId?: string) => {
     const content = (contentOverride ?? chatInput).trim();
     if (!content || isChatting) return;
@@ -240,12 +299,21 @@ export default function Home() {
     setChatInput("");
     setError("");
     setIsChatting(true);
+    const requestSessionId = chatSessionId ?? window.crypto.randomUUID();
+    if (!chatSessionId) setChatSessionId(requestSessionId);
+    setIntakeActivity({
+      session_id: requestSessionId,
+      phase: "THINKING",
+      detail: "正在提交对话",
+      active: true,
+      sequence: 0
+    });
     try {
       const response = await fetch(`${API_BASE}/api/v1/intake/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          ...(chatSessionId ? { session_id: chatSessionId } : {}),
+          session_id: requestSessionId,
           messages: nextMessages,
           ...(audioJobId ? { audio_job_id: audioJobId } : {})
         })
@@ -266,12 +334,26 @@ export default function Home() {
         ...current,
         { role: "assistant", content: payload.assistant_reply }
       ]);
+      setIntakeActivity({
+        session_id: payload.session_id,
+        phase: "COMPLETED",
+        detail: "本轮对话处理完成",
+        active: false,
+        sequence: intakeActivity.sequence + 1
+      });
       if (audioJobId) {
         setAudioJob(undefined);
         setAudioTranscript("");
       }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "对话助手暂时不可用");
+      setIntakeActivity({
+        session_id: requestSessionId,
+        phase: "FAILED",
+        detail: "本轮对话处理失败",
+        active: false,
+        sequence: intakeActivity.sequence + 1
+      });
     } finally {
       setIsChatting(false);
     }
@@ -325,6 +407,7 @@ export default function Home() {
     setSelections({});
     setManualValues({});
     setReportTab("detailed");
+    setIntakeActivity(IDLE_ACTIVITY);
   };
 
   const confirmEntities = async () => {
@@ -441,9 +524,17 @@ export default function Home() {
     setAudioJob(payload as IntakeAudioJob);
   };
 
+  const usesLegacyWebProgress = Boolean(
+    task && (
+      LEGACY_WEB_STATUSES.has(task.status)
+      || task.web_search_status === "SUCCESS"
+      || task.web_search_status === "FAILED"
+    )
+  );
+  const statusOrder = usesLegacyWebProgress ? LEGACY_STATUS_ORDER : CURRENT_STATUS_ORDER;
   const visibleStatuses = task?.input_type === "text"
-    ? STATUS_ORDER.filter((status) => status !== "TRANSCRIBING")
-    : STATUS_ORDER;
+    ? statusOrder.filter((status) => status !== "TRANSCRIBING")
+    : statusOrder;
   const visibleCurrentIndex = task ? visibleStatuses.indexOf(task.status) : -1;
 
   return (
@@ -495,6 +586,26 @@ export default function Home() {
                   {readyToAnalyze ? <Check size={14} /> : <MessageSquare size={14} />}
                   {readyToAnalyze ? "信息已基本齐全" : "正在收集信息"}
                 </div>
+              </div>
+
+              <div
+                className={`agent-activity ${intakeActivity.active ? "active" : ""} ${intakeActivity.phase.toLowerCase()}`}
+                aria-live="polite"
+              >
+                <span className="activity-icon" aria-hidden="true">
+                  {intakeActivity.active ? (
+                    intakeActivity.tool_name === "lookup_internal_identity" ? <Database size={15} />
+                      : intakeActivity.tool_name === "search_key_person_identity_web" ? <Globe2 size={15} />
+                        : <LoaderCircle className="spin" size={15} />
+                  ) : intakeActivity.phase === "COMPLETED" ? <Check size={15} /> : <Bot size={15} />}
+                </span>
+                <span className="activity-copy">
+                  <strong>{intakeActivity.detail}</strong>
+                  {intakeActivity.tool_name && (
+                    <small>{TOOL_LABELS[intakeActivity.tool_name] ?? intakeActivity.tool_name}</small>
+                  )}
+                </span>
+                <span className="activity-state">{intakeActivity.active ? "运行中" : intakeActivity.phase === "COMPLETED" ? "已完成" : "待命"}</span>
               </div>
 
               <div className="chat-thread" ref={chatThreadRef} aria-live="polite">

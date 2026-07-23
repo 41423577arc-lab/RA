@@ -12,24 +12,17 @@ from app.schemas.task import (
     ProjectQueryPlan,
     ProjectResult,
     PublicClaim,
-    SearchResult,
-    WebPage,
-    WebSearchPlan,
 )
 from app.services.agent_nodes import (
     AgentNodes,
-    claims_from_verifications,
     deterministic_rankings,
     fallback_association,
     fallback_project_query,
     fallback_report_content,
     fallback_understanding,
-    fallback_web_plan,
-    strict_rule_verifications,
     validate_analysis,
     validate_rankings,
     validate_report_content,
-    validate_web_results,
 )
 from app.services.entity_resolver import EntityResolver
 from app.services.extractor import RuleExtractor
@@ -51,12 +44,6 @@ class Transcriber(Protocol):
     def transcribe(self, webm_path: Path) -> str: ...
 
 
-class SearchService(Protocol):
-    async def search(self, queries: list[str]) -> list[SearchResult]: ...
-
-    async def extract(self, results: list[SearchResult]) -> list[WebPage]: ...
-
-
 class ProjectService(Protocol):
     async def search_projects(
         self, person_names: list[str], organization_names: list[str], keywords: list[str]
@@ -69,7 +56,7 @@ class ResearchPipeline:
         repository: Repository,
         transcriber: Transcriber,
         extractor: RuleExtractor,
-        web: SearchService,
+        web: object,
         projects: ProjectService,
         renderer: ReportRenderer,
         agents: AgentNodes | None = None,
@@ -78,7 +65,6 @@ class ResearchPipeline:
         self.repository = repository
         self.transcriber = transcriber
         self.extractor = extractor
-        self.web = web
         self.projects = projects
         self.renderer = renderer
         self.agents = agents
@@ -130,20 +116,6 @@ class ResearchPipeline:
                     context, confirmation = self.entity_resolver.resolve(
                         input_text, understanding, version
                     )
-                    lookup = self.entity_resolver.candidate_lookup(
-                        input_text, understanding
-                    )
-                    if confirmation and lookup:
-                        mention, organization = lookup
-                        candidates = self._discover_identity_candidates(
-                            task_id, mention, organization, degraded
-                        )
-                        context, confirmation = self.entity_resolver.resolve(
-                            input_text,
-                            understanding,
-                            version,
-                            external_candidates=candidates,
-                        )
                 if confirmation:
                     self.repository.update(
                         task_id,
@@ -159,39 +131,19 @@ class ResearchPipeline:
                     confirmation_request=None,
                 )
 
-            self.repository.update(task_id, status="PLANNING_WEB_SEARCH")
-            web_plan = self._with_fallback(
-                "web_plan",
-                degraded,
-                lambda: self.agents.web_plan(task_id, context),
-                lambda: fallback_web_plan(context),
+            claims = identity_claims_from_intake_snapshot(
+                getattr(task, "input_snapshot", None)
             )
-            web_plan = sanitize_web_plan(web_plan, context)
-            self.repository.update(task_id, web_search_plan=web_plan.model_dump(mode="json"))
-
-            search_results, pages, web_search_status, web_fetch_status = self._run_web(
-                task_id, [item.query for item in web_plan.queries]
-            )
-
-            self.repository.update(task_id, status="VERIFYING_WEB_RESULTS")
-            if pages:
-                verifications = self._with_fallback(
-                    "web_verify",
-                    degraded,
-                    lambda: validate_web_results(
-                        self.agents.web_verify(task_id, context, pages),
-                        pages,
-                        context,
-                        settings.llm_web_identity_threshold,
-                    ),
-                    lambda: strict_rule_verifications(pages, context, extracted.keywords),
-                )
-            else:
-                verifications = []
-            claims = claims_from_verifications(verifications, pages)
+            web_search_status = "REUSED_INTAKE" if claims else "SKIPPED"
+            web_fetch_status = web_search_status
             self.repository.update(
                 task_id,
-                verified_web_results=[item.model_dump(mode="json") for item in verifications],
+                web_search_plan=None,
+                web_results=[],
+                web_pages=[],
+                web_search_status=web_search_status,
+                web_fetch_status=web_fetch_status,
+                verified_web_results=[],
                 public_claims=[item.model_dump(mode="json") for item in claims],
             )
 
@@ -274,7 +226,9 @@ class ResearchPipeline:
                     context,
                 ),
                 lambda: validate_report_content(
-                    fallback_report_content(input_text, context, analysis, project_results),
+                    fallback_report_content(
+                        input_text, context, analysis, claims, project_results
+                    ),
                     claims,
                     project_results,
                     context,
@@ -309,27 +263,6 @@ class ResearchPipeline:
                 audio_path.unlink(missing_ok=True)
                 audio_path.with_suffix(".wav").unlink(missing_ok=True)
 
-    def _discover_identity_candidates(
-        self,
-        task_id: str,
-        mention: str,
-        organization: str,
-        degraded: list[str],
-    ):
-        try:
-            query = f'"{organization}" "{mention}" 董事长 总经理 高管'
-            results = asyncio.run(self.web.search([query]))
-            pages = asyncio.run(self.web.extract(results)) if results else []
-            if not pages:
-                return []
-            return self.entity_resolver.candidates_from_web(
-                mention, organization, pages
-            )
-        except Exception:
-            if "identity_candidates" not in degraded:
-                degraded.append("identity_candidates")
-            return []
-
     def _with_fallback(self, node_name: str, degraded: list[str], call, fallback):
         try:
             return call()
@@ -337,46 +270,6 @@ class ResearchPipeline:
             if node_name not in degraded:
                 degraded.append(node_name)
             return fallback()
-
-    def _run_web(
-        self, task_id: str, queries: list[str]
-    ) -> tuple[list[SearchResult], list[WebPage], str, str]:
-        search_results: list[SearchResult] = []
-        pages: list[WebPage] = []
-        web_search_status = "SKIPPED"
-        web_fetch_status = "SKIPPED"
-        if queries:
-            self.repository.update(task_id, status="WEB_SEARCHING")
-            try:
-                search_results = asyncio.run(self.web.search(queries))
-                for index, item in enumerate(search_results, 1):
-                    if not item.web_result_id:
-                        item.web_result_id = f"W{index:03d}"
-                web_search_status = "SUCCESS"
-            except Exception:
-                web_search_status = "FAILED"
-            self.repository.update(
-                task_id,
-                web_results=[item.model_dump(mode="json") for item in search_results],
-                web_search_status=web_search_status,
-            )
-            if search_results:
-                self.repository.update(task_id, status="WEB_FETCHING")
-                try:
-                    pages = asyncio.run(self.web.extract(search_results))
-                    by_url = {item.url: item for item in search_results}
-                    for page in pages:
-                        if not page.web_result_id and page.url in by_url:
-                            page.web_result_id = by_url[page.url].web_result_id
-                    web_fetch_status = "SUCCESS" if pages else "FAILED"
-                except Exception:
-                    web_fetch_status = "FAILED"
-            self.repository.update(
-                task_id,
-                web_pages=[item.model_dump(mode="json") for item in pages],
-                web_fetch_status=web_fetch_status,
-            )
-        return search_results, pages, web_search_status, web_fetch_status
 
     def _run_legacy(self, task_id: str) -> None:
         task = self.repository.get(task_id)
@@ -394,11 +287,20 @@ class ResearchPipeline:
             self.repository.update(task_id, status="EXTRACTING")
             extracted = self.extractor.extract(input_text)
             self.repository.update(task_id, extracted_info=extracted.model_dump(mode="json"))
-            queries = build_search_queries(extracted)
-            _, pages, web_search_status, web_fetch_status = self._run_web(task_id, queries)
-            claims = self.extractor.extract_public_claims(pages, extracted) if pages else []
+            claims = identity_claims_from_intake_snapshot(
+                getattr(task, "input_snapshot", None)
+            )
+            web_search_status = "REUSED_INTAKE" if claims else "SKIPPED"
+            web_fetch_status = web_search_status
             self.repository.update(
-                task_id, public_claims=[item.model_dump(mode="json") for item in claims]
+                task_id,
+                web_search_plan=None,
+                web_results=[],
+                web_pages=[],
+                web_search_status=web_search_status,
+                web_fetch_status=web_fetch_status,
+                verified_web_results=[],
+                public_claims=[item.model_dump(mode="json") for item in claims],
             )
             self.repository.update(task_id, status="PROJECT_SEARCHING")
             person_names = unique_non_empty(person.name for person in extracted.people)
@@ -433,22 +335,6 @@ class ResearchPipeline:
             if audio_path:
                 audio_path.unlink(missing_ok=True)
                 audio_path.with_suffix(".wav").unlink(missing_ok=True)
-
-
-def sanitize_web_plan(plan: WebSearchPlan, context: ConfirmedContext) -> WebSearchPlan:
-    people = {item.canonical_name for item in context.entities if item.entity_type == "PERSON"}
-    organizations = {
-        item.organization or item.canonical_name
-        for item in context.entities
-        if item.organization or item.entity_type == "ORGANIZATION"
-    }
-    valid = [
-        item
-        for item in plan.queries
-        if (not item.target_person or item.target_person in people)
-        and (not item.target_organization or item.target_organization in organizations)
-    ]
-    return WebSearchPlan(queries=valid) if valid else fallback_web_plan(context)
 
 
 def sanitize_project_plan(
@@ -495,7 +381,7 @@ def context_from_intake_snapshot(
                 title=item.get("title"),
                 region=item.get("region"),
                 confirmed_by="AUTO"
-                if item.get("confirmed_by") == "INTERNAL"
+                if item.get("confirmed_by") in {"INTERNAL", "EXTERNAL_AUTO", "AUTO"}
                 else "USER",
             )
         )
@@ -512,27 +398,37 @@ def context_from_intake_snapshot(
     )
 
 
-def build_search_queries(extracted: ExtractedInfo) -> list[str]:
-    queries: list[str] = []
-    organizations: list[str] = []
-    for person in extracted.people:
-        if person.organization:
-            organizations.append(person.organization)
-        if person.name and person.organization:
-            parts = [person.name, person.organization]
-            if person.title:
-                parts.append(person.title)
-            parts.append("负责业务")
-            queries.append(" ".join(parts))
-        elif person.name:
-            queries.append(f"{person.name} 负责业务")
-        elif person.organization:
-            queries.append(f"{person.organization} 主营业务 项目")
-    for organization in unique_non_empty(organizations):
-        queries.append(f"{organization} 主营业务 项目")
-    if not queries and extracted.keywords:
-        queries.append(" ".join(extracted.keywords[:3]))
-    return list(dict.fromkeys(queries))
+def identity_claims_from_intake_snapshot(snapshot: dict | None) -> list[PublicClaim]:
+    structured = (snapshot or {}).get("structured_context", {})
+    resolutions = structured.get("entity_resolutions", [])
+    claims: list[PublicClaim] = []
+    for item in resolutions:
+        source_url = (item.get("source_url") or "").strip()
+        evidence_quote = (item.get("evidence_quote") or "").strip()
+        canonical_name = (item.get("canonical_name") or "").strip()
+        if not source_url or not evidence_quote or not canonical_name:
+            continue
+        organization = (item.get("organization") or "").strip()
+        title = (item.get("title") or "").strip()
+        details = "、".join(value for value in (organization, title) if value)
+        claim = f"{canonical_name}（{details}）" if details else canonical_name
+        index = len(claims) + 1
+        claims.append(
+            PublicClaim(
+                web_result_id=f"INTAKE{index:03d}",
+                evidence_id="IDENTITY",
+                subject=canonical_name,
+                claim=claim,
+                evidence_quote=evidence_quote,
+                source_title="关键人身份核验来源",
+                source_url=source_url,
+                matched_keywords=[],
+                confidence=float(item.get("confidence") or 1),
+            )
+        )
+    return claims
+
+
 
 
 @celery_app.task(name="run_research_pipeline")

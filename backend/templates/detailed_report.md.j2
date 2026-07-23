@@ -22,15 +22,9 @@
 
 {{ items(content.task_overview) }}
 
-## 人物和公司背景
+## 关键人身份核验
 
 {{ items(content.person_and_company_summary) }}
-
-## 公开信息摘要
-
-{% if web_search_failed %}公开网络信息检索失败。
-{% elif web_fetch_failed %}公开网页正文抓取失败。
-{% else %}{{ items(content.public_information_summary) }}{% endif %}
 
 ## 重点内部项目
 

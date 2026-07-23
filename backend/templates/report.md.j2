@@ -17,19 +17,19 @@
 未识别到可检索的关键人物或单位。
 {% endif %}
 
-## 公开业务信息
+## 关键人身份核验
 
 {% if web_search_failed %}
-公开网络信息检索失败。
+关键人身份核验失败。
 {% elif web_fetch_failed %}
-公开网页正文抓取失败。
+关键人身份来源读取失败。
 {% elif claims %}
 {% for claim in claims %}
 - **{{ claim.subject }}**：{{ claim.claim }}  
   来源：[{{ claim.source_title }}]({{ claim.source_url }})
 {% endfor %}
 {% else %}
-未从已抓取网页中提取到相关公开业务信息。
+本次没有可复用的联网身份来源。
 {% endif %}
 
 ## 公司内部在建项目
@@ -61,7 +61,7 @@
 ## 资源关联总结
 
 - 业务关键词：{{ info.keywords | join("、") if info.keywords else "未识别" }}
-- 公开信息：{{ claims | length }} 条
+- 身份核验来源：{{ claims | length }} 条
 - 在建项目：{{ active_projects | length }} 个
 - 已结项项目：{{ completed_projects | length }} 个
 
@@ -71,5 +71,5 @@
 {% endif %}{% if web_search_failed %}- 公开网络信息检索失败。
 {% endif %}{% if web_fetch_failed %}- 公开网页正文抓取失败。
 {% endif %}{% if internal_search_failed %}- 公司内部项目信息检索失败。
-{% endif %}{% if not web_search_failed and not web_fetch_failed and not claims %}- 未提取到公开业务信息。
+{% endif %}{% if not web_search_failed and not web_fetch_failed and not claims %}- 本次没有联网身份来源，仅使用用户或内部确认的信息。
 {% endif %}
