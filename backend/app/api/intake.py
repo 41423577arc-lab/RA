@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+import re
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -36,7 +38,7 @@ from app.services.intake_defaults import with_default_requester_context
 from app.services.llm_client import LLMCallFailed, LLMUnavailable, StructuredLLM
 from app.services.mcp_client import ProjectMcpClient
 from app.services.tavily_client import TavilyClient
-from app.tasks.pipeline import run_research_pipeline
+from app.tasks.pipeline import context_from_intake_snapshot, run_research_pipeline
 from app.tasks.intake_audio import run_intake_audio_transcription
 
 
@@ -136,7 +138,11 @@ def _standardized_analysis_input(text: str, resolutions: list[dict]) -> str:
         mention = (item.get("mention") or "").strip()
         canonical = (item.get("canonical_name") or "").strip()
         if mention and canonical and mention != canonical:
-            standardized = standardized.replace(mention, canonical)
+            suffix = canonical[len(mention) :] if canonical.startswith(mention) else ""
+            pattern = re.escape(mention)
+            if suffix:
+                pattern += f"(?!{re.escape(suffix)})"
+            standardized = re.sub(pattern, canonical, standardized)
         if not canonical:
             continue
         if item.get("entity_type") == "PERSON":
@@ -923,12 +929,17 @@ def start_analysis(
         "analysis_input": intake_session.analysis_input,
         "audio_transcripts": [job.corrected_transcript for job in audio_jobs],
     }
+    confirmed_context = context_from_intake_snapshot(snapshot)
+    if confirmed_context is None:
+        raise HTTPException(status_code=422, detail="已确认身份无法转换为分析上下文")
     task = ResearchTask(
         id=task_id,
         input_type="audio" if audio_jobs else "text",
         input_text=intake_session.analysis_input.strip(),
         intake_session_id=intake_session.id,
         input_snapshot=snapshot,
+        confirmed_context=confirmed_context.model_dump(mode="json"),
+        confirmed_at=datetime.now(timezone.utc),
     )
     intake_session.status = "ANALYZING"
     intake_session.research_task_id = task_id

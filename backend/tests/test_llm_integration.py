@@ -170,6 +170,56 @@ def test_web_verification_rejects_same_name_page_without_target_company() -> Non
     assert results[0].evidence == []
 
 
+def test_web_verification_rejects_evidence_from_an_unrelated_page_section() -> None:
+    context = ConfirmedContext(
+        intents=["PERSON_BACKGROUND_RESEARCH"],
+        entities=[
+            ConfirmedEntity(
+                entity_type="PERSON",
+                canonical_name="张伟",
+                organization="宏远制造有限公司",
+                confirmed_by="USER",
+            )
+        ],
+        event_type="宴请",
+    )
+    page = WebPage(
+        web_result_id="W001",
+        title="人员与企业名录",
+        url="https://example.com/directory",
+        raw_content=(
+            "张伟担任另一家公司的技术负责人。\n"
+            "宏远制造有限公司持续推进园区节能改造。"
+        ),
+        rank=0,
+    )
+    batch = WebVerificationBatch(
+        results=[
+            WebVerification(
+                web_result_id="W001",
+                keep=True,
+                matched_person="张伟",
+                matched_organization="宏远制造有限公司",
+                identity_reason="页面同时出现姓名和企业",
+                confidence=0.99,
+                same_name_risk=False,
+                evidence=[
+                    WebEvidence(
+                        evidence_id="E1",
+                        quote="张伟担任另一家公司的技术负责人",
+                        claim="张伟担任技术负责人",
+                    )
+                ],
+            )
+        ]
+    )
+
+    results = validate_web_results(batch, [page], context, 0.8)
+
+    assert results[0].keep is False
+    assert results[0].evidence == []
+
+
 def test_entity_resolver_requires_confirmation_for_huaxing_li_alias() -> None:
     extractor = RuleExtractor(ROOT / "seed")
     input_text = "华星能源集团的李总明天参加会议"
@@ -475,6 +525,8 @@ def test_v05_pipeline_completes_with_all_llm_nodes_degraded() -> None:
     assert task.status == "COMPLETED", getattr(task, "error_message", None)
     assert set(task.degraded_nodes) == {
         "understanding",
+        "web_plan",
+        "web_search",
         "project_query",
         "project_rerank",
         "association",

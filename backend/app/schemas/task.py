@@ -246,8 +246,14 @@ class ProjectResult(BaseModel):
     project_aliases: list[str] = Field(default_factory=list)
     customer_name: str
     contact_name: str | None = None
+    customer_contact_title: str | None = None
+    customer_contact_phone: str | None = None
     status: Literal["ACTIVE", "COMPLETED"]
     owner_name: str
+    owner_phone: str | None = None
+    owner_email: str | None = None
+    owner_manager_name: str | None = None
+    owner_region: str | None = None
     start_date: date
     end_date: date | None = None
     description: str

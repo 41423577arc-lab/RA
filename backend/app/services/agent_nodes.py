@@ -235,10 +235,33 @@ def validate_web_results(
         if page is None:
             continue
         body = normalize(page.raw_content)
-        identity_present = (not people or any(name in body for name in people)) and (
-            not organizations or any(name in body for name in organizations)
+        matched_person_valid = bool(
+            result.matched_person
+            and result.matched_person in people
+            and result.matched_person in body
+            and (not organizations or any(name in body for name in organizations))
         )
-        evidence = [item for item in result.evidence if normalize(item.quote) in body]
+        matched_organization_valid = bool(
+            not result.matched_person
+            and result.matched_organization
+            and result.matched_organization in organizations
+            and result.matched_organization in body
+        )
+        identity_present = matched_person_valid or matched_organization_valid
+        evidence = []
+        for item in result.evidence:
+            quote = normalize(item.quote)
+            if quote not in body:
+                continue
+            if result.matched_person:
+                if result.matched_person not in quote or (
+                    organizations
+                    and not any(name in quote for name in organizations)
+                ):
+                    continue
+            elif result.matched_organization not in quote:
+                continue
+            evidence.append(item)
         keep = result.keep and result.confidence >= threshold and identity_present and bool(evidence)
         output.append(result.model_copy(update={"keep": keep, "evidence": evidence if keep else []}))
     return output
@@ -257,7 +280,9 @@ def strict_rule_verifications(
         plain = normalize(page.raw_content)
         person = next((name for name in people if name in plain), None)
         organization = next((name for name in organizations if name in plain), None)
-        keep = bool(person and (organization or not organizations)) or bool(not people and organization)
+        keep = bool(person and (organization or not organizations)) or bool(
+            not person and organization
+        )
         evidence: list[WebEvidence] = []
         if keep:
             sentences = [item.strip() for item in re.split(r"[。！？!?；;\n]+", plain)]
@@ -283,7 +308,7 @@ def strict_rule_verifications(
                 keep=keep,
                 matched_person=person,
                 matched_organization=organization,
-                identity_reason="规则要求正文同时命中已确认人物和单位" if keep else "正文未同时命中已确认身份",
+                identity_reason="规则确认正文命中已确认人物与单位或目标企业" if keep else "正文未命中已确认身份",
                 confidence=0.85 if keep else 0.2,
                 same_name_risk=bool(people and not organization),
                 evidence=evidence,
@@ -387,8 +412,37 @@ def fallback_association(
     ]
     resources = [
         EvidenceBackedItem(
-            text=f"可联系内部负责人 {project.owner_name} 了解 {project.project_name}",
-            statement_type="RECOMMENDATION",
+            text="；".join(
+                filter(
+                    None,
+                    (
+                        f"{project.project_name} 的我方负责人为 {project.owner_name}",
+                        f"联系电话 {project.owner_phone}" if project.owner_phone else None,
+                        f"邮箱 {project.owner_email}" if project.owner_email else None,
+                        (
+                            f"客户联系人为 {project.contact_name}"
+                            + (
+                                f"（{project.customer_contact_title}）"
+                                if project.customer_contact_title
+                                else ""
+                            )
+                            + (
+                                f"，联系电话 {project.customer_contact_phone}"
+                                if project.customer_contact_phone
+                                else ""
+                            )
+                            if project.contact_name
+                            else None
+                        ),
+                        (
+                            f"上级为 {project.owner_manager_name}，负责 {project.owner_region}"
+                            if project.owner_manager_name and project.owner_region
+                            else None
+                        ),
+                    ),
+                )
+            ),
+            statement_type="FACT",
             evidence_refs=[f"PROJECT:{project.project_id}"],
             confidence=0.8,
         )
@@ -403,7 +457,15 @@ def fallback_association(
         key_findings=findings,
         related_projects=related,
         available_resources=resources,
-        recommended_topics=[],
+        recommended_topics=[
+            EvidenceBackedItem(
+                text=f"可围绕 {project.project_name} 的当前进展、客户需求和下一步安排展开沟通",
+                statement_type="RECOMMENDATION",
+                evidence_refs=[f"PROJECT:{project.project_id}"],
+                confidence=0.8,
+            )
+            for project in projects[:3]
+        ],
         risks=[],
         information_gaps=gaps,
         next_actions=resources,
@@ -440,16 +502,40 @@ def fallback_report_content(
     people = [entity.canonical_name for entity in context.entities if entity.entity_type == "PERSON"]
     return GeneratedReportContent(
         task_overview=build_task_overview(context),
-        person_and_company_summary=[
+        person_and_company_summary=(
+            [
+                EvidenceBackedItem(
+                    text=claim.claim,
+                    statement_type="FACT",
+                    evidence_refs=[f"WEB:{claim.web_result_id}:{claim.evidence_id}"],
+                    confidence=claim.confidence,
+                )
+                for claim in claims[:5]
+            ]
+            or [
+                EvidenceBackedItem(
+                    text=(
+                        f"已确认目标人物：{entity.canonical_name}"
+                        + (f"，所属企业：{entity.organization}" if entity.organization else "")
+                        + (f"，职位：{entity.title}" if entity.title else "")
+                    ),
+                    statement_type="FACT",
+                    evidence_refs=["CONFIRMATION:1"],
+                    confidence=1,
+                )
+                for entity in context.entities
+                if entity.entity_type == "PERSON"
+            ]
+        ),
+        public_information_summary=[
             EvidenceBackedItem(
                 text=claim.claim,
                 statement_type="FACT",
                 evidence_refs=[f"WEB:{claim.web_result_id}:{claim.evidence_id}"],
                 confidence=claim.confidence,
             )
-            for claim in claims[:5]
+            for claim in claims[:6]
         ],
-        public_information_summary=[],
         priority_projects=analysis.related_projects,
         resource_analysis=analysis.available_resources,
         recommended_topics=analysis.recommended_topics,
@@ -502,7 +588,9 @@ def validate_report_content(
         "person_and_company_summary": clean(
             content.person_and_company_summary, allowed
         ),
-        "public_information_summary": [],
+        "public_information_summary": clean(
+            content.public_information_summary, web_refs
+        ),
         "priority_projects": clean(content.priority_projects, project_refs),
         "resource_analysis": clean(content.resource_analysis, web_refs | project_refs),
         "recommended_topics": clean(content.recommended_topics, allowed),
@@ -523,6 +611,89 @@ def validate_report_content(
         }
     )
     return content.model_copy(update=updates)
+
+
+def complete_analysis(
+    primary: AssociationAnalysis, fallback: AssociationAnalysis
+) -> AssociationAnalysis:
+    fields = (
+        "key_findings",
+        "related_projects",
+        "available_resources",
+        "recommended_topics",
+        "risks",
+        "information_gaps",
+        "next_actions",
+    )
+    return primary.model_copy(
+        update={
+            field: merge_evidence_items(
+                getattr(primary, field), getattr(fallback, field)
+            )
+            for field in fields
+        }
+    )
+
+
+def complete_report_content(
+    primary: GeneratedReportContent, fallback: GeneratedReportContent
+) -> GeneratedReportContent:
+    fields = (
+        "task_overview",
+        "person_and_company_summary",
+        "public_information_summary",
+        "priority_projects",
+        "resource_analysis",
+        "recommended_topics",
+        "advancement_advice",
+        "preparation_items",
+        "gaps_and_risks",
+    )
+    primary_brief = primary.action_brief
+    fallback_brief = fallback.action_brief
+    updates = {
+        field: merge_evidence_items(
+            getattr(primary, field), getattr(fallback, field)
+        )
+        for field in fields
+    }
+    updates["action_brief"] = primary_brief.model_copy(
+        update={
+            "destination": primary_brief.destination or fallback_brief.destination,
+            "meeting_people": primary_brief.meeting_people
+            or fallback_brief.meeting_people,
+            "objective": primary_brief.objective.strip()
+            or fallback_brief.objective,
+            "discussion_topics": unique(
+                [*primary_brief.discussion_topics, *fallback_brief.discussion_topics]
+            ),
+            "internal_contacts": unique(
+                [*primary_brief.internal_contacts, *fallback_brief.internal_contacts]
+            ),
+            "preparation_items": unique(
+                [*primary_brief.preparation_items, *fallback_brief.preparation_items]
+            ),
+            "risks": unique([*primary_brief.risks, *fallback_brief.risks]),
+            "evidence_refs": unique(
+                [*primary_brief.evidence_refs, *fallback_brief.evidence_refs]
+            ),
+        }
+    )
+    return primary.model_copy(update=updates)
+
+
+def merge_evidence_items(
+    primary: list[EvidenceBackedItem], fallback: list[EvidenceBackedItem]
+) -> list[EvidenceBackedItem]:
+    output: list[EvidenceBackedItem] = []
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    for item in [*primary, *fallback]:
+        key = (normalize(item.text).casefold(), tuple(sorted(item.evidence_refs)))
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(item)
+    return output
 
 
 def build_task_overview(context: ConfirmedContext) -> list[EvidenceBackedItem]:

@@ -22,7 +22,7 @@ def make_repository_spy():
     return repository, calls
 
 
-def test_person_scope_does_not_expand_to_organization_or_keywords() -> None:
+def test_person_and_organization_scopes_are_merged() -> None:
     repository, calls = make_repository_spy()
 
     results = repository.search(
@@ -31,8 +31,9 @@ def test_person_scope_does_not_expand_to_organization_or_keywords() -> None:
 
     assert results == []
     assert calls == [
-        ("exact", ["王传福"], []),
-        ("text", ["王传福"]),
+        ("exact", ["王传福"], ["比亚迪股份有限公司"]),
+        ("text", ["比亚迪股份有限公司", "新能源", "储能"]),
+        ("vector", ["新能源", "储能"]),
     ]
 
 

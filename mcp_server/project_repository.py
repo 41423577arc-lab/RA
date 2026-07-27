@@ -56,21 +56,27 @@ class ProjectRepository:
     ) -> list[ProjectResult]:
         matches: dict[str, tuple[str, float | None, InternalProject]] = {}
         with self.session_factory() as session:
-            if person_names:
-                self._add_exact_matches(session, matches, person_names, [])
-                self._add_text_matches(session, matches, unique_non_empty(person_names))
-            else:
-                self._add_exact_matches(session, matches, [], organization_names)
-                terms = unique_non_empty([*organization_names, *keywords])
-                self._add_text_matches(session, matches, terms)
-                if keywords:
-                    self._add_vector_matches(session, matches, keywords)
+            if person_names or organization_names:
+                self._add_exact_matches(
+                    session, matches, person_names, organization_names
+                )
+            text_people = [] if organization_names else person_names
+            terms = unique_non_empty(
+                [*text_people, *organization_names, *keywords]
+            )
+            self._add_text_matches(session, matches, terms)
+            if keywords:
+                self._add_vector_matches(session, matches, keywords)
 
         ordered = sorted(
             matches.values(),
             key=lambda item: (PRIORITY[item[0]], -(item[1] or 0.0), item[2].project_id),
         )[:10]
-        return [self._to_result(project, match_type, similarity) for match_type, similarity, project in ordered]
+        results = []
+        for match_type, similarity, project in ordered:
+            details = self.get_project_details(project.project_id) or {}
+            results.append(self._to_result(project, match_type, similarity, details))
+        return results
 
     def get_project_details(self, project_id: str) -> dict | None:
         statement = text(
@@ -83,6 +89,7 @@ class ProjectRepository:
                 cc.contact_name AS customer_contact_name, cc.job_title AS customer_contact_title,
                 cc.phone AS customer_contact_phone,
                 sr.sales_rep_id, sr.sales_rep_name, sr.phone AS sales_rep_phone,
+                sr.email AS sales_rep_email,
                 sm.manager_id, sm.manager_name, sm.region_name
             FROM internal_projects p
             JOIN customer_contacts cc ON cc.contact_id = p.customer_contact_id
@@ -204,9 +211,14 @@ class ProjectRepository:
         organizations: list[str],
     ) -> None:
         if people:
-            for project in session.scalars(
-                select(InternalProject).where(InternalProject.contact_name.in_(people))
-            ):
+            statement = select(InternalProject).where(
+                InternalProject.contact_name.in_(people)
+            )
+            if organizations:
+                statement = statement.where(
+                    InternalProject.customer_name.in_(organizations)
+                )
+            for project in session.scalars(statement):
                 matches[project.project_id] = ("PERSON_EXACT", None, project)
         if organizations:
             for project in session.scalars(
@@ -262,16 +274,26 @@ class ProjectRepository:
 
     @staticmethod
     def _to_result(
-        project: InternalProject, match_type: str, similarity: float | None
+        project: InternalProject,
+        match_type: str,
+        similarity: float | None,
+        details: dict | None = None,
     ) -> ProjectResult:
+        details = details or {}
         return ProjectResult(
             project_id=project.project_id,
             project_name=project.project_name,
             project_aliases=project.project_aliases,
             customer_name=project.customer_name,
             contact_name=project.contact_name,
+            customer_contact_title=details.get("customer_contact_title"),
+            customer_contact_phone=details.get("customer_contact_phone"),
             status=project.status,
             owner_name=project.owner_name,
+            owner_phone=details.get("sales_rep_phone"),
+            owner_email=details.get("sales_rep_email"),
+            owner_manager_name=details.get("manager_name"),
+            owner_region=details.get("region_name"),
             start_date=project.start_date,
             end_date=project.end_date,
             description=project.description,
