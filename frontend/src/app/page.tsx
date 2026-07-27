@@ -5,6 +5,7 @@ import {
   Bot,
   Check,
   Database,
+  FileText,
   Globe2,
   LoaderCircle,
   Mic,
@@ -12,13 +13,15 @@ import {
   RefreshCw,
   RotateCcw,
   Search,
-  Send
+  Send,
+  TerminalSquare
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 
 type InputType = "text" | "audio";
 type ReportTab = "detailed" | "action";
+type TaskView = "activity" | "report";
 type ChatMessage = { role: "user" | "assistant"; content: string };
 type IntakeActivity = {
   session_id?: string;
@@ -71,6 +74,32 @@ type Task = {
   web_search_status?: string;
   web_fetch_status?: string;
   internal_search_status?: string;
+  web_search_plan?: {
+    queries: Array<{ query: string; purpose: string }>;
+  };
+  verified_web_results?: Array<{ keep: boolean }>;
+  public_claims?: Array<{ subject: string; claim: string; source_title: string }>;
+  project_query_plan?: {
+    person_names: string[];
+    organization_names: string[];
+    project_names: string[];
+    business_terms: string[];
+  };
+  internal_results?: Array<{
+    project_id: string;
+    project_name: string;
+    customer_name: string;
+    contact_name?: string;
+    customer_contact_title?: string;
+    owner_name: string;
+  }>;
+  ranked_internal_results?: Array<{ project_id: string; relevance_score: number }>;
+  association_analysis?: {
+    key_findings: unknown[];
+    related_projects: unknown[];
+    available_resources: unknown[];
+    recommended_topics: unknown[];
+  };
   confirmation_request?: {
     version: number;
     items: Array<{
@@ -166,9 +195,116 @@ const ANALYSIS_STATUS_ORDER = [
   "RERANKING_PROJECTS",
   "ANALYZING_ASSOCIATIONS",
   "GENERATING_REPORT_CONTENT",
+  "GENERATING",
   "RENDERING_REPORT",
   "COMPLETED"
 ];
+
+const PROGRESS_STAGES = [
+  { label: "信息已确认", endStatus: "CONTEXT_EXTRACTING" },
+  { label: "公开信息检索", endStatus: "VERIFYING_WEB_RESULTS" },
+  { label: "内部项目检索", endStatus: "RERANKING_PROJECTS" },
+  { label: "综合分析与报告", endStatus: "COMPLETED" }
+];
+
+type ActivityEntry = {
+  status: string;
+  label: string;
+  detail: string;
+  lines?: string[];
+};
+
+function activityEntry(task: Task, status: string): ActivityEntry {
+  const queryLines = task.web_search_plan?.queries
+    .slice(0, 4)
+    .map((item) => `${item.query} · ${item.purpose}`);
+  const projectLines = task.internal_results?.slice(0, 5).map((item) => {
+    const contact = item.contact_name
+      ? `客户联系人 ${item.contact_name}${item.customer_contact_title ? `（${item.customer_contact_title}）` : ""}`
+      : "暂无客户联系人";
+    return `${item.project_id} ${item.project_name} · ${item.customer_name} · ${contact} · 我方负责人 ${item.owner_name}`;
+  });
+  const targets = task.project_query_plan
+    ? [
+        ...task.project_query_plan.person_names,
+        ...task.project_query_plan.organization_names,
+        ...task.project_query_plan.project_names,
+        ...task.project_query_plan.business_terms
+      ].filter(Boolean)
+    : [];
+
+  const entries: Record<string, ActivityEntry> = {
+    PENDING: { status, label: STATUS_LABELS[status], detail: "任务已提交，等待分析服务接管。" },
+    TRANSCRIBING: { status, label: STATUS_LABELS[status], detail: "正在把录音转换为可分析文本。" },
+    CONTEXT_EXTRACTING: { status, label: STATUS_LABELS[status], detail: "正在整理对话中已确认的人物、企业和分析目标。" },
+    PLANNING_WEB_SEARCH: {
+      status,
+      label: STATUS_LABELS[status],
+      detail: task.web_search_plan ? `已生成 ${task.web_search_plan.queries.length} 条公开检索任务。` : "正在生成公开信息检索计划。",
+      lines: queryLines
+    },
+    WEB_SEARCHING: {
+      status,
+      label: STATUS_LABELS[status],
+      detail: task.web_search_status === "FAILED" ? "公开搜索未成功，将在报告中标记信息缺口。" : "正在按人物与企业组合搜索公开资料。"
+    },
+    WEB_FETCHING: {
+      status,
+      label: STATUS_LABELS[status],
+      detail: task.web_fetch_status === "FAILED" ? "网页正文抓取未成功。" : "正在读取候选网页正文，准备核验证据。"
+    },
+    VERIFYING_WEB_RESULTS: {
+      status,
+      label: STATUS_LABELS[status],
+      detail: `已保留 ${task.verified_web_results?.filter((item) => item.keep).length ?? 0} 个身份匹配页面，形成 ${task.public_claims?.length ?? 0} 条公开证据。`,
+      lines: task.public_claims?.slice(0, 4).map((item) => `${item.subject}：${item.claim}（${item.source_title}）`)
+    },
+    PLANNING_PROJECT_SEARCH: {
+      status,
+      label: STATUS_LABELS[status],
+      detail: targets.length ? `内部检索对象：${targets.join("、")}` : "正在根据已确认身份生成内部项目查询。"
+    },
+    PROJECT_SEARCHING: {
+      status,
+      label: STATUS_LABELS[status],
+      detail: task.internal_search_status === "FAILED" ? "内部项目检索未成功。" : `已匹配 ${task.internal_results?.length ?? 0} 个内部项目。`,
+      lines: projectLines
+    },
+    RERANKING_PROJECTS: {
+      status,
+      label: STATUS_LABELS[status],
+      detail: `已完成 ${task.ranked_internal_results?.length ?? 0} 个项目的相关性评估。`
+    },
+    ANALYZING_ASSOCIATIONS: {
+      status,
+      label: STATUS_LABELS[status],
+      detail: task.association_analysis
+        ? `已整理 ${task.association_analysis.key_findings.length} 条发现、${task.association_analysis.available_resources.length} 条资源和 ${task.association_analysis.recommended_topics.length} 个建议话题。`
+        : "正在合并公开证据、内部项目和人员关系。"
+    },
+    GENERATING_REPORT_CONTENT: { status, label: STATUS_LABELS[status], detail: "正在把可验证信息整理为报告章节。" },
+    GENERATING: { status, label: STATUS_LABELS[status], detail: "正在生成分析总结。" },
+    RENDERING_REPORT: { status, label: STATUS_LABELS[status], detail: "正在排版详细报告与行动说明。" },
+    COMPLETED: { status, label: STATUS_LABELS[status], detail: "报告已生成，可以查看详细报告和行动说明。" }
+  };
+  return entries[status] ?? { status, label: STATUS_LABELS[status] ?? status, detail: "正在处理当前步骤。" };
+}
+
+function buildActivityEntries(task: Task): ActivityEntry[] {
+  const currentIndex = ANALYSIS_STATUS_ORDER.indexOf(task.status);
+  const reachedIndex = task.status === "COMPLETED" ? ANALYSIS_STATUS_ORDER.length - 1 : currentIndex;
+  const statuses = ANALYSIS_STATUS_ORDER.filter((status, index) => {
+    if (index > reachedIndex) return false;
+    if (task.input_type === "text" && status === "TRANSCRIBING") return false;
+    if (task.confirmed_context && status === "CONTEXT_EXTRACTING") return false;
+    if (status === "GENERATING") return task.status === "GENERATING";
+    return true;
+  });
+  if (task.status === "FAILED") statuses.push("FAILED");
+  return statuses.map((status) => status === "FAILED"
+    ? { status, label: STATUS_LABELS[status], detail: task.error_message ?? "任务处理失败。" }
+    : activityEntry(task, status));
+}
 
 function safeReportUrl(url: string) {
   return /^https?:\/\//i.test(url) ? url : "";
@@ -191,6 +327,7 @@ export default function Home() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [reportTab, setReportTab] = useState<ReportTab>("detailed");
+  const [taskView, setTaskView] = useState<TaskView>("activity");
   const [selections, setSelections] = useState<Record<string, string>>({});
   const [manualValues, setManualValues] = useState<Record<string, string>>({});
   const chatThreadRef = useRef<HTMLDivElement | null>(null);
@@ -258,6 +395,12 @@ export default function Home() {
     }, 2000);
     return () => clearInterval(interval);
   }, [fetchTask, task]);
+
+  useEffect(() => {
+    if (task?.status === "COMPLETED" && (task.detailed_report_markdown || task.report_markdown)) {
+      setTaskView("report");
+    }
+  }, [task?.status, task?.detailed_report_markdown, task?.report_markdown]);
 
   useEffect(() => {
     chatThreadRef.current?.scrollTo({ top: chatThreadRef.current.scrollHeight });
@@ -367,6 +510,7 @@ export default function Home() {
         const payload = await response.json().catch(() => ({}));
         throw new Error(payload.detail ?? "任务创建失败");
       }
+      setTaskView("activity");
       setTask(await response.json());
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "任务创建失败");
@@ -398,6 +542,7 @@ export default function Home() {
     setSelections({});
     setManualValues({});
     setReportTab("detailed");
+    setTaskView("activity");
     setIntakeActivity(IDLE_ACTIVITY);
   };
 
@@ -515,12 +660,9 @@ export default function Home() {
     setAudioJob(payload as IntakeAudioJob);
   };
 
-  const visibleStatuses = ANALYSIS_STATUS_ORDER.filter((status) => {
-    if (task?.input_type === "text" && status === "TRANSCRIBING") return false;
-    if (task?.confirmed_context && status === "CONTEXT_EXTRACTING") return false;
-    return true;
-  });
-  const visibleCurrentIndex = task ? visibleStatuses.indexOf(task.status) : -1;
+  const taskActivityEntries = task ? buildActivityEntries(task) : [];
+  const reportReady = Boolean(task?.status === "COMPLETED" && (task.detailed_report_markdown || task.report_markdown));
+  const currentStatusIndex = task ? ANALYSIS_STATUS_ORDER.indexOf(task.status) : -1;
 
   return (
     <main className="app-shell">
@@ -538,7 +680,7 @@ export default function Home() {
 
       <div className="workspace">
         <aside className="progress-panel" aria-label="处理进度">
-          <div className="section-label">处理进度</div>
+          <div className="section-label">任务阶段</div>
           <ol className="steps">
             {!task && (
               <li className="active">
@@ -546,13 +688,15 @@ export default function Home() {
                 <span>对话收集信息</span>
               </li>
             )}
-            {task && visibleStatuses.slice(0, -1).map((status, index) => {
-              const done = task?.status === "COMPLETED" || visibleCurrentIndex > index;
-              const active = task?.status === status;
+            {task && PROGRESS_STAGES.map((stage, index) => {
+              const endIndex = ANALYSIS_STATUS_ORDER.indexOf(stage.endStatus);
+              const previousEndIndex = index === 0 ? -1 : ANALYSIS_STATUS_ORDER.indexOf(PROGRESS_STAGES[index - 1].endStatus);
+              const done = task.status === "COMPLETED" || currentStatusIndex > endIndex;
+              const active = !done && currentStatusIndex > previousEndIndex && currentStatusIndex <= endIndex;
               return (
-                <li key={status} className={done ? "done" : active ? "active" : ""}>
+                <li key={stage.label} className={done ? "done" : active ? "active" : ""}>
                   <span className="step-dot">{done ? <Check size={13} /> : index + 1}</span>
-                  <span>{STATUS_LABELS[status]}</span>
+                  <span>{stage.label}</span>
                 </li>
               );
             })}
@@ -770,6 +914,69 @@ export default function Home() {
                 </div>
               )}
 
+              <nav className="task-view-tabs" aria-label="任务结果视图">
+                <button
+                  className={taskView === "activity" ? "selected" : ""}
+                  onClick={() => setTaskView("activity")}
+                >
+                  <TerminalSquare size={16} />
+                  执行日志
+                  <span className="tab-count">{taskActivityEntries.length}</span>
+                </button>
+                <button
+                  className={taskView === "report" ? "selected" : ""}
+                  disabled={!reportReady}
+                  onClick={() => setTaskView("report")}
+                >
+                  <FileText size={16} />
+                  分析报告
+                  {!reportReady && <span className="tab-note">完成后显示</span>}
+                </button>
+              </nav>
+
+              {taskView === "activity" && (
+                <section className="execution-log" aria-live="polite">
+                  <header className="log-header">
+                    <div>
+                      <span className="section-label">实时运行结果</span>
+                      <h2>执行日志</h2>
+                    </div>
+                    <span className={`live-indicator ${TERMINAL.has(task.status) ? "stopped" : ""}`}>
+                      <span aria-hidden="true" />
+                      {task.status === "COMPLETED" ? "已完成" : task.status === "FAILED" ? "已停止" : "实时更新"}
+                    </span>
+                  </header>
+                  <ol className="log-list">
+                    {taskActivityEntries.map((entry, index) => {
+                      const isCurrent = entry.status === task.status;
+                      const isFailed = entry.status === "FAILED";
+                      return (
+                        <li key={`${entry.status}-${index}`} className={isCurrent ? "current" : isFailed ? "failed" : "complete"}>
+                          <span className="log-marker" aria-hidden="true">
+                            {isFailed ? <AlertCircle size={15} /> : isCurrent && !TERMINAL.has(task.status) ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}
+                          </span>
+                          <div className="log-entry">
+                            <div className="log-entry-heading">
+                              <strong>{entry.label}</strong>
+                              <span>{String(index + 1).padStart(2, "0")}</span>
+                            </div>
+                            <p>{entry.detail}</p>
+                            {entry.lines && entry.lines.length > 0 && (
+                              <ul>
+                                {entry.lines.map((line, lineIndex) => <li key={`${entry.status}-${lineIndex}`}>{line}</li>)}
+                              </ul>
+                            )}
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ol>
+                  {!TERMINAL.has(task.status) && (
+                    <div className="log-waiting"><LoaderCircle className="spin" size={14} />等待下一条运行结果</div>
+                  )}
+                </section>
+              )}
+
               {task.status === "FAILED" && (
                 <div className="error-banner"><AlertCircle size={17} />{task.error_message ?? "任务处理失败"}</div>
               )}
@@ -830,7 +1037,7 @@ export default function Home() {
                 </section>
               )}
 
-              {(task.detailed_report_markdown || task.report_markdown) && (
+              {taskView === "report" && reportReady && (
                 <>
                   <div className="report-tabs" role="tablist">
                     <button className={reportTab === "detailed" ? "selected" : ""} onClick={() => setReportTab("detailed")}>详细报告</button>
