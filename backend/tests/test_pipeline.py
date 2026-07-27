@@ -7,6 +7,7 @@ from app.services.extractor import RuleExtractor
 from app.services.report_renderer import ReportRenderer
 from app.tasks.pipeline import (
     ResearchPipeline,
+    context_from_intake_snapshot,
     identity_claims_from_intake_snapshot,
 )
 
@@ -111,6 +112,65 @@ class FailedProjects:
         raise RuntimeError("mcp unavailable")
 
 
+class MacroWeb:
+    async def search(self, queries):
+        assert all("林致远" not in query for query in queries)
+        return [
+            SearchResult(
+                title="宏远制造公开资料",
+                url="https://example.com/hongyuan",
+                content="宏远制造有限公司持续推进制造园区能源管理。",
+                query=queries[0],
+                rank=0,
+            )
+        ]
+
+    async def extract(self, _):
+        return [
+            WebPage(
+                title="宏远制造公开资料",
+                url="https://example.com/hongyuan",
+                raw_content="宏远制造有限公司持续推进制造园区能源管理和节能改造。",
+                rank=0,
+            )
+        ]
+
+
+class MacroProjects:
+    def __init__(self):
+        self.arguments = None
+
+    async def search_projects(self, person_names, organization_names, keywords):
+        self.arguments = (person_names, organization_names, keywords)
+        return [
+            ProjectResult(
+                project_id="P007",
+                project_name="制造园区能源管理",
+                customer_name="宏远制造有限公司",
+                contact_name="郑伟",
+                customer_contact_title="能源管理部经理",
+                customer_contact_phone="17010000006",
+                status="ACTIVE",
+                owner_name="张伟",
+                owner_phone="17000001001",
+                owner_manager_name="周岚",
+                owner_region="华东大区",
+                start_date=date(2025, 8, 1),
+                description="建设制造园区综合能源管理系统",
+                project_stage="DELIVERY",
+                match_type="ORG_EXACT",
+            )
+        ]
+
+
+class FallbackAgents:
+    def __getattr__(self, _):
+        def fail(*args, **kwargs):
+            raise RuntimeError("use deterministic fallback")
+
+        return fail
+
+
 def make_pipeline(repository, web):
     return ResearchPipeline(
         repository=repository,
@@ -147,6 +207,53 @@ def test_pipeline_reuses_only_intake_identity_evidence() -> None:
     assert claims[0].claim == "王传福（比亚迪股份有限公司、董事长兼总裁）"
     assert claims[0].matched_keywords == []
     assert "业务" not in claims[0].claim
+
+
+def test_context_from_snapshot_excludes_requester_even_if_resolution_is_polluted() -> None:
+    context = context_from_intake_snapshot(
+        {
+            "analysis_input": "林致远与宏远制造有限公司的张伟吃饭。",
+            "structured_context": {
+                "requester_context": {
+                    "name": "林致远",
+                    "organization": "澄岳产业发展有限公司",
+                },
+                "entity_resolutions": [
+                    {
+                        "entity_type": "PERSON",
+                        "mention": "林致远",
+                        "canonical_name": "林致远",
+                        "confirmed_by": "AUTO",
+                    },
+                    {
+                        "entity_type": "ORGANIZATION",
+                        "mention": "澄岳产业",
+                        "canonical_name": "澄岳产业发展有限公司",
+                        "confirmed_by": "AUTO",
+                    },
+                    {
+                        "entity_type": "PERSON",
+                        "mention": "张总",
+                        "canonical_name": "张伟",
+                        "organization": "宏远制造有限公司",
+                        "confirmed_by": "USER",
+                    },
+                    {
+                        "entity_type": "ORGANIZATION",
+                        "mention": "宏远制造",
+                        "canonical_name": "宏远制造有限公司",
+                        "confirmed_by": "INTERNAL",
+                    },
+                ],
+            },
+        }
+    )
+
+    assert context is not None
+    assert {item.canonical_name for item in context.entities} == {
+        "张伟",
+        "宏远制造有限公司",
+    }
 
 
 def test_full_text_pipeline_generates_report_and_all_states() -> None:
@@ -240,3 +347,102 @@ def test_mcp_failure_is_partial_and_public_information_continues() -> None:
     assert task.internal_search_status == "FAILED"
     assert "公司内部项目信息检索失败" in task.report_markdown
     assert task.web_search_status == "SKIPPED"
+
+
+def test_confirmed_intake_merges_public_and_internal_evidence_without_requester() -> None:
+    snapshot = {
+        "analysis_input": "林致远要和宏远制造有限公司的张伟吃饭。",
+        "structured_context": {
+            "people": ["张伟"],
+            "organizations": ["宏远制造有限公司"],
+            "requester_context": {
+                "name": "林致远",
+                "organization": "澄岳产业发展有限公司",
+                "title": "副总经理",
+            },
+            "entity_resolutions": [
+                {
+                    "entity_type": "ORGANIZATION",
+                    "mention": "宏远制造",
+                    "canonical_name": "宏远制造有限公司",
+                    "confirmed_by": "INTERNAL",
+                },
+                {
+                    "entity_type": "PERSON",
+                    "mention": "张总",
+                    "canonical_name": "张伟",
+                    "organization": "宏远制造有限公司",
+                    "confirmed_by": "USER",
+                },
+            ],
+        },
+    }
+    confirmed_context = {
+        "intents": [
+            "MEETING_PREPARATION",
+            "PERSON_BACKGROUND_RESEARCH",
+            "INTERNAL_PROJECT_QUERY",
+            "RESOURCE_RELATION_QUERY",
+            "REPORT_GENERATION",
+        ],
+        "entities": [
+            {
+                "entity_type": "ORGANIZATION",
+                "canonical_name": "宏远制造有限公司",
+                "confirmed_by": "AUTO",
+            },
+            {
+                "entity_type": "PERSON",
+                "canonical_name": "张伟",
+                "organization": "宏远制造有限公司",
+                "confirmed_by": "USER",
+            },
+        ],
+        "event_type": "宴请",
+        "business_directions": [],
+        "focus_questions": [],
+    }
+    task = SimpleNamespace(
+        id="task-confirmed-intake",
+        input_type="text",
+        input_text=snapshot["analysis_input"],
+        input_snapshot=snapshot,
+        audio_path=None,
+        degraded_nodes=[],
+        confirmation_version=0,
+        confirmed_context=confirmed_context,
+        extracted_info=None,
+        llm_understanding=None,
+    )
+    repository = FakeRepository(task)
+    projects = MacroProjects()
+    pipeline = ResearchPipeline(
+        repository=repository,
+        transcriber=NoopTranscriber(),
+        extractor=RuleExtractor(ROOT / "seed"),
+        web=MacroWeb(),
+        projects=projects,
+        renderer=ReportRenderer(
+            ROOT / "backend/templates/report.md.j2",
+            ROOT / "backend/templates/detailed_report.md.j2",
+            ROOT / "backend/templates/action_brief.md.j2",
+        ),
+        agents=FallbackAgents(),
+        entity_resolver=object(),
+    )
+
+    pipeline.run(task.id)
+
+    assert task.status == "COMPLETED", getattr(task, "error_message", None)
+    assert "CONTEXT_EXTRACTING" not in repository.statuses
+    assert projects.arguments == (["张伟"], ["宏远制造有限公司"], [])
+    assert "林致远" not in str(task.project_query_plan)
+    assert task.web_search_status == "SUCCESS"
+    assert len(task.public_claims) == 1
+    assert task.internal_results[0]["project_id"] == "P007"
+    assert task.internal_results[0]["contact_name"] == "郑伟"
+    assert task.internal_results[0]["owner_name"] == "张伟"
+    assert "宏远制造有限公司持续推进制造园区能源管理" in task.detailed_report_markdown
+    assert "制造园区能源管理" in task.detailed_report_markdown
+    assert "郑伟（能源管理部经理），17010000006" in task.detailed_report_markdown
+    assert "我方负责人：张伟，17000001001" in task.detailed_report_markdown

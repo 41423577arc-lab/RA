@@ -60,6 +60,14 @@ type Task = {
     people: EntityMention[];
     organizations: EntityMention[];
   };
+  confirmed_context?: {
+    entities: Array<{
+      entity_type: "PERSON" | "ORGANIZATION" | "PROJECT";
+      canonical_name: string;
+      organization?: string;
+      title?: string;
+    }>;
+  };
   web_search_status?: string;
   web_fetch_status?: string;
   internal_search_status?: string;
@@ -124,7 +132,7 @@ const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "NEEDS_CONFIRMATIO
 const STATUS_LABELS: Record<string, string> = {
   PENDING: "任务已创建",
   TRANSCRIBING: "正在识别语音",
-  CONTEXT_EXTRACTING: "正在识别人物与企业",
+  CONTEXT_EXTRACTING: "正在整理分析上下文",
   EXTRACTING: "正在提取关键信息",
   RULE_EXTRACTING: "正在提取关键信息",
   LLM_UNDERSTANDING: "正在理解任务意图",
@@ -145,19 +153,7 @@ const STATUS_LABELS: Record<string, string> = {
   FAILED: "分析失败",
   CANCELLED: "任务已取消"
 };
-const CURRENT_STATUS_ORDER = [
-  "PENDING",
-  "TRANSCRIBING",
-  "CONTEXT_EXTRACTING",
-  "PLANNING_PROJECT_SEARCH",
-  "PROJECT_SEARCHING",
-  "RERANKING_PROJECTS",
-  "ANALYZING_ASSOCIATIONS",
-  "GENERATING_REPORT_CONTENT",
-  "RENDERING_REPORT",
-  "COMPLETED"
-];
-const LEGACY_STATUS_ORDER = [
+const ANALYSIS_STATUS_ORDER = [
   "PENDING",
   "TRANSCRIBING",
   "CONTEXT_EXTRACTING",
@@ -173,12 +169,6 @@ const LEGACY_STATUS_ORDER = [
   "RENDERING_REPORT",
   "COMPLETED"
 ];
-const LEGACY_WEB_STATUSES = new Set([
-  "PLANNING_WEB_SEARCH",
-  "WEB_SEARCHING",
-  "WEB_FETCHING",
-  "VERIFYING_WEB_RESULTS"
-]);
 
 function safeReportUrl(url: string) {
   return /^https?:\/\//i.test(url) ? url : "";
@@ -525,17 +515,11 @@ export default function Home() {
     setAudioJob(payload as IntakeAudioJob);
   };
 
-  const usesLegacyWebProgress = Boolean(
-    task && (
-      LEGACY_WEB_STATUSES.has(task.status)
-      || task.web_search_status === "SUCCESS"
-      || task.web_search_status === "FAILED"
-    )
-  );
-  const statusOrder = usesLegacyWebProgress ? LEGACY_STATUS_ORDER : CURRENT_STATUS_ORDER;
-  const visibleStatuses = task?.input_type === "text"
-    ? statusOrder.filter((status) => status !== "TRANSCRIBING")
-    : statusOrder;
+  const visibleStatuses = ANALYSIS_STATUS_ORDER.filter((status) => {
+    if (task?.input_type === "text" && status === "TRANSCRIBING") return false;
+    if (task?.confirmed_context && status === "CONTEXT_EXTRACTING") return false;
+    return true;
+  });
   const visibleCurrentIndex = task ? visibleStatuses.indexOf(task.status) : -1;
 
   return (

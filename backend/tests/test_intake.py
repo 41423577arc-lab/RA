@@ -359,6 +359,12 @@ def test_start_analysis_is_idempotent_and_freezes_snapshot(monkeypatch) -> None:
             "title": "副总经理",
             "role_type": "企业高层领导",
         }
+        assert task.confirmed_context is not None
+        target_names = {
+            item["canonical_name"] for item in task.confirmed_context["entities"]
+        }
+        assert target_names == {"王传福", "比亚迪股份有限公司"}
+        assert "林致远" not in target_names
 
 
 def test_external_candidate_requires_user_confirmation(monkeypatch) -> None:
@@ -1003,6 +1009,28 @@ def test_standardized_analysis_input_uses_confirmed_names_and_title() -> None:
     assert "王传福" in output
     assert "比亚迪股份有限公司" in output
     assert "董事长兼总裁" in output
+
+
+def test_standardized_analysis_input_does_not_expand_an_already_canonical_name() -> None:
+    output = intake_api._standardized_analysis_input(
+        "与宏远制造有限公司的张总吃饭。",
+        [
+            {
+                "mention": "宏远制造",
+                "canonical_name": "宏远制造有限公司",
+                "entity_type": "ORGANIZATION",
+            },
+            {
+                "mention": "张总",
+                "canonical_name": "张伟",
+                "entity_type": "PERSON",
+                "organization": "宏远制造有限公司",
+            },
+        ],
+    )
+
+    assert "宏远制造有限公司有限公司" not in output
+    assert "与宏远制造有限公司的张伟吃饭" in output
 
 
 def test_audio_is_transcribed_and_reviewed_before_analysis(monkeypatch, tmp_path: Path) -> None:
