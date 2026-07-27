@@ -14,6 +14,7 @@ from app.schemas.intake import (
     IntakeChatRequest,
     IntakeChatResponse,
     IntakeChatResult,
+    IntakeReadinessResult,
     IntakeAudioJobResponse,
     IntakeSessionResponse,
     IntakeStructuredContext,
@@ -674,6 +675,7 @@ def confirm_intake_entities(
         intake_session.structured_context or {}
     )
     resolutions = list((intake_session.structured_context or {}).get("entity_resolutions", []))
+    confirmed_selections: list[dict] = []
     for item in request.get("items", []):
         selection = selections.get(item["mention"])
         if selection is None:
@@ -714,6 +716,7 @@ def confirm_intake_entities(
                 "confirmed_by": "USER",
             }
         resolutions = _merge_resolutions(resolutions, [resolution])
+        confirmed_selections.append(resolution)
 
     structured_context = with_default_requester_context(
         dict(intake_session.structured_context or {})
@@ -723,12 +726,24 @@ def confirm_intake_entities(
     standardized_input = _standardized_analysis_input(
         intake_session.analysis_input, resolutions
     )
-    confirmed_names = list(
-        dict.fromkeys(
-            item.get("canonical_name")
-            for item in resolutions
-            if item.get("canonical_name")
+    confirmed_names = list(dict.fromkeys(
+        item.get("canonical_name")
+        for item in resolutions
+        if item.get("canonical_name")
+    ))
+    selection_descriptions = []
+    for item in confirmed_selections:
+        details = "、".join(
+            value
+            for value in (item.get("organization"), item.get("title"))
+            if value
         )
+        identity = item.get("canonical_name") or item.get("mention")
+        selection_descriptions.append(
+            f"{item.get('mention')} → {identity}{f'（{details}）' if details else ''}"
+        )
+    confirmation_message = (
+        f"我已在身份确认中选择：{'；'.join(selection_descriptions)}。"
     )
     validation_result = IntakeChatResult(
         assistant_reply=(
@@ -746,12 +761,74 @@ def confirm_intake_entities(
         for item in (intake_session.messages or [])
         if item.get("role") == "user"
     )
-    ready = is_intake_ready(validation_result, source_text) and _has_resolved_entities(
-        structured_context
+    intake_activity.update(
+        str(session_id),
+        "CALLING_TOOL",
+        "正在检查确认后的信息是否可以开始分析",
+        tool_name="check_intake_readiness",
+    )
+    required_missing = required_missing_information(validation_result, source_text)
+    all_entities_resolved = _has_resolved_entities(structured_context)
+    server_ready = not required_missing and all_entities_resolved
+    tool_observation = {
+        "tool": "check_intake_readiness",
+        "server_ready": server_ready,
+        "all_entities_resolved": all_entities_resolved,
+        "required_missing_information": required_missing,
+        "confirmed_selections": confirmed_selections,
+    }
+    fallback_missing = required_missing or (
+        [] if all_entities_resolved else ["人物或企业身份确认"]
+    )
+    readiness_review = IntakeReadinessResult(
+        assistant_reply=(
+            f"已复核确认的标准身份：{'、'.join(confirmed_names)}。可以开始分析。"
+            if server_ready and confirmed_names
+            else "身份选择已记录，但还需要补充分析目标或确认关键身份。"
+        ),
+        ready_to_analyze=server_ready,
+        missing_information=fallback_missing,
+        next_action="PROPOSE_READY" if server_ready else "ASK_USER",
+    )
+    assess_readiness = getattr(intake_agent, "assess_readiness", None)
+    if callable(assess_readiness):
+        intake_activity.update(
+            str(session_id),
+            "PROCESSING_TOOL_RESULT",
+            "大模型正在复核确认结果与分析条件",
+            tool_name="check_intake_readiness",
+        )
+        review_messages = [
+            *(intake_session.messages or []),
+            {"role": "user", "content": confirmation_message},
+        ]
+        try:
+            readiness_review = assess_readiness(
+                IntakeChatRequest(
+                    session_id=session_id,
+                    messages=review_messages[-30:],
+                ),
+                IntakeStructuredContext.model_validate(structured_context),
+                tool_observation,
+            )
+        except (LLMUnavailable, LLMCallFailed):
+            pass
+    ready = bool(
+        server_ready
+        and readiness_review.ready_to_analyze
+        and readiness_review.next_action == "PROPOSE_READY"
+    )
+    missing_information = (
+        []
+        if ready
+        else fallback_missing
+        or readiness_review.missing_information
+        or ["身份或分析目标确认"]
     )
     messages = [
         *(intake_session.messages or []),
-        {"role": "assistant", "content": validation_result.assistant_reply},
+        {"role": "user", "content": confirmation_message},
+        {"role": "assistant", "content": readiness_review.assistant_reply},
     ]
     intake_session = repository.update(
         str(session_id),
@@ -759,10 +836,17 @@ def confirm_intake_entities(
         messages=messages,
         structured_context=structured_context,
         analysis_input=standardized_input,
-        missing_information=[] if ready else ["分析目标或重点"],
+        missing_information=missing_information,
         confirmation_request=None,
         ready_to_analyze=ready,
         version=intake_session.version + 1,
+    )
+    intake_activity.update(
+        str(session_id),
+        "COMPLETED",
+        "确认结果复核完成",
+        active=False,
+        tool_name="check_intake_readiness",
     )
     response = _chat_response(intake_session)
     return IntakeSessionResponse(

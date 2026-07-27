@@ -117,7 +117,8 @@ const IDLE_ACTIVITY: IntakeActivity = {
 };
 const TOOL_LABELS: Record<string, string> = {
   lookup_internal_identity: "内部身份查询",
-  search_key_person_identity_web: "联网身份补全"
+  search_key_person_identity_web: "联网身份补全",
+  check_intake_readiness: "分析就绪复核"
 };
 const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "NEEDS_CONFIRMATION"]);
 const STATUS_LABELS: Record<string, string> = {
@@ -273,7 +274,7 @@ export default function Home() {
   }, [chatMessages, isChatting]);
 
   useEffect(() => {
-    if (!chatSessionId || !isChatting) return;
+    if (!chatSessionId || (!isChatting && !isSubmitting)) return;
     let cancelled = false;
     const fetchActivity = async () => {
       const response = await fetch(`${API_BASE}/api/v1/intake/${chatSessionId}/activity`);
@@ -289,7 +290,7 @@ export default function Home() {
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [chatSessionId, isChatting]);
+  }, [chatSessionId, isChatting, isSubmitting]);
 
   const sendChatMessage = async (contentOverride?: string, audioJobId?: string) => {
     const content = (contentOverride ?? chatInput).trim();

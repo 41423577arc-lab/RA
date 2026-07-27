@@ -14,6 +14,7 @@ from app.schemas.intake import (
     IntakeEntityAssessment,
     IntakeChatResult,
     IntakeFollowupResult,
+    IntakeReadinessResult,
     IntakeStructuredContext,
 )
 from app.schemas.task import (
@@ -27,6 +28,7 @@ from app.schemas.task import (
 from app.services.intake_completeness import is_intake_ready
 from app.services.intake_entity_candidates import IntakeEntityCandidateService
 from app.services.intake_agent import IntakeAgent
+from app.services.llm_client import LLMUnavailable
 from app.tasks.pipeline import context_from_intake_snapshot
 
 
@@ -58,6 +60,21 @@ class ReadyIntakeAgent:
                 focus_questions=["储能项目如何推进"],
             ),
         )
+
+
+class ReadinessReviewAgent(ReadyIntakeAgent):
+    def __init__(self, result: IntakeReadinessResult):
+        self.result = result
+        self.observations: list[dict] = []
+
+    def assess_readiness(self, request, structured_context, observation):
+        self.observations.append(observation)
+        return self.result
+
+
+class FailingReadinessAgent(ReadyIntakeAgent):
+    def assess_readiness(self, request, structured_context, observation):
+        raise LLMUnavailable("readiness model unavailable")
 
 
 class AutoConfirmEntityCandidates:
@@ -345,7 +362,7 @@ def test_start_analysis_is_idempotent_and_freezes_snapshot(monkeypatch) -> None:
 
 
 def test_external_candidate_requires_user_confirmation(monkeypatch) -> None:
-    monkeypatch.setattr(intake_api, "intake_agent", ReadyIntakeAgent())
+    monkeypatch.setattr(intake_api, "intake_agent", FailingReadinessAgent())
     monkeypatch.setattr(intake_api, "entity_candidates", ExternalConfirmationCandidates())
 
     with TestClient(app) as client:
@@ -380,6 +397,105 @@ def test_external_candidate_requires_user_confirmation(monkeypatch) -> None:
     assert confirmed.status_code == 200
     assert confirmed.json()["status"] == "READY"
     assert confirmed.json()["ready_to_analyze"] is True
+    assert confirmed.json()["messages"][-2]["role"] == "user"
+    assert "我已在身份确认中选择" in confirmed.json()["messages"][-2]["content"]
+
+
+def test_confirmation_model_can_require_more_information(monkeypatch) -> None:
+    agent = ReadinessReviewAgent(
+        IntakeReadinessResult(
+            assistant_reply="已记录您的选择，请再确认王先生是否属于该企业。",
+            ready_to_analyze=False,
+            missing_information=["人物企业关系"],
+            next_action="ASK_USER",
+        )
+    )
+    monkeypatch.setattr(intake_api, "intake_agent", agent)
+    monkeypatch.setattr(intake_api, "entity_candidates", ExternalConfirmationCandidates())
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/intake/chat",
+            json={
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "和比亚迪的王传福讨论储能项目如何推进",
+                    }
+                ]
+            },
+        ).json()
+        candidate = created["confirmation_request"]["items"][0]["candidates"][0]
+        confirmed = client.post(
+            f"/api/v1/intake/{created['session_id']}/confirm",
+            json={
+                "confirmation_version": created["confirmation_request"]["version"],
+                "selections": [
+                    {
+                        "mention": "王传福",
+                        "candidate_id": candidate["candidate_id"],
+                    }
+                ],
+            },
+        )
+
+    assert confirmed.status_code == 200
+    payload = confirmed.json()
+    assert payload["status"] == "COLLECTING"
+    assert payload["ready_to_analyze"] is False
+    assert payload["missing_information"] == ["人物企业关系"]
+    assert payload["messages"][-1]["content"] == agent.result.assistant_reply
+    assert len(agent.observations) == 1
+    assert agent.observations[0]["tool"] == "check_intake_readiness"
+    assert agent.observations[0]["server_ready"] is True
+    assert agent.observations[0]["all_entities_resolved"] is True
+    assert agent.observations[0]["required_missing_information"] == []
+    assert agent.observations[0]["confirmed_selections"][0]["canonical_name"] == "王传福"
+
+
+def test_confirmation_model_proposes_ready_after_tool_check(monkeypatch) -> None:
+    agent = ReadinessReviewAgent(
+        IntakeReadinessResult(
+            assistant_reply="身份和分析目标已经复核，可以开始分析。",
+            ready_to_analyze=True,
+            missing_information=[],
+            next_action="PROPOSE_READY",
+        )
+    )
+    monkeypatch.setattr(intake_api, "intake_agent", agent)
+    monkeypatch.setattr(intake_api, "entity_candidates", ExternalConfirmationCandidates())
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/intake/chat",
+            json={
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "和比亚迪的王传福讨论储能项目如何推进",
+                    }
+                ]
+            },
+        ).json()
+        candidate = created["confirmation_request"]["items"][0]["candidates"][0]
+        confirmed = client.post(
+            f"/api/v1/intake/{created['session_id']}/confirm",
+            json={
+                "confirmation_version": created["confirmation_request"]["version"],
+                "selections": [
+                    {
+                        "mention": "王传福",
+                        "candidate_id": candidate["candidate_id"],
+                    }
+                ],
+            },
+        )
+
+    assert confirmed.status_code == 200
+    assert confirmed.json()["status"] == "READY"
+    assert confirmed.json()["ready_to_analyze"] is True
+    assert agent.observations[0]["tool"] == "check_intake_readiness"
+    assert agent.observations[0]["server_ready"] is True
 
 
 class NoInternalCandidates:
@@ -958,10 +1074,17 @@ class RecordingLlm:
         self.payloads.append(payload)
         if node_name == "intake_chat":
             return ReadyIntakeAgent().respond(None)
+        if node_name == "intake_readiness":
+            return IntakeReadinessResult(
+                assistant_reply="复核完成，可以分析。",
+                ready_to_analyze=True,
+                missing_information=[],
+                next_action="PROPOSE_READY",
+            )
         return IntakeFollowupResult(assistant_reply="请确认身份候选。")
 
 
-def test_controlled_intake_agent_has_only_two_model_steps() -> None:
+def test_controlled_intake_agent_has_dedicated_readiness_step() -> None:
     llm = RecordingLlm()
     agent = IntakeAgent(llm)
     request = intake_api.IntakeChatRequest(
@@ -974,9 +1097,21 @@ def test_controlled_intake_agent_has_only_two_model_steps() -> None:
         decision,
         {"resolved_count": 0, "needs_confirmation": True, "candidate_count": 1},
     )
+    readiness = agent.assess_readiness(
+        request,
+        decision.structured_context,
+        {
+            "tool": "check_intake_readiness",
+            "server_ready": True,
+            "all_entities_resolved": True,
+            "required_missing_information": [],
+            "confirmed_selections": [],
+        },
+    )
 
     assert follow_up.assistant_reply == "请确认身份候选。"
-    assert llm.nodes == ["intake_chat", "intake_followup"]
+    assert readiness.next_action == "PROPOSE_READY"
+    assert llm.nodes == ["intake_chat", "intake_followup", "intake_readiness"]
     assert llm.payloads[0]["default_requester_context"]["organization"] == (
         "澄岳产业发展有限公司"
     )

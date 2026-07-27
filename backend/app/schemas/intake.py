@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.schemas.task import ConfirmationRequest
 
@@ -75,6 +75,22 @@ class IntakeFollowupResult(BaseModel):
     next_action: Literal["SEARCH_EXTERNAL", "REQUEST_CONFIRMATION", "PROPOSE_READY"] = (
         "REQUEST_CONFIRMATION"
     )
+
+
+class IntakeReadinessResult(BaseModel):
+    assistant_reply: str = Field(min_length=1, max_length=1_000)
+    ready_to_analyze: bool
+    missing_information: list[str] = Field(default_factory=list, max_length=8)
+    next_action: Literal["ASK_USER", "PROPOSE_READY"]
+
+    @model_validator(mode="after")
+    def validate_decision(self):
+        if self.ready_to_analyze:
+            if self.next_action != "PROPOSE_READY" or self.missing_information:
+                raise ValueError("就绪结论必须使用 PROPOSE_READY 且不能包含缺失信息")
+        elif self.next_action != "ASK_USER":
+            raise ValueError("未就绪结论必须使用 ASK_USER")
+        return self
 
 
 class ExternalIdentityCandidate(BaseModel):
