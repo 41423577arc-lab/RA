@@ -3,6 +3,8 @@ from app.schemas.intake import (
     IntakeChatRequest,
     IntakeChatResult,
     IntakeFollowupResult,
+    IntakeReadinessResult,
+    IntakeStructuredContext,
 )
 from app.services.intake_defaults import DEFAULT_REQUESTER_CONTEXT
 from app.services.llm_client import StructuredLLM
@@ -56,4 +58,22 @@ class IntakeAgent:
                 "default_requester_context": DEFAULT_REQUESTER_CONTEXT,
             },
             ExternalIdentityNormalizationResult,
+        )
+
+    def assess_readiness(
+        self,
+        request: IntakeChatRequest,
+        structured_context: IntakeStructuredContext,
+        tool_observation: dict,
+    ) -> IntakeReadinessResult:
+        return self.llm.parse(
+            str(request.session_id),
+            "intake_readiness",
+            {
+                "messages": [message.model_dump() for message in request.messages],
+                "structured_context": structured_context.model_dump(mode="json"),
+                "tool_observation": tool_observation,
+                "default_requester_context": DEFAULT_REQUESTER_CONTEXT,
+            },
+            IntakeReadinessResult,
         )

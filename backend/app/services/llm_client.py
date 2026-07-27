@@ -16,6 +16,7 @@ REVIEW_NODES = {
     "project_rerank",
     "association",
     "intake_identity_normalize",
+    "intake_readiness",
 }
 LONG_NODES = {"association", "report_content"}
 
