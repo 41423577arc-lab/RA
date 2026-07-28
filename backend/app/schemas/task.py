@@ -181,6 +181,8 @@ class SearchResult(BaseModel):
     content: str = ""
     query: str
     rank: int
+    target_person: str | None = None
+    target_organization: str | None = None
     published_at: datetime | None = None
 
 
@@ -190,6 +192,11 @@ class WebPage(BaseModel):
     url: str
     raw_content: str
     rank: int
+    query: str = ""
+    target_person: str | None = None
+    target_organization: str | None = None
+    search_snippet: str = ""
+    content_source: Literal["PAGE_TEXT", "SEARCH_SNIPPET"] = "PAGE_TEXT"
     published_at: datetime | None = None
 
 
@@ -208,6 +215,7 @@ class PublicClaim(BaseModel):
     evidence_quote: str = ""
     source_title: str
     source_url: str
+    evidence_source: Literal["PAGE_TEXT", "SEARCH_SNIPPET"] = "PAGE_TEXT"
     published_at: datetime | None = None
     matched_keywords: list[str] = Field(default_factory=list)
     confidence: float = Field(default=1, ge=0, le=1)

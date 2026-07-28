@@ -223,29 +223,37 @@ def validate_web_results(
     threshold: float,
 ) -> list[WebVerification]:
     by_id = {page.web_result_id: page for page in pages}
-    people = {entity.canonical_name for entity in context.entities if entity.entity_type == "PERSON"}
-    organizations = {
-        entity.organization or entity.canonical_name
+    people = {
+        entity.canonical_name
         for entity in context.entities
-        if entity.organization or entity.entity_type == "ORGANIZATION"
+        if entity.entity_type == "PERSON"
     }
     output: list[WebVerification] = []
     for result in batch.results:
         page = by_id.get(result.web_result_id)
         if page is None:
             continue
-        body = normalize(page.raw_content)
+        body = normalize(_web_evidence_text(page))
+        target_person = page.target_person or (
+            result.matched_person if result.matched_person in people else None
+        )
+        organization_terms = _organization_terms(context, page.target_organization)
+        organization_present = bool(
+            not organization_terms
+            or any(name in body for name in organization_terms)
+        )
         matched_person_valid = bool(
-            result.matched_person
-            and result.matched_person in people
-            and result.matched_person in body
-            and (not organizations or any(name in body for name in organizations))
+            target_person
+            and result.matched_person == target_person
+            and target_person in body
+            and organization_present
         )
         matched_organization_valid = bool(
-            not result.matched_person
+            not target_person
+            and not people
             and result.matched_organization
-            and result.matched_organization in organizations
-            and result.matched_organization in body
+            and result.matched_organization in organization_terms
+            and organization_present
         )
         identity_present = matched_person_valid or matched_organization_valid
         evidence = []
@@ -253,13 +261,13 @@ def validate_web_results(
             quote = normalize(item.quote)
             if quote not in body:
                 continue
-            if result.matched_person:
-                if result.matched_person not in quote or (
-                    organizations
-                    and not any(name in quote for name in organizations)
+            if target_person:
+                if target_person not in quote or (
+                    organization_terms
+                    and not any(name in quote for name in organization_terms)
                 ):
                     continue
-            elif result.matched_organization not in quote:
+            elif not any(name in quote for name in organization_terms):
                 continue
             evidence.append(item)
         keep = result.keep and result.confidence >= threshold and identity_present and bool(evidence)
@@ -271,23 +279,38 @@ def strict_rule_verifications(
     pages: list[WebPage], context: ConfirmedContext, keywords: list[str]
 ) -> list[WebVerification]:
     people = [item.canonical_name for item in context.entities if item.entity_type == "PERSON"]
-    organizations = unique(
-        [item.organization for item in context.entities if item.organization]
-        + [item.canonical_name for item in context.entities if item.entity_type == "ORGANIZATION"]
-    )
     output = []
     for page in pages:
-        plain = normalize(page.raw_content)
-        person = next((name for name in people if name in plain), None)
-        organization = next((name for name in organizations if name in plain), None)
-        keep = bool(person and (organization or not organizations)) or bool(
-            not person and organization
+        source_text = _web_evidence_text(page)
+        plain = normalize(source_text)
+        target_people = [page.target_person] if page.target_person else people
+        person = next((name for name in target_people if name and name in plain), None)
+        organization_terms = _organization_terms(context, page.target_organization)
+        organization = next(
+            (name for name in organization_terms if name in plain), None
         )
+        keep = bool(person and (organization or not organization_terms))
+        if not target_people:
+            keep = bool(organization)
         evidence: list[WebEvidence] = []
         if keep:
-            sentences = [item.strip() for item in re.split(r"[。！？!?；;\n]+", plain)]
-            for sentence in sentences:
-                if (person and person not in sentence) or (organization and organization not in sentence):
+            candidates = (
+                _person_evidence_windows(source_text, person)
+                if person
+                else [
+                    item.strip()
+                    for item in re.split(r"[。！？!?；;\n]+", plain)
+                    if item.strip()
+                ]
+            )
+            for sentence in candidates:
+                if person and person not in sentence:
+                    continue
+                if person and organization_terms and not any(
+                    name in sentence for name in organization_terms
+                ):
+                    continue
+                if not person and organization and organization not in sentence:
                     continue
                 matched = [word for word in keywords if word in sentence]
                 if len(sentence) >= 10:
@@ -310,7 +333,7 @@ def strict_rule_verifications(
                 matched_organization=organization,
                 identity_reason="规则确认正文命中已确认人物与单位或目标企业" if keep else "正文未命中已确认身份",
                 confidence=0.85 if keep else 0.2,
-                same_name_risk=bool(people and not organization),
+                same_name_risk=bool(target_people and not organization),
                 evidence=evidence,
             )
         )
@@ -338,6 +361,7 @@ def claims_from_verifications(
                     evidence_quote=evidence.quote,
                     source_title=page.title,
                     source_url=page.url,
+                    evidence_source=_evidence_source(page, evidence.quote),
                     published_at=page.published_at,
                     matched_keywords=evidence.matched_terms,
                     confidence=verification.confidence,
@@ -416,7 +440,7 @@ def fallback_association(
                 filter(
                     None,
                     (
-                        f"{project.project_name} 的我方负责人为 {project.owner_name}",
+                        f"{project.project_name} 的我方项目销售员为 {project.owner_name}",
                         f"联系电话 {project.owner_phone}" if project.owner_phone else None,
                         f"邮箱 {project.owner_email}" if project.owner_email else None,
                         (
@@ -756,3 +780,77 @@ def unique(values) -> list[str]:
 
 def normalize(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
+
+
+def _web_evidence_text(page: WebPage) -> str:
+    if page.search_snippet and page.search_snippet not in page.raw_content:
+        return f"{page.raw_content}\n{page.search_snippet}"
+    return page.raw_content or page.search_snippet
+
+
+def _organization_terms(
+    context: ConfirmedContext, target_organization: str | None = None
+) -> list[str]:
+    values = organization_aliases(target_organization)
+    for entity in context.entities:
+        if entity.entity_type == "PERSON":
+            values.extend(organization_aliases(entity.organization))
+        elif entity.entity_type == "ORGANIZATION":
+            for name in [entity.canonical_name, *entity.aliases]:
+                values.extend(organization_aliases(name))
+    return unique(values)
+
+
+def organization_aliases(value: str | None) -> list[str]:
+    """Return conservative legal-name variants suitable for identity evidence."""
+    name = normalize(value or "")
+    if not name:
+        return []
+    aliases = [name]
+    if name.endswith("工程有限公司"):
+        aliases.append(f"{name[:-len('工程有限公司')]}公司")
+    if name.endswith("股份有限公司"):
+        aliases.append(name[: -len("有限公司")])
+    if name.endswith("有限公司"):
+        aliases.append(name[: -len("有限公司")])
+    return unique(aliases)
+
+
+def _person_evidence_windows(text: str, person: str, radius: int = 250) -> list[str]:
+    lines = [normalize(line) for line in text.splitlines() if normalize(line)]
+    windows: list[str] = []
+    for index, line in enumerate(lines):
+        if person not in line:
+            continue
+        block = [line]
+        for following in lines[index + 1 : index + 4]:
+            if following.startswith("姓名："):
+                break
+            block.append(following)
+        windows.append(" ".join(block))
+
+    if windows:
+        distinct = sorted(unique(windows), key=len, reverse=True)
+        return [
+            window
+            for index, window in enumerate(distinct)
+            if not any(window in longer for longer in distinct[:index])
+        ]
+
+    plain = normalize(text)
+    start = 0
+    while True:
+        position = plain.find(person, start)
+        if position < 0:
+            break
+        windows.append(
+            plain[max(0, position - radius) : position + len(person) + radius].strip()
+        )
+        start = position + len(person)
+    return unique(windows)
+
+
+def _evidence_source(page: WebPage, quote: str) -> str:
+    if normalize(quote) in normalize(page.raw_content):
+        return page.content_source
+    return "SEARCH_SNIPPET"

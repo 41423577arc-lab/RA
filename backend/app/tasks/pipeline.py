@@ -1,4 +1,5 @@
 import asyncio
+import re
 from pathlib import Path
 from typing import Protocol
 
@@ -15,6 +16,8 @@ from app.schemas.task import (
     SearchResult,
     WebPage,
     WebSearchPlan,
+    WebSearchQuery,
+    WebVerification,
 )
 from app.services.agent_nodes import (
     AgentNodes,
@@ -27,6 +30,7 @@ from app.services.agent_nodes import (
     fallback_report_content,
     fallback_understanding,
     fallback_web_plan,
+    organization_aliases,
     strict_rule_verifications,
     validate_analysis,
     validate_rankings,
@@ -179,7 +183,7 @@ class ResearchPipeline:
                 task_id, web_search_plan=web_plan.model_dump(mode="json")
             )
             _, pages, web_search_status, web_fetch_status = self._run_web(
-                task_id, [item.query for item in web_plan.queries]
+                task_id, web_plan.queries
             )
             if web_search_status == "FAILED" and "web_search" not in degraded:
                 degraded.append("web_search")
@@ -200,6 +204,10 @@ class ResearchPipeline:
                     lambda: strict_rule_verifications(
                         pages, context, extracted.keywords
                     ),
+                )
+                verifications = merge_snippet_verifications(
+                    verifications,
+                    strict_rule_verifications(pages, context, extracted.keywords),
                 )
             else:
                 verifications = []
@@ -350,7 +358,7 @@ class ResearchPipeline:
             return fallback()
 
     def _run_web(
-        self, task_id: str, queries: list[str]
+        self, task_id: str, queries: list[WebSearchQuery]
     ) -> tuple[list[SearchResult], list[WebPage], str, str]:
         search_results: list[SearchResult] = []
         pages: list[WebPage] = []
@@ -359,10 +367,17 @@ class ResearchPipeline:
         if queries:
             self.repository.update(task_id, status="WEB_SEARCHING")
             try:
-                search_results = asyncio.run(self.web.search(queries))
+                search_results = asyncio.run(
+                    self.web.search([item.query for item in queries])
+                )
+                query_targets = {item.query: item for item in queries}
                 for index, item in enumerate(search_results, 1):
                     if not item.web_result_id:
                         item.web_result_id = f"W{index:03d}"
+                    target = query_targets.get(item.query)
+                    if target:
+                        item.target_person = target.target_person
+                        item.target_organization = target.target_organization
                 web_search_status = "SUCCESS"
             except Exception:
                 web_search_status = "FAILED"
@@ -373,14 +388,49 @@ class ResearchPipeline:
             )
             if search_results:
                 self.repository.update(task_id, status="WEB_FETCHING")
+                extracted_pages: list[WebPage] = []
                 try:
-                    pages = asyncio.run(self.web.extract(search_results))
+                    extracted_pages = asyncio.run(self.web.extract(search_results))
                     by_url = {item.url: item for item in search_results}
-                    for page in pages:
-                        if not page.web_result_id and page.url in by_url:
-                            page.web_result_id = by_url[page.url].web_result_id
-                    web_fetch_status = "SUCCESS" if pages else "FAILED"
+                    for page in extracted_pages:
+                        source = by_url.get(page.url)
+                        if source is None:
+                            continue
+                        page.web_result_id = page.web_result_id or source.web_result_id
+                        page.query = page.query or source.query
+                        page.target_person = page.target_person or source.target_person
+                        page.target_organization = (
+                            page.target_organization or source.target_organization
+                        )
+                        page.search_snippet = page.search_snippet or source.content
                 except Exception:
+                    web_fetch_status = "FAILED"
+                pages = list(extracted_pages)
+                extracted_urls = {page.url for page in extracted_pages}
+                pages.extend(
+                    WebPage(
+                        web_result_id=item.web_result_id,
+                        title=item.title,
+                        url=item.url,
+                        raw_content=item.content,
+                        rank=item.rank,
+                        query=item.query,
+                        target_person=item.target_person,
+                        target_organization=item.target_organization,
+                        search_snippet=item.content,
+                        content_source="SEARCH_SNIPPET",
+                        published_at=item.published_at,
+                    )
+                    for item in search_results
+                    if item.url not in extracted_urls and item.content.strip()
+                )
+                if extracted_pages and len(extracted_urls) == len(search_results):
+                    web_fetch_status = "SUCCESS"
+                elif extracted_pages:
+                    web_fetch_status = "PARTIAL"
+                elif pages:
+                    web_fetch_status = "SNIPPET_FALLBACK"
+                else:
                     web_fetch_status = "FAILED"
             self.repository.update(
                 task_id,
@@ -459,12 +509,18 @@ def sanitize_project_plan(
     plan: ProjectQueryPlan, context: ConfirmedContext
 ) -> ProjectQueryPlan:
     base = fallback_project_query(context)
+    organization_names = unique_non_empty(
+        [*base.organization_names, *plan.organization_names]
+    )
+    expanded_organizations = unique_non_empty(
+        alias
+        for name in organization_names
+        for alias in project_organization_terms(name)
+    )
     return plan.model_copy(
         update={
             "person_names": unique_non_empty([*base.person_names, *plan.person_names]),
-            "organization_names": unique_non_empty(
-                [*base.organization_names, *plan.organization_names]
-            ),
+            "organization_names": expanded_organizations,
             "project_names": unique_non_empty([*base.project_names, *plan.project_names]),
             "business_terms": unique_non_empty(
                 [*base.business_terms, *plan.business_terms]
@@ -474,25 +530,55 @@ def sanitize_project_plan(
     )
 
 
+def project_organization_terms(name: str) -> list[str]:
+    terms = organization_aliases(name)
+    match = re.match(r"^(中建[一二三四五六七八九十]局)", name)
+    if match:
+        terms.append(match.group(1))
+    return unique_non_empty(terms)
+
+
 def sanitize_web_plan(plan: WebSearchPlan, context: ConfirmedContext) -> WebSearchPlan:
-    people = {
-        item.canonical_name for item in context.entities if item.entity_type == "PERSON"
-    }
+    person_entities = [
+        item for item in context.entities if item.entity_type == "PERSON"
+    ]
+    people = {item.canonical_name for item in person_entities}
     organizations = {
         item.organization or item.canonical_name
         for item in context.entities
         if item.organization or item.entity_type == "ORGANIZATION"
     }
-    valid = [
-        item
-        for item in plan.queries
-        if (not item.target_person or item.target_person in people)
-        and (
-            not item.target_organization
-            or item.target_organization in organizations
+    default_person = person_entities[0] if len(person_entities) == 1 else None
+    default_organization = (
+        default_person.organization
+        if default_person and default_person.organization
+        else next(iter(organizations), None)
+    )
+    valid = []
+    for item in plan.queries:
+        if item.target_person and item.target_person not in people:
+            continue
+        if item.target_organization and item.target_organization not in organizations:
+            continue
+        target_person = item.target_person or (
+            default_person.canonical_name if default_person else None
         )
-    ]
-    return WebSearchPlan(queries=valid) if valid else fallback_web_plan(context)
+        target_organization = item.target_organization or default_organization
+        required_terms = unique_non_empty(
+            [*item.required_terms, target_person, target_organization]
+        )[:8]
+        valid.append(
+            item.model_copy(
+                update={
+                    "target_person": target_person,
+                    "target_organization": target_organization,
+                    "required_terms": required_terms,
+                }
+            )
+        )
+    if valid:
+        return WebSearchPlan(queries=valid)
+    return sanitize_web_plan(fallback_web_plan(context), context)
 
 
 def unique_non_empty(values) -> list[str]:
@@ -509,6 +595,23 @@ def merge_public_claims(*groups: list[PublicClaim]) -> list[PublicClaim]:
         seen.add(key)
         merged.append(claim)
     return merged[:30]
+
+
+def merge_snippet_verifications(
+    primary: list[WebVerification], snippet_rules: list[WebVerification]
+) -> list[WebVerification]:
+    output = list(primary)
+    positions = {item.web_result_id: index for index, item in enumerate(output)}
+    for item in snippet_rules:
+        if not item.keep:
+            continue
+        position = positions.get(item.web_result_id)
+        if position is None:
+            positions[item.web_result_id] = len(output)
+            output.append(item)
+        elif not output[position].keep:
+            output[position] = item
+    return output
 
 
 def context_from_intake_snapshot(
