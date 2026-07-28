@@ -58,6 +58,10 @@ class TavilyClient:
                         url=url,
                         raw_content=content[:20_000],
                         rank=source.rank,
+                        query=source.query,
+                        target_person=source.target_person,
+                        target_organization=source.target_organization,
+                        search_snippet=source.content,
                         published_at=source.published_at,
                     )
                 )

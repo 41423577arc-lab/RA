@@ -119,7 +119,7 @@ class MacroWeb:
             SearchResult(
                 title="宏远制造公开资料",
                 url="https://example.com/hongyuan",
-                content="宏远制造有限公司持续推进制造园区能源管理。",
+                content="张伟负责宏远制造有限公司持续推进制造园区能源管理。",
                 query=queries[0],
                 rank=0,
             )
@@ -130,7 +130,7 @@ class MacroWeb:
             WebPage(
                 title="宏远制造公开资料",
                 url="https://example.com/hongyuan",
-                raw_content="宏远制造有限公司持续推进制造园区能源管理和节能改造。",
+                raw_content="张伟负责宏远制造有限公司持续推进制造园区能源管理和节能改造。",
                 rank=0,
             )
         ]
@@ -435,7 +435,7 @@ def test_confirmed_intake_merges_public_and_internal_evidence_without_requester(
 
     assert task.status == "COMPLETED", getattr(task, "error_message", None)
     assert "CONTEXT_EXTRACTING" not in repository.statuses
-    assert projects.arguments == (["张伟"], ["宏远制造有限公司"], [])
+    assert projects.arguments == (["张伟"], ["宏远制造有限公司", "宏远制造"], [])
     assert "林致远" not in str(task.project_query_plan)
     assert task.web_search_status == "SUCCESS"
     assert len(task.public_claims) == 1
@@ -445,4 +445,4 @@ def test_confirmed_intake_merges_public_and_internal_evidence_without_requester(
     assert "宏远制造有限公司持续推进制造园区能源管理" in task.detailed_report_markdown
     assert "制造园区能源管理" in task.detailed_report_markdown
     assert "郑伟（能源管理部经理），17010000006" in task.detailed_report_markdown
-    assert "我方负责人：张伟，17000001001" in task.detailed_report_markdown
+    assert "我方项目销售员：张伟，手机号：17000001001" in task.detailed_report_markdown
