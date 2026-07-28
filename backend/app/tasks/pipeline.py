@@ -525,7 +525,7 @@ def sanitize_project_plan(
             "business_terms": unique_non_empty(
                 [*base.business_terms, *plan.business_terms]
             ),
-            "statuses": plan.statuses or ["ACTIVE", "COMPLETED"],
+            "statuses": unique_non_empty([*base.statuses, *plan.statuses]),
         }
     )
 

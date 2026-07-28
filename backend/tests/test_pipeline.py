@@ -438,6 +438,7 @@ def test_confirmed_intake_merges_public_and_internal_evidence_without_requester(
     assert projects.arguments == (["张伟"], ["宏远制造有限公司", "宏远制造"], [])
     assert "林致远" not in str(task.project_query_plan)
     assert task.web_search_status == "SUCCESS"
+    assert task.project_query_plan["statuses"] == ["ACTIVE", "COMPLETED"]
     assert len(task.public_claims) == 1
     assert task.internal_results[0]["project_id"] == "P007"
     assert task.internal_results[0]["contact_name"] == "郑伟"
