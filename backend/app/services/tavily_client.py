@@ -12,17 +12,62 @@ class TavilyClient:
         self.base_url = "https://api.tavily.com"
 
     async def search(self, queries: list[str]) -> list[SearchResult]:
+        return await self._search(
+            queries,
+            search_depth="basic",
+            max_results=5,
+            max_total_results=10,
+        )
+
+    async def search_identity(
+        self,
+        queries: list[str],
+        *,
+        start_date: str,
+        end_date: str,
+    ) -> list[SearchResult]:
+        return await self._search(
+            queries,
+            search_depth="advanced",
+            max_results=10,
+            max_total_results=20,
+            country="china",
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    async def _search(
+        self,
+        queries: list[str],
+        *,
+        search_depth: str,
+        max_results: int,
+        max_total_results: int,
+        country: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> list[SearchResult]:
         if not self.api_key:
             raise RuntimeError("TAVILY_API_KEY is empty")
         output: list[SearchResult] = []
         seen: set[str] = set()
         async with httpx.AsyncClient(timeout=15) as client:
             for query in queries:
-                payload = {"query": query, "search_depth": "basic", "max_results": 5}
+                payload: dict[str, object] = {
+                    "query": query,
+                    "search_depth": search_depth,
+                    "max_results": max_results,
+                }
+                if country:
+                    payload["country"] = country
+                if start_date:
+                    payload["start_date"] = start_date
+                if end_date:
+                    payload["end_date"] = end_date
                 response = await self._post_with_retry(client, "/search", payload)
                 for item in response.get("results", []):
                     url = item.get("url", "")
-                    if not url or url in seen or len(output) >= 10:
+                    if not url or url in seen or len(output) >= max_total_results:
                         continue
                     seen.add(url)
                     output.append(
@@ -39,23 +84,35 @@ class TavilyClient:
         return output
 
     async def extract(self, results: list[SearchResult]) -> list[WebPage]:
+        return await self._extract(results, extract_depth="basic")
+
+    async def extract_identity(self, results: list[SearchResult]) -> list[WebPage]:
+        return await self._extract(results, extract_depth="advanced")
+
+    async def _extract(
+        self, results: list[SearchResult], *, extract_depth: str
+    ) -> list[WebPage]:
         if not results:
             return []
         async with httpx.AsyncClient(timeout=30) as client:
-            payload = {"urls": [item.url for item in results], "extract_depth": "basic"}
+            payload = {
+                "urls": [item.url for item in results],
+                "extract_depth": extract_depth,
+            }
             response = await self._post_with_retry(client, "/extract", payload)
-        by_url = {item.url: item for item in results}
+        extracted_by_url = {
+            item.get("url", ""): item.get("raw_content") or ""
+            for item in response.get("results", [])
+        }
         pages: list[WebPage] = []
-        for item in response.get("results", []):
-            url = item.get("url", "")
-            source = by_url.get(url)
-            content = item.get("raw_content") or ""
-            if source and content:
+        for source in results:
+            content = extracted_by_url.get(source.url) or source.content
+            if content:
                 pages.append(
                     WebPage(
                         web_result_id=source.web_result_id,
                         title=source.title,
-                        url=url,
+                        url=source.url,
                         raw_content=content[:20_000],
                         rank=source.rank,
                         query=source.query,

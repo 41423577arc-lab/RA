@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import re
 from collections.abc import Callable
+from datetime import date
 
 from app.schemas.intake import (
     ExternalIdentityNormalizationResult,
@@ -15,9 +16,15 @@ from app.services.tavily_client import TavilyClient
 
 
 class IntakeEntityCandidateService:
-    def __init__(self, projects: ProjectMcpClient, web: TavilyClient):
+    def __init__(
+        self,
+        projects: ProjectMcpClient,
+        web: TavilyClient,
+        today_provider: Callable[[], date] | None = None,
+    ):
         self.projects = projects
         self.web = web
+        self.today_provider = today_provider or date.today
 
     def resolve(
         self,
@@ -137,7 +144,8 @@ class IntakeEntityCandidateService:
             return confirmation
         person = context.people[0] if context.people else None
         organization = context.organizations[0] if context.organizations else None
-        pages = self._external_pages(person, organization)
+        as_of_date = self.today_provider()
+        pages = self._external_pages(person, organization, as_of_date)
         normalized_external: list[tuple[str, CandidateOption]] = []
         if pages:
             try:
@@ -153,7 +161,7 @@ class IntakeEntityCandidateService:
                     [page.model_dump(mode="json") for page in pages],
                 )
                 normalized_external = self._validated_normalized_candidates(
-                    normalized, pages
+                    normalized, pages, as_of_date
                 )
             except Exception:
                 normalized_external = []
@@ -161,6 +169,12 @@ class IntakeEntityCandidateService:
         for item in confirmation.items:
             options = list(item.candidates)
             if len(options) != 1:
+                if item.entity_type == "PERSON" and organization:
+                    options.extend(
+                        _explicit_person_options(
+                            pages, item.mention, organization, as_of_date
+                        )
+                    )
                 options.extend(
                     option
                     for normalized_mention, option in normalized_external
@@ -226,19 +240,46 @@ class IntakeEntityCandidateService:
             )
         return resolutions, None
 
-    def _external_pages(self, person: str | None, organization: str | None):
-        query = " ".join(f'"{value}"' for value in (person, organization) if value)
+    def _external_pages(
+        self,
+        person: str | None,
+        organization: str | None,
+        as_of_date: date,
+    ):
         try:
-            results = asyncio.run(
-                self.web.search([f"{query} 完整姓名 企业全称 职位"])
-            )
-            return asyncio.run(self.web.extract(results)) if results else []
+            search_identity = getattr(self.web, "search_identity", None)
+            extract_identity = getattr(self.web, "extract_identity", None)
+            if callable(search_identity):
+                queries = _identity_queries(person, organization)
+                start_date = date(as_of_date.year - 1, 1, 1).isoformat()
+                results = asyncio.run(
+                    search_identity(
+                        queries,
+                        start_date=start_date,
+                        end_date=as_of_date.isoformat(),
+                    )
+                )
+            else:
+                query = " ".join(
+                    f'"{value}"' for value in (person, organization) if value
+                )
+                results = asyncio.run(
+                    self.web.search([f"{query} 完整姓名 企业全称 职位"])
+                )
+            if not results:
+                return []
+            if callable(extract_identity):
+                return asyncio.run(extract_identity(results))
+            return asyncio.run(self.web.extract(results))
         except Exception:
             return []
 
     @staticmethod
     def _rule_external_options(
-        pages, mention: str, entity_type: str, organization: str | None
+        pages,
+        mention: str,
+        entity_type: str,
+        organization: str | None,
     ) -> list[CandidateOption]:
         output: list[CandidateOption] = []
         if entity_type == "PERSON" and organization:
@@ -281,7 +322,9 @@ class IntakeEntityCandidateService:
 
     @staticmethod
     def _validated_normalized_candidates(
-        result: ExternalIdentityNormalizationResult, pages
+        result: ExternalIdentityNormalizationResult,
+        pages,
+        as_of_date: date,
     ) -> list[tuple[str, CandidateOption]]:
         by_url = {page.url: page for page in pages}
         output: list[tuple[str, CandidateOption]] = []
@@ -308,7 +351,7 @@ class IntakeEntityCandidateService:
                         canonical_name=item.canonical_name,
                         organization=item.organization,
                         title=item.title,
-                        reason="联网公开资料补充的关键人标准身份候选",
+                        reason=_temporal_reason(page, as_of_date),
                         confidence=item.confidence,
                         source_url=item.source_url,
                         evidence_quote=item.evidence_quote,
@@ -340,6 +383,129 @@ class IntakeEntityCandidateService:
                 seen.add(key)
                 output.append(item)
         return output
+
+
+_PERSON_TITLE_PATTERN = (
+    r"党委书记、董事长|党委副书记、总经理|党委书记|党委副书记|"
+    r"董事长兼总经理|董事长|总经理|常务副总经理|副总经理|"
+    r"总工程师|法定代表人"
+)
+
+
+def _identity_queries(
+    person: str | None, organization: str | None
+) -> list[str]:
+    quoted_person = f'"{person}"' if person else ""
+    aliases = _organization_search_aliases(organization) if organization else []
+    queries: list[str] = []
+    if person and organization:
+        queries.append(f'{quoted_person} "{organization}"')
+        role_organization = aliases[1] if len(aliases) > 1 else organization
+        queries.append(f'{quoted_person} "{role_organization}" 职务 现任')
+    elif person:
+        queries.append(f"{quoted_person} 现任 职务")
+    elif organization:
+        queries.append(f'"{organization}" 企业全称 简称')
+    return list(dict.fromkeys(queries))
+
+
+def _organization_search_aliases(organization: str) -> list[str]:
+    aliases = [organization]
+    replacements = (
+        ("工程有限公司", "公司"),
+        ("有限责任公司", "公司"),
+        ("股份有限公司", "公司"),
+    )
+    for suffix, replacement in replacements:
+        if organization.endswith(suffix):
+            aliases.append(organization[: -len(suffix)] + replacement)
+            break
+    if "中国建筑第二工程局" in organization:
+        aliases.append(organization.replace("中国建筑第二工程局", "中建二局"))
+    return list(dict.fromkeys(alias for alias in aliases if len(alias) >= 4))
+
+
+def _explicit_person_options(
+    pages,
+    mention: str,
+    organization: str,
+    as_of_date: date,
+) -> list[CandidateOption]:
+    aliases = _organization_search_aliases(organization)
+    alias_pattern = "|".join(re.escape(alias) for alias in aliases)
+    person = re.escape(mention)
+    patterns = (
+        re.compile(
+            rf"姓名\s*[:：]\s*{person}\s*.{{0,20}}?职位\s*[:：]\s*"
+            rf"(?:(?:{alias_pattern}))?(?P<title>{_PERSON_TITLE_PATTERN})"
+        ),
+        re.compile(
+            rf"(?P<title>(?:公司)?(?:{_PERSON_TITLE_PATTERN}))\s*{person}"
+        ),
+        re.compile(
+            rf"{person}.{{0,20}}?(?:现任|任|担任|职位\s*[:：])\s*"
+            rf"(?P<title>{_PERSON_TITLE_PATTERN})"
+        ),
+    )
+    output: list[CandidateOption] = []
+    for page in pages[:20]:
+        text = page.raw_content
+        if mention not in text or not any(alias in text for alias in aliases):
+            continue
+        for pattern in patterns:
+            for match in pattern.finditer(text):
+                start = max(0, match.start() - 120)
+                end = min(len(text), match.end() + 120)
+                evidence = text[start:end].strip()
+                if not any(alias in evidence for alias in aliases):
+                    continue
+                title = match.group("title").removeprefix("公司")
+                candidate_id = hashlib.sha256(
+                    f"PERSON|{mention}|{organization}|{title}|{page.url}".encode(
+                        "utf-8"
+                    )
+                ).hexdigest()[:24]
+                output.append(
+                    CandidateOption(
+                        candidate_id=f"external:{candidate_id}",
+                        entity_type="PERSON",
+                        canonical_name=mention,
+                        organization=organization,
+                        title=title,
+                        reason=_temporal_reason(page, as_of_date),
+                        confidence=0.93,
+                        source_url=page.url,
+                        evidence_quote=evidence[:500],
+                    )
+                )
+    return output
+
+
+def _temporal_reason(page, as_of_date: date) -> str:
+    evidence_time = _page_evidence_time(page)
+    if evidence_time:
+        return (
+            f"公开资料时间为 {evidence_time}，"
+            f"身份检索截止 {as_of_date.isoformat()}"
+        )
+    return f"无发布日期的公开页面，身份检索截止 {as_of_date.isoformat()}"
+
+
+def _page_evidence_time(page) -> str | None:
+    if page.published_at is not None:
+        return page.published_at.date().isoformat()
+    match = re.search(r"/(20\d{2})(0[1-9]|1[0-2])(?:/|\d{2}/)", page.url)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}"
+    match = re.search(
+        r"(?:发布日期|发布时间)\s*[:：]?\s*(20\d{2})[-年/]"
+        r"(0?[1-9]|1[0-2])(?:[-月/](0?[1-9]|[12]\d|3[01]))?",
+        page.raw_content[:1000],
+    )
+    if match:
+        suffix = f"-{int(match.group(3)):02d}" if match.group(3) else ""
+        return f"{match.group(1)}-{int(match.group(2)):02d}{suffix}"
+    return None
 
 
 def verify_identity_evidence(
