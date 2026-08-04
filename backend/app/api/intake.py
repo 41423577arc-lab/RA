@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.database import IntakeSessionRepository, get_session
+from app.database import IntakeSessionRepository, TaskRepository, get_session
 from app.models.database import IntakeAudioJob, IntakeSession, ResearchTask
 from app.schemas.intake import (
     IntakeActivityResponse,
@@ -43,11 +43,18 @@ from app.tasks.intake_audio import run_intake_audio_transcription
 
 
 router = APIRouter(prefix="/api/v1/intake", tags=["intake"])
-intake_agent = IntakeAgent(StructuredLLM(settings))
+_default_intake_agent = IntakeAgent(StructuredLLM(settings))
+intake_agent = _default_intake_agent
 entity_candidates = IntakeEntityCandidateService(
     ProjectMcpClient(settings.mcp_server_url), TavilyClient(settings.tavily_api_key)
 )
 MAX_AUDIO_BYTES = 30 * 1024 * 1024
+
+
+def _agent_for(repository: IntakeSessionRepository) -> IntakeAgent:
+    if intake_agent is not _default_intake_agent:
+        return intake_agent
+    return IntakeAgent(StructuredLLM(settings, repository))
 
 
 def _has_resolved_entities(structured_context: dict) -> bool:
@@ -276,6 +283,7 @@ def chat(
     request: IntakeChatRequest, session: Session = Depends(get_session)
 ) -> IntakeChatResponse:
     repository = IntakeSessionRepository(session)
+    request_agent = _agent_for(repository)
     session_id = str(request.session_id)
     intake_activity.update(session_id, "THINKING", "大模型正在理解当前对话")
     intake_session = repository.get(session_id)
@@ -306,7 +314,7 @@ def chat(
             raise HTTPException(status_code=409, detail="音频当前不能确认转写")
 
     try:
-        result = intake_agent.respond(request)
+        result = request_agent.respond(request)
     except (LLMUnavailable, LLMCallFailed):
         result = _fallback_result(request)
 
@@ -373,6 +381,30 @@ def chat(
             )
             lookup_internal = getattr(entity_candidates, "lookup_internal", None)
             if callable(lookup_internal):
+                internal_arguments = {
+                    "person_mention": (
+                        candidate_context.people[0]
+                        if candidate_context.people
+                        else None
+                    ),
+                    "organization_mention": (
+                        candidate_context.organizations[0]
+                        if candidate_context.organizations
+                        else None
+                    ),
+                }
+                repository.log_execution_event(
+                    session_id,
+                    event_type="TOOL_REQUEST",
+                    node_name="mcp.find_entity_candidates",
+                    status="RUNNING",
+                    title="查询内部身份候选",
+                    detail="调用 MCP 工具 find_entity_candidates。",
+                    payload={
+                        "tool": "find_entity_candidates",
+                        "arguments": internal_arguments,
+                    },
+                )
                 intake_activity.update(
                     session_id,
                     "CALLING_TOOL",
@@ -381,6 +413,22 @@ def chat(
                 )
                 resolutions, confirmation = lookup_internal(
                     candidate_context, next_version, source_text
+                )
+                repository.log_execution_event(
+                    session_id,
+                    event_type="TOOL_RESPONSE",
+                    node_name="mcp.find_entity_candidates",
+                    status="SUCCESS",
+                    title="内部身份查询完成",
+                    detail=f"自动解析 {len(resolutions)} 个身份，仍有 {len(confirmation.items) if confirmation else 0} 个待确认项。",
+                    payload={
+                        "resolutions": resolutions,
+                        "confirmation": (
+                            confirmation.model_dump(mode="json")
+                            if confirmation
+                            else None
+                        ),
+                    },
                 )
             else:
                 resolutions, confirmation = entity_candidates.resolve(
@@ -396,7 +444,7 @@ def chat(
                     settings.llm_web_identity_threshold,
                 )
             tool_decision = None
-            follow_up = getattr(intake_agent, "follow_up", None)
+            follow_up = getattr(request_agent, "follow_up", None)
             if confirmation and settings.intake_react_enabled and callable(follow_up):
                 intake_activity.update(
                     session_id,
@@ -427,7 +475,7 @@ def chat(
                     pass
 
             external_normalizer = getattr(
-                intake_agent, "normalize_external_identity", None
+                request_agent, "normalize_external_identity", None
             )
             external_attempted = False
             if (
@@ -436,6 +484,38 @@ def chat(
                 and callable(external_normalizer)
             ):
                 external_attempted = True
+                person = (
+                    candidate_context.people[0]
+                    if candidate_context.people
+                    else None
+                )
+                organization = (
+                    candidate_context.organizations[0]
+                    if candidate_context.organizations
+                    else None
+                )
+                quoted_targets = " ".join(
+                    f'"{value}"' for value in (person, organization) if value
+                )
+                identity_query = (
+                    f"{quoted_targets} 完整姓名 企业全称 职位".strip()
+                )
+                repository.log_execution_event(
+                    session_id,
+                    event_type="SEARCH_REQUEST",
+                    node_name="intake_identity_web",
+                    status="RUNNING",
+                    title="联网补全关键人身份",
+                    detail="向 Tavily 提交身份补全搜索指令。",
+                    payload={
+                        "provider": "Tavily",
+                        "request": {
+                            "query": identity_query,
+                            "search_depth": "basic",
+                            "max_results": 5,
+                        },
+                    },
+                )
                 intake_activity.update(
                     session_id,
                     "CALLING_TOOL",
@@ -459,6 +539,22 @@ def chat(
                     "PROCESSING_TOOL_RESULT",
                     "大模型正在整理联网身份候选",
                     tool_name="search_key_person_identity_web",
+                )
+                repository.log_execution_event(
+                    session_id,
+                    event_type="SEARCH_RESPONSE",
+                    node_name="intake_identity_web",
+                    status="SUCCESS",
+                    title="联网身份补全完成",
+                    detail=f"当前仍有 {len(confirmation.items) if confirmation else 0} 个待确认项。",
+                    payload={
+                        "resolutions": resolutions,
+                        "confirmation": (
+                            confirmation.model_dump(mode="json")
+                            if confirmation
+                            else None
+                        ),
+                    },
                 )
             resolutions = _merge_resolutions(existing_resolutions, resolutions)
             resolutions = _align_resolution_relationships(
@@ -667,6 +763,7 @@ def confirm_intake_entities(
     session: Session = Depends(get_session),
 ) -> IntakeSessionResponse:
     repository = IntakeSessionRepository(session)
+    request_agent = _agent_for(repository)
     intake_session = repository.get(str(session_id), for_update=True)
     if intake_session is None:
         raise HTTPException(status_code=404, detail="信息采集会话不存在")
@@ -796,7 +893,7 @@ def confirm_intake_entities(
         missing_information=fallback_missing,
         next_action="PROPOSE_READY" if server_ready else "ASK_USER",
     )
-    assess_readiness = getattr(intake_agent, "assess_readiness", None)
+    assess_readiness = getattr(request_agent, "assess_readiness", None)
     if callable(assess_readiness):
         intake_activity.update(
             str(session_id),
@@ -956,5 +1053,13 @@ def start_analysis(
             raise
         return TaskCreated(task_id=UUID(task.id), input_type=task.input_type)
 
+    TaskRepository(session).log_execution_event(
+        task_id,
+        event_type="STATUS",
+        status=task.status,
+        title="研究任务已创建",
+        detail="录入会话已确认，研究任务等待分析服务接管。",
+        payload={"intake_session_id": intake_session.id},
+    )
     run_research_pipeline.delay(task_id)
     return TaskCreated(task_id=UUID(task.id), input_type=task.input_type)

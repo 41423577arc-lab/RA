@@ -344,6 +344,23 @@ class TaskCreated(BaseModel):
     input_type: Literal["text", "audio"]
 
 
+class ExecutionEventResponse(BaseModel):
+    sequence: int = Field(ge=1)
+    event_type: str
+    node_name: str | None = None
+    status: str | None = None
+    title: str
+    detail: str
+    payload: dict | list | str | None = None
+    created_at: datetime
+
+
+class ExecutionLogResponse(BaseModel):
+    task_id: UUID
+    latest_sequence: int = Field(ge=0)
+    events: list[ExecutionEventResponse] = Field(default_factory=list)
+
+
 class TaskResponse(BaseModel):
     task_id: UUID
     status: TaskStatus

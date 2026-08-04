@@ -134,6 +134,7 @@ class ResearchPipeline:
                 self.repository.update(task_id, extracted_info=extracted.model_dump(mode="json"))
 
                 understanding = self._with_fallback(
+                    task_id,
                     "understanding",
                     degraded,
                     lambda: self.agents.understanding(task_id, input_text, extracted),
@@ -173,6 +174,7 @@ class ResearchPipeline:
 
             self.repository.update(task_id, status="PLANNING_WEB_SEARCH")
             web_plan = self._with_fallback(
+                task_id,
                 "web_plan",
                 degraded,
                 lambda: self.agents.web_plan(task_id, context),
@@ -193,6 +195,7 @@ class ResearchPipeline:
             self.repository.update(task_id, status="VERIFYING_WEB_RESULTS")
             if pages:
                 verifications = self._with_fallback(
+                    task_id,
                     "web_verify",
                     degraded,
                     lambda: validate_web_results(
@@ -224,6 +227,7 @@ class ResearchPipeline:
 
             self.repository.update(task_id, status="PLANNING_PROJECT_SEARCH")
             project_plan = self._with_fallback(
+                task_id,
                 "project_query",
                 degraded,
                 lambda: self.agents.project_query(task_id, context),
@@ -237,19 +241,63 @@ class ResearchPipeline:
             self.repository.update(task_id, status="PROJECT_SEARCHING")
             project_results: list[ProjectResult] = []
             internal_search_status = "SUCCESS"
+            project_arguments = {
+                "person_names": project_plan.person_names,
+                "organization_names": project_plan.organization_names,
+                "keywords": unique_non_empty(
+                    [*project_plan.project_names, *project_plan.business_terms]
+                ),
+            }
+            self._record_event(
+                task_id,
+                event_type="TOOL_REQUEST",
+                node_name="mcp.search_projects",
+                status="RUNNING",
+                title="查询内部项目",
+                detail="调用 MCP 工具 search_projects。",
+                payload={
+                    "tool": "search_projects",
+                    "arguments": project_arguments,
+                },
+            )
             try:
                 project_results = asyncio.run(
                     self.projects.search_projects(
-                        project_plan.person_names,
-                        project_plan.organization_names,
-                        unique_non_empty([*project_plan.project_names, *project_plan.business_terms]),
+                        project_arguments["person_names"],
+                        project_arguments["organization_names"],
+                        project_arguments["keywords"],
                     )
                 )
                 project_results = [
                     item for item in project_results if item.status in project_plan.statuses
                 ]
-            except Exception:
+                self._record_event(
+                    task_id,
+                    event_type="TOOL_RESPONSE",
+                    node_name="mcp.search_projects",
+                    status="SUCCESS",
+                    title="内部项目查询完成",
+                    detail=f"返回 {len(project_results)} 个符合状态条件的项目。",
+                    payload={
+                        "results": [
+                            item.model_dump(mode="json") for item in project_results
+                        ]
+                    },
+                )
+            except Exception as exc:
                 internal_search_status = "FAILED"
+                self._record_event(
+                    task_id,
+                    event_type="TOOL_ERROR",
+                    node_name="mcp.search_projects",
+                    status="FAILED",
+                    title="内部项目查询失败",
+                    detail=str(exc)[:1000],
+                    payload={
+                        "tool": "search_projects",
+                        "arguments": project_arguments,
+                    },
+                )
             self.repository.update(
                 task_id,
                 internal_results=[item.model_dump(mode="json") for item in project_results],
@@ -258,6 +306,7 @@ class ResearchPipeline:
 
             self.repository.update(task_id, status="RERANKING_PROJECTS")
             rankings = self._with_fallback(
+                task_id,
                 "project_rerank",
                 degraded,
                 lambda: validate_rankings(
@@ -277,6 +326,7 @@ class ResearchPipeline:
                 claims, project_results, rankings
             )
             analysis = self._with_fallback(
+                task_id,
                 "association",
                 degraded,
                 lambda: validate_analysis(
@@ -302,6 +352,7 @@ class ResearchPipeline:
                 context,
             )
             report_content = self._with_fallback(
+                task_id,
                 "report_content",
                 degraded,
                 lambda: validate_report_content(
@@ -343,19 +394,41 @@ class ResearchPipeline:
                 error_message=None,
             )
         except Exception as exc:
+            self._record_event(
+                task_id,
+                event_type="PIPELINE_ERROR",
+                node_name="research_pipeline",
+                status="FAILED",
+                title="研究流水线执行失败",
+                detail=str(exc)[:1000],
+                payload={"error_type": type(exc).__name__},
+            )
             self.repository.update(task_id, status="FAILED", error_message=str(exc), degraded_nodes=degraded)
         finally:
             if audio_path:
                 audio_path.unlink(missing_ok=True)
                 audio_path.with_suffix(".wav").unlink(missing_ok=True)
 
-    def _with_fallback(self, node_name: str, degraded: list[str], call, fallback):
+    def _with_fallback(self, task_id: str, node_name: str, degraded: list[str], call, fallback):
         try:
             return call()
-        except Exception:
+        except Exception as exc:
             if node_name not in degraded:
                 degraded.append(node_name)
+            self._record_event(
+                task_id,
+                event_type="FALLBACK",
+                node_name=node_name,
+                status="DEGRADED",
+                title=f"节点已降级：{node_name}",
+                detail=str(exc)[:1000],
+            )
             return fallback()
+
+    def _record_event(self, task_id: str, **values) -> None:
+        logger = getattr(self.repository, "log_execution_event", None)
+        if logger is not None:
+            logger(task_id, **values)
 
     def _run_web(
         self, task_id: str, queries: list[WebSearchQuery]
@@ -366,6 +439,31 @@ class ResearchPipeline:
         web_fetch_status = "SKIPPED"
         if queries:
             self.repository.update(task_id, status="WEB_SEARCHING")
+            self._record_event(
+                task_id,
+                event_type="SEARCH_REQUEST",
+                node_name="tavily_search",
+                status="RUNNING",
+                title="执行公开网络搜索",
+                detail=f"向 Tavily 提交 {len(queries)} 条搜索指令。",
+                payload={
+                    "provider": "Tavily",
+                    "requests": [
+                        {
+                            "query": item.query,
+                            "purpose": item.purpose,
+                            "target_person": item.target_person,
+                            "target_organization": item.target_organization,
+                            "request": {
+                                "query": item.query,
+                                "search_depth": "basic",
+                                "max_results": 5,
+                            },
+                        }
+                        for item in queries
+                    ],
+                },
+            )
             try:
                 search_results = asyncio.run(
                     self.web.search([item.query for item in queries])
@@ -379,8 +477,29 @@ class ResearchPipeline:
                         item.target_person = target.target_person
                         item.target_organization = target.target_organization
                 web_search_status = "SUCCESS"
-            except Exception:
+                self._record_event(
+                    task_id,
+                    event_type="SEARCH_RESPONSE",
+                    node_name="tavily_search",
+                    status="SUCCESS",
+                    title="公开网络搜索完成",
+                    detail=f"获得 {len(search_results)} 条去重结果。",
+                    payload={
+                        "results": [
+                            item.model_dump(mode="json") for item in search_results
+                        ]
+                    },
+                )
+            except Exception as exc:
                 web_search_status = "FAILED"
+                self._record_event(
+                    task_id,
+                    event_type="TOOL_ERROR",
+                    node_name="tavily_search",
+                    status="FAILED",
+                    title="公开网络搜索失败",
+                    detail=str(exc)[:1000],
+                )
             self.repository.update(
                 task_id,
                 web_results=[item.model_dump(mode="json") for item in search_results],
@@ -388,6 +507,21 @@ class ResearchPipeline:
             )
             if search_results:
                 self.repository.update(task_id, status="WEB_FETCHING")
+                self._record_event(
+                    task_id,
+                    event_type="SEARCH_REQUEST",
+                    node_name="tavily_extract",
+                    status="RUNNING",
+                    title="抓取候选网页正文",
+                    detail=f"向 Tavily Extract 提交 {len(search_results)} 个 URL。",
+                    payload={
+                        "provider": "Tavily",
+                        "request": {
+                            "urls": [item.url for item in search_results],
+                            "extract_depth": "basic",
+                        },
+                    },
+                )
                 extracted_pages: list[WebPage] = []
                 try:
                     extracted_pages = asyncio.run(self.web.extract(search_results))
@@ -403,8 +537,16 @@ class ResearchPipeline:
                             page.target_organization or source.target_organization
                         )
                         page.search_snippet = page.search_snippet or source.content
-                except Exception:
+                except Exception as exc:
                     web_fetch_status = "FAILED"
+                    self._record_event(
+                        task_id,
+                        event_type="TOOL_ERROR",
+                        node_name="tavily_extract",
+                        status="FAILED",
+                        title="网页正文抓取失败",
+                        detail=str(exc)[:1000],
+                    )
                 pages = list(extracted_pages)
                 extracted_urls = {page.url for page in extracted_pages}
                 pages.extend(
@@ -432,6 +574,27 @@ class ResearchPipeline:
                     web_fetch_status = "SNIPPET_FALLBACK"
                 else:
                     web_fetch_status = "FAILED"
+                self._record_event(
+                    task_id,
+                    event_type="SEARCH_RESPONSE",
+                    node_name="tavily_extract",
+                    status=web_fetch_status,
+                    title="网页正文处理完成",
+                    detail=f"形成 {len(pages)} 个可供核验的页面。",
+                    payload={
+                        "pages": [
+                            {
+                                "web_result_id": page.web_result_id,
+                                "title": page.title,
+                                "url": page.url,
+                                "query": page.query,
+                                "content_source": page.content_source,
+                                "content_length": len(page.raw_content),
+                            }
+                            for page in pages
+                        ]
+                    },
+                )
             self.repository.update(
                 task_id,
                 web_pages=[item.model_dump(mode="json") for item in pages],

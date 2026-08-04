@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -14,6 +14,8 @@ from app.schemas.task import (
     ConfirmationRequest,
     ConfirmedContext,
     ExtractedInfo,
+    ExecutionEventResponse,
+    ExecutionLogResponse,
     IntentUnderstanding,
     ProjectQueryPlan,
     ProjectRanking,
@@ -112,6 +114,37 @@ def get_task(task_id: UUID, session: Session = Depends(get_session)) -> TaskResp
         report_markdown=task.report_markdown,
         degraded_nodes=task.degraded_nodes or [],
         error_message=task.error_message,
+    )
+
+
+@router.get("/{task_id}/execution-log", response_model=ExecutionLogResponse)
+def get_execution_log(
+    task_id: UUID,
+    after_sequence: int = Query(default=0, ge=0),
+    session: Session = Depends(get_session),
+) -> ExecutionLogResponse:
+    repository = TaskRepository(session)
+    task = repository.get(str(task_id))
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    scope_ids = [item for item in (task.intake_session_id, task.id) if item]
+    events = repository.list_execution_events(scope_ids, after_sequence=after_sequence)
+    return ExecutionLogResponse(
+        task_id=task_id,
+        latest_sequence=max([after_sequence, *(event.id for event in events)]),
+        events=[
+            ExecutionEventResponse(
+                sequence=event.id,
+                event_type=event.event_type,
+                node_name=event.node_name,
+                status=event.status,
+                title=event.title,
+                detail=event.detail,
+                payload=event.payload,
+                created_at=event.created_at,
+            )
+            for event in events
+        ],
     )
 
 

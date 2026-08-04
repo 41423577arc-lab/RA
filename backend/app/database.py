@@ -4,7 +4,7 @@ from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
-from app.models.database import Base, IntakeSession, LlmCallLog, ResearchTask
+from app.models.database import Base, ExecutionEvent, IntakeSession, LlmCallLog, ResearchTask
 
 
 engine = create_engine(settings.database_url, pool_pre_ping=True)
@@ -82,6 +82,13 @@ class TaskRepository:
         self.session.add(task)
         self.session.commit()
         self.session.refresh(task)
+        self.log_execution_event(
+            task.id,
+            event_type="STATUS",
+            status=task.status,
+            title="任务已创建",
+            detail="研究任务已写入数据库，等待分析服务接管。",
+        )
         return task
 
     def get(self, task_id: str) -> ResearchTask | None:
@@ -91,15 +98,47 @@ class TaskRepository:
         task = self.get(task_id)
         if task is None:
             raise KeyError(f"Task {task_id} not found")
+        previous_status = task.status
         for key, value in values.items():
             setattr(task, key, value)
         self.session.commit()
         self.session.refresh(task)
+        next_status = values.get("status")
+        if isinstance(next_status, str) and next_status != previous_status:
+            self.log_execution_event(
+                task_id,
+                event_type="STATUS",
+                status=next_status,
+                title="执行阶段更新",
+                detail=f"{previous_status} -> {next_status}",
+            )
         return task
 
     def log_llm_call(self, task_id: str, **values: object) -> None:
         self.session.add(LlmCallLog(task_id=task_id, **values))
         self.session.commit()
+
+    def log_execution_event(self, scope_id: str, **values: object) -> ExecutionEvent:
+        event = ExecutionEvent(scope_id=scope_id, **values)
+        self.session.add(event)
+        self.session.commit()
+        self.session.refresh(event)
+        return event
+
+    def list_execution_events(
+        self, scope_ids: list[str], *, after_sequence: int = 0
+    ) -> list[ExecutionEvent]:
+        if not scope_ids:
+            return []
+        statement = (
+            select(ExecutionEvent)
+            .where(
+                ExecutionEvent.scope_id.in_(scope_ids),
+                ExecutionEvent.id > after_sequence,
+            )
+            .order_by(ExecutionEvent.id)
+        )
+        return list(self.session.scalars(statement))
 
 
 class IntakeSessionRepository:
@@ -127,3 +166,6 @@ class IntakeSessionRepository:
         self.session.commit()
         self.session.refresh(intake_session)
         return intake_session
+
+    def log_execution_event(self, scope_id: str, **values: object) -> ExecutionEvent:
+        return TaskRepository(self.session).log_execution_event(scope_id, **values)

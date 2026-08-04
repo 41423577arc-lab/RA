@@ -40,6 +40,21 @@ type IntakeAudioJob = {
   error_message?: string;
   retry_count: number;
 };
+type ExecutionEvent = {
+  sequence: number;
+  event_type: string;
+  node_name?: string;
+  status?: string;
+  title: string;
+  detail: string;
+  payload?: Record<string, unknown> | unknown[] | string;
+  created_at: string;
+};
+type ExecutionLogResponse = {
+  task_id: string;
+  latest_sequence: number;
+  events: ExecutionEvent[];
+};
 
 type Person = { name?: string; organization?: string; title?: string };
 type EntityMention = {
@@ -212,6 +227,10 @@ type ActivityEntry = {
   label: string;
   detail: string;
   lines?: string[];
+  eventType?: string;
+  nodeName?: string;
+  payload?: ExecutionEvent["payload"];
+  createdAt?: string;
 };
 
 function activityEntry(task: Task, status: string): ActivityEntry {
@@ -306,6 +325,18 @@ function buildActivityEntries(task: Task): ActivityEntry[] {
     : activityEntry(task, status));
 }
 
+function persistedActivityEntries(events: ExecutionEvent[]): ActivityEntry[] {
+  return events.map((event) => ({
+    status: event.status ?? event.event_type,
+    label: event.title,
+    detail: event.detail,
+    eventType: event.event_type,
+    nodeName: event.node_name,
+    payload: event.payload,
+    createdAt: event.created_at
+  }));
+}
+
 function safeReportUrl(url: string) {
   return /^https?:\/\//i.test(url) ? url : "";
 }
@@ -328,17 +359,43 @@ export default function Home() {
   const [error, setError] = useState("");
   const [reportTab, setReportTab] = useState<ReportTab>("detailed");
   const [taskView, setTaskView] = useState<TaskView>("activity");
+  const [executionEvents, setExecutionEvents] = useState<ExecutionEvent[]>([]);
   const [selections, setSelections] = useState<Record<string, string>>({});
   const [manualValues, setManualValues] = useState<Record<string, string>>({});
   const chatThreadRef = useRef<HTMLDivElement | null>(null);
+  const executionCursorRef = useRef(0);
+  const executionTaskRef = useRef<string | null>(null);
+
+  const fetchExecutionLog = useCallback(async (taskId: string) => {
+    if (executionTaskRef.current !== taskId) {
+      executionTaskRef.current = taskId;
+      executionCursorRef.current = 0;
+      setExecutionEvents([]);
+    }
+    const response = await fetch(
+      `${API_BASE}/api/v1/tasks/${taskId}/execution-log?after_sequence=${executionCursorRef.current}`
+    );
+    if (!response.ok) throw new Error("执行日志获取失败");
+    const payload = (await response.json()) as ExecutionLogResponse;
+    if (executionTaskRef.current !== taskId) return;
+    executionCursorRef.current = Math.max(executionCursorRef.current, payload.latest_sequence);
+    if (payload.events.length) {
+      setExecutionEvents((current) => {
+        const merged = new Map(current.map((event) => [event.sequence, event]));
+        payload.events.forEach((event) => merged.set(event.sequence, event));
+        return [...merged.values()].sort((left, right) => left.sequence - right.sequence);
+      });
+    }
+  }, []);
 
   const fetchTask = useCallback(async (taskId: string) => {
     const response = await fetch(`${API_BASE}/api/v1/tasks/${taskId}`);
     if (!response.ok) throw new Error("任务状态获取失败");
     const nextTask = (await response.json()) as Task;
     setTask(nextTask);
+    await fetchExecutionLog(taskId);
     return nextTask;
-  }, []);
+  }, [fetchExecutionLog]);
 
   useEffect(() => {
     const sessionId = window.localStorage.getItem(INTAKE_SESSION_STORAGE_KEY);
@@ -527,6 +584,9 @@ export default function Home() {
       return;
     }
     setTask(null);
+    setExecutionEvents([]);
+    executionCursorRef.current = 0;
+    executionTaskRef.current = null;
     setError("");
     setChatMessages([INITIAL_MESSAGE]);
     setChatInput("");
@@ -660,7 +720,11 @@ export default function Home() {
     setAudioJob(payload as IntakeAudioJob);
   };
 
-  const taskActivityEntries = task ? buildActivityEntries(task) : [];
+  const taskActivityEntries = task
+    ? executionEvents.length
+      ? persistedActivityEntries(executionEvents)
+      : buildActivityEntries(task)
+    : [];
   const reportReady = Boolean(task?.status === "COMPLETED" && (task.detailed_report_markdown || task.report_markdown));
   const currentStatusIndex = task ? ANALYSIS_STATUS_ORDER.indexOf(task.status) : -1;
 
@@ -948,23 +1012,47 @@ export default function Home() {
                   </header>
                   <ol className="log-list">
                     {taskActivityEntries.map((entry, index) => {
-                      const isCurrent = entry.status === task.status;
-                      const isFailed = entry.status === "FAILED";
+                      const isCurrent = index === taskActivityEntries.length - 1 && !TERMINAL.has(task.status);
+                      const isFailed = entry.status === "FAILED" || entry.eventType === "TOOL_ERROR";
+                      const isWarning = entry.status === "DEGRADED" || entry.eventType === "FALLBACK" || entry.eventType === "LLM_ERROR";
                       return (
-                        <li key={`${entry.status}-${index}`} className={isCurrent ? "current" : isFailed ? "failed" : "complete"}>
+                        <li
+                          key={`${entry.status}-${index}`}
+                          className={isFailed ? "failed" : isWarning ? "warning" : isCurrent ? "current" : "complete"}
+                        >
                           <span className="log-marker" aria-hidden="true">
-                            {isFailed ? <AlertCircle size={15} /> : isCurrent && !TERMINAL.has(task.status) ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}
+                            {isFailed || isWarning ? <AlertCircle size={15} /> : isCurrent ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}
                           </span>
                           <div className="log-entry">
                             <div className="log-entry-heading">
                               <strong>{entry.label}</strong>
-                              <span>{String(index + 1).padStart(2, "0")}</span>
+                              <span>
+                                {entry.createdAt
+                                  ? new Date(entry.createdAt).toLocaleTimeString("zh-CN", { hour12: false })
+                                  : String(index + 1).padStart(2, "0")}
+                              </span>
                             </div>
+                            {(entry.eventType || entry.nodeName) && (
+                              <div className="log-meta">
+                                {entry.eventType && <span>{entry.eventType}</span>}
+                                {entry.nodeName && <span>{entry.nodeName}</span>}
+                              </div>
+                            )}
                             <p>{entry.detail}</p>
                             {entry.lines && entry.lines.length > 0 && (
                               <ul>
                                 {entry.lines.map((line, lineIndex) => <li key={`${entry.status}-${lineIndex}`}>{line}</li>)}
                               </ul>
+                            )}
+                            {entry.payload !== undefined && entry.payload !== null && (
+                              <details className="log-payload">
+                                <summary>查看完整指令与数据</summary>
+                                <pre>
+                                  {typeof entry.payload === "string"
+                                    ? entry.payload
+                                    : JSON.stringify(entry.payload, null, 2)}
+                                </pre>
+                              </details>
                             )}
                           </div>
                         </li>

@@ -106,3 +106,17 @@ class LlmCallLog(Base):
     error_type: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ExecutionEvent(Base):
+    __tablename__ = "execution_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    scope_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    node_name: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str | None] = mapped_column(String(32))
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    detail: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    payload: Mapped[dict | list | str | None] = mapped_column(INTAKE_JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
