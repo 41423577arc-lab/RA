@@ -325,7 +325,7 @@ class GeneratedReportContent(BaseModel):  # 结构化报告内容模型
     task_overview: list[EvidenceBackedItem] = Field(default_factory=list)
     person_and_company_summary: list[EvidenceBackedItem] = Field(default_factory=list)
     public_information_summary: list[EvidenceBackedItem] = Field(default_factory=list)
-    priority_projects: list[EvidenceBackedItem] = Field(default_factory=list)
+    priority_projects: list[EvidenceBackedItem] = Field(default_factory=list, max_length=3)
     resource_analysis: list[EvidenceBackedItem] = Field(default_factory=list)
     recommended_topics: list[EvidenceBackedItem] = Field(default_factory=list)
     advancement_advice: list[EvidenceBackedItem] = Field(default_factory=list)

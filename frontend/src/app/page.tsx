@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 type InputType = "text" | "audio";
 type ReportTab = "detailed" | "action";
@@ -1450,7 +1451,7 @@ export default function Home() {
                     <div className="degraded-banner">部分智能分析已降级，报告保留可验证的规则、网页和内部项目结果。</div>
                   )}
                   <article className="report">
-                    <ReactMarkdown urlTransform={safeReportUrl}>
+                    <ReactMarkdown remarkPlugins={[remarkGfm]} urlTransform={safeReportUrl}>
                       {reportTab === "action" ? task.action_brief_markdown ?? "暂无行动说明" : task.detailed_report_markdown ?? task.report_markdown ?? ""}
                     </ReactMarkdown>
                   </article>

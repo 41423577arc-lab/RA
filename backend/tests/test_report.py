@@ -13,7 +13,7 @@ from app.schemas.task import (
     ProjectResult,
     PublicClaim,
 )
-from app.services.agent_nodes import validate_report_content
+from app.services.agent_nodes import build_person_identity_summaries, validate_report_content
 from app.services.report_renderer import ReportRenderer
 
 
@@ -79,9 +79,29 @@ def test_generated_report_enforces_section_meaning_and_business_labels() -> None
         evidence_refs=["PROJECT:P001"],
         confidence=0.99,
     )
+    identity_fact = EvidenceBackedItem(
+        text="王传福现任比亚迪股份有限公司董事长兼总裁，负责公司经营管理。",
+        statement_type="FACT",
+        evidence_refs=["CONFIRMATION:1"],
+        confidence=1,
+    )
     content = GeneratedReportContent(
         task_overview=[project_fact, project_fact],
-        person_and_company_summary=[],
+        person_and_company_summary=[
+            EvidenceBackedItem(
+                text="王传福近期参加公司会议。",
+                statement_type="FACT",
+                evidence_refs=["CONFIRMATION:1"],
+                confidence=1,
+            ),
+            identity_fact,
+            EvidenceBackedItem(
+                text="比亚迪股份有限公司管理层还包括其他成员。",
+                statement_type="FACT",
+                evidence_refs=["CONFIRMATION:1"],
+                confidence=1,
+            ),
+        ],
         public_information_summary=[project_fact],
         priority_projects=[project_fact, project_fact],
         resource_analysis=[],
@@ -102,6 +122,7 @@ def test_generated_report_enforces_section_meaning_and_business_labels() -> None
     assert len(validated.task_overview) == 2
     assert validated.task_overview[0].text == "今晚在深圳与王传福进行宴请。"
     assert all("P001" not in item.text for item in validated.task_overview)
+    assert validated.person_and_company_summary == [identity_fact]
     assert validated.public_information_summary == []
     assert len(validated.priority_projects) == 1
     assert validated.priority_projects[0].text == "P001 状态为在建，尚未记录结束日期。"
@@ -116,9 +137,133 @@ def test_generated_report_enforces_section_meaning_and_business_labels() -> None
         validated, [], [project], "SUCCESS", "SUCCESS", "SUCCESS"
     )
 
-    assert "## 活动或任务概况" in report
+    assert "## 会面概况" in report
+    assert "## 关键人及企业" in report
+    assert "## 公开信息" in report
+    assert "## 重点项目与可用资源" in report
+    assert "## 会谈行动建议" in report
+    assert "### 建议讨论" in report
+    assert "### 推动动作" in report
+    assert "### 会前准备" in report
+    assert "## 风险与信息缺口" in report
     assert "今晚在深圳与王传福进行宴请" in report
+    assert "| 类型 | 内容 | 来源 |" in report
+    assert "| 重点项目 | P001 状态为在建" in report
+    assert "内部项目 `P001`" in report
     assert "P001`-" not in report
     assert "ACTIVE" not in report
     assert "end_date" not in report
-    assert "状态：在建" in report
+    assert "P001 状态为在建" in report
+
+
+def test_generated_report_numbers_and_deduplicates_web_sources() -> None:
+    context = ConfirmedContext(
+        intents=["MEETING_PREPARATION"],
+        entities=[
+            ConfirmedEntity(
+                entity_type="PERSON",
+                canonical_name="范玉峰",
+                organization="中建二局安装公司",
+                title="党委书记、董事长",
+                confirmed_by="AUTO",
+            )
+        ],
+        event_type="会议",
+    )
+    claims = [
+        PublicClaim(
+            web_result_id="W001",
+            evidence_id="E001",
+            subject="范玉峰",
+            claim="范玉峰现任中建二局安装公司党委书记、董事长。",
+            source_title="公司领导",
+            source_url="https://example.com/leader",
+        ),
+        PublicClaim(
+            web_result_id="W001",
+            evidence_id="E002",
+            subject="范玉峰",
+            claim="范玉峰负责生产经营。",
+            source_title="公司领导",
+            source_url="https://example.com/leader",
+        ),
+        PublicClaim(
+            web_result_id="W002",
+            evidence_id="E001",
+            subject="范玉峰",
+            claim="范玉峰负责对外商务拓展。",
+            source_title="公司要闻",
+            source_url="https://example.com/news",
+        ),
+    ]
+    item = EvidenceBackedItem(
+        text="范玉峰现任中建二局安装公司党委书记、董事长。",
+        statement_type="FACT",
+        evidence_refs=["WEB:W001:E001", "WEB:W001:E002", "WEB:W002:E001"],
+        confidence=1,
+    )
+    content = GeneratedReportContent(
+        task_overview=[],
+        person_and_company_summary=[item],
+        public_information_summary=[],
+        priority_projects=[],
+        resource_analysis=[],
+        recommended_topics=[],
+        advancement_advice=[],
+        preparation_items=[],
+        gaps_and_risks=[],
+        action_brief=ActionBrief(objective="确认会面事项"),
+    )
+    renderer = ReportRenderer(
+        ROOT / "backend/templates/report.md.j2",
+        ROOT / "backend/templates/detailed_report.md.j2",
+        ROOT / "backend/templates/action_brief.md.j2",
+    )
+
+    report, _ = renderer.render_generated(
+        content, claims, [], "SUCCESS", "SUCCESS", "SUCCESS"
+    )
+
+    assert "[¹](https://example.com/leader)" in report
+    assert "[²](https://example.com/news)" in report
+    assert "[来源1](https://example.com/leader)" in report
+    assert "[来源2](https://example.com/news)" in report
+    assert "来源3" not in report
+
+
+def test_person_identity_summary_rejects_activity_only_candidate() -> None:
+    context = ConfirmedContext(
+        intents=["PERSON_BACKGROUND_RESEARCH"],
+        entities=[
+            ConfirmedEntity(
+                entity_type="PERSON",
+                canonical_name="范玉峰",
+                organization="中建二局安装公司",
+                title="党委书记、董事长",
+                confirmed_by="AUTO",
+            )
+        ],
+        event_type="会议",
+    )
+    activity = EvidenceBackedItem(
+        text="范玉峰近期参加公司会议和节前检查。",
+        statement_type="FACT",
+        evidence_refs=["WEB:W001:E001"],
+        confidence=1,
+    )
+    claims = [
+        PublicClaim(
+            web_result_id="W001",
+            evidence_id="E001",
+            subject="范玉峰",
+            claim=activity.text,
+            source_title="公司要闻",
+            source_url="https://example.com/news",
+        )
+    ]
+
+    summaries = build_person_identity_summaries(context, claims, [activity])
+
+    assert len(summaries) == 1
+    assert summaries[0].text == "范玉峰现任中建二局安装公司党委书记、董事长。"
+    assert summaries[0].evidence_refs == ["CONFIRMATION:1"]
