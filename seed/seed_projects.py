@@ -80,6 +80,12 @@ def seed_sales_organization(connection, rows: list[dict[str, str]]) -> None:
 
 
 def seed_customers_and_contacts(connection, rows: list[dict[str, str]]) -> None:
+    customer_by_id_statement = text(
+        "SELECT customer_id FROM customers WHERE customer_id = :customer_id"
+    )
+    customer_by_name_statement = text(
+        "SELECT customer_id FROM customers WHERE customer_name = :customer_name"
+    )
     customer_statement = text(
         """
         INSERT INTO customers (
@@ -111,8 +117,31 @@ def seed_customers_and_contacts(connection, rows: list[dict[str, str]]) -> None:
         """
     )
     for row in rows:
-        connection.execute(customer_statement, row)
-        connection.execute(contact_statement, row)
+        customer_id_by_id = connection.scalar(customer_by_id_statement, row)
+        customer_id_by_name = connection.scalar(customer_by_name_statement, row)
+        if (
+            customer_id_by_id
+            and customer_id_by_name
+            and customer_id_by_id != customer_id_by_name
+        ):
+            raise ValueError(
+                "Seed customer identity conflict: "
+                f"{row['customer_id']} and {row['customer_name']} resolve to different customers"
+            )
+
+        resolved_customer_id = customer_id_by_name or customer_id_by_id
+        if customer_id_by_name and customer_id_by_name != row["customer_id"]:
+            print(
+                "Reusing existing customer "
+                f"{customer_id_by_name} for seed customer {row['customer_id']} "
+                f"({row['customer_name']})"
+            )
+        else:
+            connection.execute(customer_statement, row)
+            resolved_customer_id = row["customer_id"]
+
+        contact_row = {**row, "customer_id": resolved_customer_id}
+        connection.execute(contact_statement, contact_row)
 
 
 def seed_projects(connection, rows, vectors, details_by_project) -> None:
