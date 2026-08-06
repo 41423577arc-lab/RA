@@ -526,30 +526,8 @@ def fallback_report_content(
     people = [entity.canonical_name for entity in context.entities if entity.entity_type == "PERSON"]
     return GeneratedReportContent(
         task_overview=build_task_overview(context),
-        person_and_company_summary=(
-            [
-                EvidenceBackedItem(
-                    text=claim.claim,
-                    statement_type="FACT",
-                    evidence_refs=[f"WEB:{claim.web_result_id}:{claim.evidence_id}"],
-                    confidence=claim.confidence,
-                )
-                for claim in claims[:5]
-            ]
-            or [
-                EvidenceBackedItem(
-                    text=(
-                        f"已确认目标人物：{entity.canonical_name}"
-                        + (f"，所属企业：{entity.organization}" if entity.organization else "")
-                        + (f"，职位：{entity.title}" if entity.title else "")
-                    ),
-                    statement_type="FACT",
-                    evidence_refs=["CONFIRMATION:1"],
-                    confidence=1,
-                )
-                for entity in context.entities
-                if entity.entity_type == "PERSON"
-            ]
+        person_and_company_summary=build_person_identity_summaries(
+            context, claims, []
         ),
         public_information_summary=[
             EvidenceBackedItem(
@@ -607,10 +585,11 @@ def validate_report_content(
                 break
         return output
 
+    person_items = clean(content.person_and_company_summary, allowed)
     updates = {
         "task_overview": build_task_overview(context),
-        "person_and_company_summary": clean(
-            content.person_and_company_summary, allowed
+        "person_and_company_summary": build_person_identity_summaries(
+            context, claims, person_items
         ),
         "public_information_summary": clean(
             content.public_information_summary, web_refs
@@ -635,6 +614,71 @@ def validate_report_content(
         }
     )
     return content.model_copy(update=updates)
+
+
+def build_person_identity_summaries(
+    context: ConfirmedContext,
+    claims: list[PublicClaim],
+    candidates: list[EvidenceBackedItem],
+) -> list[EvidenceBackedItem]:
+    summaries: list[EvidenceBackedItem] = []
+    role_terms = ("现任", "担任", "职位", "负责", "分管", "书记", "董事", "总经理", "总裁")
+    activity_terms = ("参加", "出席", "调研", "会议", "学习", "检查", "慰问", "拜会")
+
+    for entity in context.entities:
+        if entity.entity_type != "PERSON":
+            continue
+        name = normalize(entity.canonical_name).casefold()
+        ranked: list[tuple[int, int, EvidenceBackedItem]] = []
+        for index, item in enumerate(candidates):
+            text = normalize(item.text).casefold()
+            if item.statement_type != "FACT" or name not in text:
+                continue
+            score = 4
+            if entity.organization and normalize(entity.organization).casefold() in text:
+                score += 3
+            if entity.title and normalize(entity.title).casefold() in text:
+                score += 3
+            score += 2 * sum(term in item.text for term in role_terms)
+            score -= 4 * sum(term in item.text for term in activity_terms)
+            ranked.append((score, -index, item))
+        best = max(ranked, key=lambda entry: (entry[0], entry[1])) if ranked else None
+        if best and best[0] >= 7:
+            summaries.append(best[2])
+            continue
+
+        refs = unique(
+            f"WEB:{claim.web_result_id}:{claim.evidence_id}"
+            for claim in claims
+            if normalize(claim.subject).casefold() == name
+            and (
+                not entity.organization
+                or normalize(entity.organization).casefold()
+                in normalize(claim.claim).casefold()
+            )
+            and (
+                not entity.title
+                or normalize(entity.title).casefold()
+                in normalize(claim.claim).casefold()
+            )
+        ) or ["CONFIRMATION:1"]
+        if entity.organization and entity.title:
+            text = f"{entity.canonical_name}现任{entity.organization}{entity.title}。"
+        elif entity.organization:
+            text = f"{entity.canonical_name}所属企业为{entity.organization}。"
+        elif entity.title:
+            text = f"{entity.canonical_name}现任{entity.title}。"
+        else:
+            text = f"已确认目标人物为{entity.canonical_name}。"
+        summaries.append(
+            EvidenceBackedItem(
+                text=text,
+                statement_type="FACT",
+                evidence_refs=refs,
+                confidence=1,
+            )
+        )
+    return summaries
 
 
 def complete_analysis(

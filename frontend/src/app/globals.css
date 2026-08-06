@@ -291,12 +291,18 @@ textarea::placeholder { color: #9ca49f; }
   font-size: 11px;
 }
 
-.report { padding: 26px 30px; line-height: 1.75; overflow-wrap: anywhere; }
+.report { padding: 26px 30px; line-height: 1.75; overflow-x: auto; overflow-wrap: anywhere; }
 .report h1 { margin: 0 0 24px; font-size: 23px; }
 .report h2 { margin: 28px 0 10px; padding-bottom: 7px; border-bottom: 1px solid #e2e6e3; font-size: 16px; }
 .report p, .report li { font-size: 14px; color: #334038; }
 .report ul { padding-left: 20px; }
 .report a { color: #176240; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.report table { width: 100%; min-width: 680px; margin: 14px 0 22px; border-collapse: collapse; font-size: 13px; }
+.report th, .report td { padding: 10px 12px; border: 1px solid #dce2dd; text-align: left; vertical-align: top; }
+.report th { background: #f3f6f4; color: #26332b; font-weight: 700; }
+.report td:first-child { width: 92px; white-space: nowrap; font-weight: 650; }
+.report td:last-child { width: 150px; }
+.report tbody tr:nth-child(even) { background: #fafbfa; }
 
 .confirmation-panel { margin-top: 14px; padding: 24px; background: #fff; border: 1px solid #dce2dd; border-radius: 7px; }
 .confirmation-panel h2 { margin: 7px 0 20px; font-size: 18px; }

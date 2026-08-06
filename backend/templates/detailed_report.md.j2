@@ -3,62 +3,65 @@
 {% macro items(values) %}
 {% if values %}
 {% for item in values %}
-- {{ item.text }}{% if item.statement_type != "FACT" %}（{{ "建议" if item.statement_type == "RECOMMENDATION" else "推测" }}）{% endif %}
-{% for ref in item.evidence_refs %}
-{% if ref in evidence_links %}  
-  来源：[{{ evidence_links[ref].label }}]({{ evidence_links[ref].url }})
-{% elif ref in project_refs %}  
-  内部项目：`{{ project_refs[ref].project_id }}`
+{% set sources = source_refs(item.evidence_refs) %}
+- {{ item.text }}{% if item.statement_type == "RECOMMENDATION" %}（建议）{% elif item.statement_type != "FACT" %}（推测）{% endif %}{% for source in sources.web %}[{{ source.marker }}]({{ source.url }}){% endfor %}{% if sources.web or sources.projects %}\
+  来源：{% for source in sources.web %}[{{ source.label }}]({{ source.url }}){% if not loop.last or sources.projects %}、{% endif %}{% endfor %}{% for project in sources.projects %}内部项目 `{{ project.project_id }}`{% if not loop.last %}、{% endif %}{% endfor %}
 {% endif %}
-{% endfor %}
-
 {% endfor %}
 {% else %}
 暂无可靠信息。
 {% endif %}
 {% endmacro %}
 
-## 活动或任务概况
+## 会面概况
 
 {{ items(content.task_overview) }}
 
-## 关键人身份核验
+## 关键人及企业
 
 {{ items(content.person_and_company_summary) }}
 
-## 公开信息与职责背景
+## 公开信息
 
-{% if web_search_failed %}公开信息检索失败。
-{% elif web_fetch_failed %}公开网页正文读取失败。
-{% else %}{{ items(content.public_information_summary) }}{% endif %}
+{% if web_search_failed %}
+公开信息检索失败，以下结论仅基于已确认信息。
+{% elif web_fetch_failed %}
+部分公开网页无法读取，公开信息可能不完整。
+{% else %}
+{{ items(content.public_information_summary) }}
+{% endif %}
 
-## 重点内部项目
+## 重点项目与可用资源
 
-{% if internal_search_failed %}公司内部项目信息检索失败。
-{% else %}{{ items(content.priority_projects) }}{% endif %}
+{% if internal_search_failed %}
+内部项目信息检索失败。
+{% elif content.priority_projects or content.resource_analysis %}
+| 类型 | 内容 | 来源 |
+| --- | --- | --- |
+{% for item in content.priority_projects %}{% set sources = source_refs(item.evidence_refs) %}
+| 重点项目 | {{ item.text | table_cell }}{% if item.statement_type == "RECOMMENDATION" %}（建议）{% elif item.statement_type != "FACT" %}（推测）{% endif %}{% for source in sources.web %}[{{ source.marker }}]({{ source.url }}){% endfor %} | {% for source in sources.web %}[{{ source.label }}]({{ source.url }}){% if not loop.last or sources.projects %}、{% endif %}{% endfor %}{% for project in sources.projects %}内部项目 `{{ project.project_id }}`{% if not loop.last %}、{% endif %}{% endfor %} |
+{% endfor %}
+{% for item in content.resource_analysis %}{% set sources = source_refs(item.evidence_refs) %}
+| 可用资源 | {{ item.text | table_cell }}{% if item.statement_type == "RECOMMENDATION" %}（建议）{% elif item.statement_type != "FACT" %}（推测）{% endif %}{% for source in sources.web %}[{{ source.marker }}]({{ source.url }}){% endfor %} | {% for source in sources.web %}[{{ source.label }}]({{ source.url }}){% if not loop.last or sources.projects %}、{% endif %}{% endfor %}{% for project in sources.projects %}内部项目 `{{ project.project_id }}`{% if not loop.last %}、{% endif %}{% endfor %} |
+{% endfor %}
+{% else %}
+暂无可靠信息。
+{% endif %}
 
-## 资源关联分析
+## 会谈行动建议
 
-{{ items(content.resource_analysis) }}
-
-## 推荐讨论话题
+### 建议讨论
 
 {{ items(content.recommended_topics) }}
 
-## 项目推动建议
+### 推动动作
 
 {{ items(content.advancement_advice) }}
 
-## 会前准备事项
+### 会前准备
 
 {{ items(content.preparation_items) }}
 
-## 信息缺口和风险提示
+## 风险与信息缺口
 
 {{ items(content.gaps_and_risks) }}
-
-## 内部项目明细
-
-{% if projects %}{% for project in projects %}
-- `{{ project.project_id }}` {{ project.project_name }}｜客户：{{ project.customer_name }}｜客户联系人：{{ project.contact_name or "未记录" }}{% if project.customer_contact_title %}（{{ project.customer_contact_title }}）{% endif %}{% if project.customer_contact_phone %}，{{ project.customer_contact_phone }}{% endif %}｜我方项目销售员：{{ project.owner_name }}{% if project.owner_phone %}，手机号：{{ project.owner_phone }}{% endif %}{% if project.owner_email %}，{{ project.owner_email }}{% endif %}{% if project.owner_manager_name %}｜上级：{{ project.owner_manager_name }}{% endif %}{% if project.owner_region %}（{{ project.owner_region }}）{% endif %}｜状态：{{ "在建" if project.status == "ACTIVE" else "已结项" }}{% if project.project_stage %}｜阶段：{{ project.project_stage }}{% endif %}{% if project.description %}｜项目情况：{{ project.description }}{% endif %}{{ "\n" }}
-{% endfor %}{% else %}未检索到相关内部项目。{% endif %}
