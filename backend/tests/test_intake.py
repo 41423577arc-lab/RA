@@ -32,6 +32,15 @@ from app.services.llm_client import LLMUnavailable
 from app.tasks.pipeline import context_from_intake_snapshot
 
 
+def _confirm_final_summary(client: TestClient, intake: dict) -> dict:
+    response = client.post(
+        f"/api/v1/intake/{intake['session_id']}/confirm-summary",
+        json={"expected_version": intake["final_confirmation"]["version"]},
+    )
+    assert response.status_code == 200
+    return response.json()
+
+
 class FakeIntakeAgent:
     def __init__(self):
         self.request = None
@@ -279,6 +288,12 @@ def test_get_repairs_existing_complete_session_to_ready() -> None:
                     "organizations": ["比亚迪股份有限公司"],
                     "projects": ["储能"],
                     "focus_questions": ["储能合作机会"],
+                    "event_type": "会议",
+                    "final_confirmation": {
+                        "version": 3,
+                        "question": "请确认当前会面信息。",
+                        "status": "CONFIRMED",
+                    },
                 },
                 missing_information=["具体物资类别"],
                 analysis_input="与比亚迪股份有限公司的王传福讨论储能。",
@@ -339,9 +354,11 @@ def test_start_analysis_is_idempotent_and_freezes_snapshot(monkeypatch) -> None:
             },
         )
         intake = created.json()
-        url = f"/api/v1/intake/{intake['session_id']}/start-analysis"
-        first = client.post(url, json={"expected_version": intake["version"]})
-        second = client.post(url, json={"expected_version": intake["version"]})
+        assert intake["status"] == "AWAITING_FINAL_CONFIRMATION"
+        ready = _confirm_final_summary(client, intake)
+        url = f"/api/v1/intake/{ready['session_id']}/start-analysis"
+        first = client.post(url, json={"expected_version": ready["version"]})
+        second = client.post(url, json={"expected_version": ready["version"]})
 
     assert first.status_code == 202
     assert second.status_code == 202
@@ -350,8 +367,8 @@ def test_start_analysis_is_idempotent_and_freezes_snapshot(monkeypatch) -> None:
     with SessionLocal() as session:
         task = session.get(ResearchTask, first.json()["task_id"])
         assert task is not None
-        assert task.intake_session_id == intake["session_id"]
-        assert task.input_snapshot["session_version"] == intake["version"]
+        assert task.intake_session_id == ready["session_id"]
+        assert task.input_snapshot["session_version"] == ready["version"]
         assert task.input_snapshot["structured_context"]["people"] == ["王传福"]
         assert task.input_snapshot["structured_context"]["requester_context"] == {
             "name": "林致远",
@@ -401,13 +418,17 @@ def test_external_candidate_requires_user_confirmation(monkeypatch) -> None:
         )
 
     assert confirmed.status_code == 200
-    assert confirmed.json()["status"] == "READY"
-    assert confirmed.json()["ready_to_analyze"] is True
-    assert confirmed.json()["messages"][-2]["role"] == "user"
-    assert "我已在身份确认中选择" in confirmed.json()["messages"][-2]["content"]
+    pending = confirmed.json()
+    assert pending["status"] == "AWAITING_FINAL_CONFIRMATION"
+    assert pending["ready_to_analyze"] is False
+    assert pending["messages"][-2]["role"] == "user"
+    assert "我已在身份确认中选择" in pending["messages"][-2]["content"]
+    ready = _confirm_final_summary(client, pending)
+    assert ready["status"] == "READY"
+    assert ready["ready_to_analyze"] is True
 
 
-def test_confirmation_model_can_require_more_information(monkeypatch) -> None:
+def test_legacy_readiness_review_cannot_bypass_final_confirmation(monkeypatch) -> None:
     agent = ReadinessReviewAgent(
         IntakeReadinessResult(
             assistant_reply="已记录您的选择，请再确认王先生是否属于该企业。",
@@ -447,16 +468,11 @@ def test_confirmation_model_can_require_more_information(monkeypatch) -> None:
 
     assert confirmed.status_code == 200
     payload = confirmed.json()
-    assert payload["status"] == "COLLECTING"
+    assert payload["status"] == "AWAITING_FINAL_CONFIRMATION"
     assert payload["ready_to_analyze"] is False
-    assert payload["missing_information"] == ["人物企业关系"]
-    assert payload["messages"][-1]["content"] == agent.result.assistant_reply
-    assert len(agent.observations) == 1
-    assert agent.observations[0]["tool"] == "check_intake_readiness"
-    assert agent.observations[0]["server_ready"] is True
-    assert agent.observations[0]["all_entities_resolved"] is True
-    assert agent.observations[0]["required_missing_information"] == []
-    assert agent.observations[0]["confirmed_selections"][0]["canonical_name"] == "王传福"
+    assert payload["missing_information"] == []
+    assert payload["final_confirmation"]["status"] == "PENDING"
+    assert agent.observations == []
 
 
 def test_confirmation_model_proposes_ready_after_tool_check(monkeypatch) -> None:
@@ -498,10 +514,13 @@ def test_confirmation_model_proposes_ready_after_tool_check(monkeypatch) -> None
         )
 
     assert confirmed.status_code == 200
-    assert confirmed.json()["status"] == "READY"
-    assert confirmed.json()["ready_to_analyze"] is True
-    assert agent.observations[0]["tool"] == "check_intake_readiness"
-    assert agent.observations[0]["server_ready"] is True
+    pending = confirmed.json()
+    assert pending["status"] == "AWAITING_FINAL_CONFIRMATION"
+    assert pending["ready_to_analyze"] is False
+    ready = _confirm_final_summary(client, pending)
+    assert ready["status"] == "READY"
+    assert ready["ready_to_analyze"] is True
+    assert agent.observations == []
 
 
 class NoInternalCandidates:
@@ -687,7 +706,9 @@ def test_intake_model_calls_external_identity_tool_only_after_internal_miss(
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "READY"
+    assert payload["status"] == "AWAITING_FINAL_CONFIRMATION"
+    assert payload["ready_to_analyze"] is False
+    assert payload["final_confirmation"]["status"] == "PENDING"
     resolutions = payload["structured_context"]["entity_resolutions"]
     assert {item["confirmed_by"] for item in resolutions} == {"EXTERNAL_AUTO"}
     assert web.queries == ['"王总" "比亚迪" 完整姓名 企业全称 职位']
@@ -1076,10 +1097,12 @@ def test_audio_is_transcribed_and_reviewed_before_analysis(monkeypatch, tmp_path
             },
         )
         assert reviewed.status_code == 200
-        assert reviewed.json()["status"] == "READY"
+        pending = reviewed.json()
+        assert pending["status"] == "AWAITING_FINAL_CONFIRMATION"
+        ready = _confirm_final_summary(client, pending)
         started = client.post(
             f"/api/v1/intake/{session_id}/start-analysis",
-            json={"expected_version": reviewed.json()["version"]},
+            json={"expected_version": ready["version"]},
         )
 
     assert started.status_code == 202
