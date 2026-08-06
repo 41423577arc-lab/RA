@@ -42,13 +42,13 @@ EntityResolution = Literal["CONFIRMED", "NEEDS_CONFIRMATION", "MISSING"]
 StatementType = Literal["FACT", "INFERENCE", "RECOMMENDATION"]
 
 
-class Person(BaseModel):
+class Person(BaseModel):  # 人物信息模型
     name: str | None = None
     organization: str | None = None
     title: str | None = None
 
 
-class ExtractedInfo(BaseModel):
+class ExtractedInfo(BaseModel):  # 基础信息提取结果模型
     event_type: Literal["宴请", "拜访", "会议", "其他"]
     event_time: str | None = None
     event_location: str | None = None
@@ -56,7 +56,7 @@ class ExtractedInfo(BaseModel):
     keywords: list[str] = Field(default_factory=list)
 
 
-class EntityMention(BaseModel):
+class EntityMention(BaseModel):  # 实体提及与解析信息模型
     mention: str
     canonical_name: str | None = None
     aliases: list[str] = Field(default_factory=list)
@@ -81,7 +81,7 @@ class EntityMention(BaseModel):
         return value
 
 
-class ProjectMention(BaseModel):
+class ProjectMention(BaseModel):  # 项目提及信息模型
     mention: str
     canonical_name: str | None = None
     aliases: list[str] = Field(default_factory=list)
@@ -91,7 +91,7 @@ class ProjectMention(BaseModel):
     needs_confirmation: bool = False
 
 
-class IntentUnderstanding(BaseModel):
+class IntentUnderstanding(BaseModel):  # 意图理解结果模型
     intents: list[IntentType]
     people: list[EntityMention] = Field(default_factory=list)
     organizations: list[EntityMention] = Field(default_factory=list)
@@ -104,7 +104,7 @@ class IntentUnderstanding(BaseModel):
     overall_confidence: float = Field(ge=0, le=1)
 
 
-class CandidateOption(BaseModel):
+class CandidateOption(BaseModel):  # 实体候选选项模型
     candidate_id: str
     entity_type: EntityType
     canonical_name: str
@@ -118,30 +118,30 @@ class CandidateOption(BaseModel):
     evidence_quote: str | None = None
 
 
-class ConfirmationItem(BaseModel):
+class ConfirmationItem(BaseModel):  # 待确认实体项模型
     mention: str
     entity_type: EntityType
     candidates: list[CandidateOption]
     required: bool = True
 
 
-class ConfirmationRequest(BaseModel):
+class ConfirmationRequest(BaseModel):  # 身份确认请求模型
     version: int
     items: list[ConfirmationItem]
 
 
-class ConfirmationSelection(BaseModel):
+class ConfirmationSelection(BaseModel):  # 用户确认选择模型
     mention: str
     candidate_id: str | None = None
     manual_value: str | None = None
 
 
-class ConfirmationPayload(BaseModel):
+class ConfirmationPayload(BaseModel):  # 身份确认提交数据模型
     confirmation_version: int
     selections: list[ConfirmationSelection]
 
 
-class ConfirmedEntity(BaseModel):
+class ConfirmedEntity(BaseModel):  # 已确认实体模型
     candidate_id: str | None = None
     entity_type: EntityType
     canonical_name: str
@@ -152,7 +152,7 @@ class ConfirmedEntity(BaseModel):
     confirmed_by: Literal["AUTO", "USER"]
 
 
-class ConfirmedContext(BaseModel):
+class ConfirmedContext(BaseModel):  # 已确认分析上下文模型
     intents: list[IntentType]
     entities: list[ConfirmedEntity]
     event_type: Literal["宴请", "拜访", "会议", "其他"]
@@ -162,7 +162,7 @@ class ConfirmedContext(BaseModel):
     focus_questions: list[str] = Field(default_factory=list)
 
 
-class WebSearchQuery(BaseModel):
+class WebSearchQuery(BaseModel):  # 联网检索查询项模型
     query: str = Field(min_length=2, max_length=120)
     purpose: str
     target_person: str | None = None
@@ -170,11 +170,11 @@ class WebSearchQuery(BaseModel):
     required_terms: list[str] = Field(default_factory=list, max_length=8)
 
 
-class WebSearchPlan(BaseModel):
+class WebSearchPlan(BaseModel):  # 联网检索计划模型
     queries: list[WebSearchQuery] = Field(min_length=1, max_length=6)
 
 
-class SearchResult(BaseModel):
+class SearchResult(BaseModel):  # 联网搜索结果模型
     web_result_id: str = ""
     title: str
     url: str
@@ -186,7 +186,7 @@ class SearchResult(BaseModel):
     published_at: datetime | None = None
 
 
-class WebPage(BaseModel):
+class WebPage(BaseModel):  # 网页正文内容模型
     web_result_id: str = ""
     title: str
     url: str
@@ -200,14 +200,14 @@ class WebPage(BaseModel):
     published_at: datetime | None = None
 
 
-class WebEvidence(BaseModel):
+class WebEvidence(BaseModel):  # 网页证据模型
     evidence_id: str
     quote: str
     claim: str
     matched_terms: list[str] = Field(default_factory=list)
 
 
-class PublicClaim(BaseModel):
+class PublicClaim(BaseModel):  # 经核验的公开事实模型
     web_result_id: str = ""
     evidence_id: str = ""
     subject: str
@@ -221,7 +221,7 @@ class PublicClaim(BaseModel):
     confidence: float = Field(default=1, ge=0, le=1)
 
 
-class WebVerification(BaseModel):
+class WebVerification(BaseModel):  # 网页结果核验模型
     web_result_id: str
     keep: bool
     matched_person: str | None = None
@@ -233,11 +233,11 @@ class WebVerification(BaseModel):
     evidence: list[WebEvidence] = Field(default_factory=list)
 
 
-class WebVerificationBatch(BaseModel):
+class WebVerificationBatch(BaseModel):  # 网页结果批量核验模型
     results: list[WebVerification]
 
 
-class ProjectQueryPlan(BaseModel):
+class ProjectQueryPlan(BaseModel):  # 内部项目查询计划模型
     person_names: list[str] = Field(default_factory=list)
     organization_names: list[str] = Field(default_factory=list)
     project_names: list[str] = Field(default_factory=list)
@@ -248,7 +248,7 @@ class ProjectQueryPlan(BaseModel):
     purpose: str = "资源调查"
 
 
-class ProjectResult(BaseModel):
+class ProjectResult(BaseModel):  # 内部项目查询结果模型
     project_id: str
     project_name: str
     project_aliases: list[str] = Field(default_factory=list)
@@ -279,7 +279,7 @@ class ProjectResult(BaseModel):
     similarity: float | None = None
 
 
-class ProjectRanking(BaseModel):
+class ProjectRanking(BaseModel):  # 项目相关性排序结果模型
     project_id: str
     relevance_score: int = Field(ge=0, le=100)
     relevance_reason: str
@@ -289,18 +289,18 @@ class ProjectRanking(BaseModel):
     evidence_refs: list[str] = Field(default_factory=list)
 
 
-class ProjectRankingBatch(BaseModel):
+class ProjectRankingBatch(BaseModel):  # 项目相关性批量排序模型
     rankings: list[ProjectRanking]
 
 
-class EvidenceBackedItem(BaseModel):
+class EvidenceBackedItem(BaseModel):  # 有证据支撑的内容条目模型
     text: str
     statement_type: StatementType
     evidence_refs: list[str] = Field(min_length=1)
     confidence: float = Field(ge=0, le=1)
 
 
-class AssociationAnalysis(BaseModel):
+class AssociationAnalysis(BaseModel):  # 资源关联分析结果模型
     key_findings: list[EvidenceBackedItem] = Field(default_factory=list)
     related_projects: list[EvidenceBackedItem] = Field(default_factory=list)
     available_resources: list[EvidenceBackedItem] = Field(default_factory=list)
@@ -310,7 +310,7 @@ class AssociationAnalysis(BaseModel):
     next_actions: list[EvidenceBackedItem] = Field(default_factory=list)
 
 
-class ActionBrief(BaseModel):
+class ActionBrief(BaseModel):  # 行动说明模型
     destination: str | None = None
     meeting_people: list[str] = Field(default_factory=list)
     objective: str
@@ -321,7 +321,7 @@ class ActionBrief(BaseModel):
     evidence_refs: list[str] = Field(default_factory=list)
 
 
-class GeneratedReportContent(BaseModel):
+class GeneratedReportContent(BaseModel):  # 结构化报告内容模型
     task_overview: list[EvidenceBackedItem] = Field(default_factory=list)
     person_and_company_summary: list[EvidenceBackedItem] = Field(default_factory=list)
     public_information_summary: list[EvidenceBackedItem] = Field(default_factory=list)
@@ -334,17 +334,17 @@ class GeneratedReportContent(BaseModel):
     action_brief: ActionBrief
 
 
-class TextTaskRequest(BaseModel):
+class TextTaskRequest(BaseModel):  # 文本任务创建请求模型
     text: str = Field(min_length=1, max_length=10_000)
 
 
-class TaskCreated(BaseModel):
+class TaskCreated(BaseModel):  # 任务创建结果模型
     task_id: UUID
     status: Literal["PENDING"] = "PENDING"
     input_type: Literal["text", "audio"]
 
 
-class ExecutionEventResponse(BaseModel):
+class ExecutionEventResponse(BaseModel):  # 单条执行事件响应模型
     sequence: int = Field(ge=1)
     event_type: str
     node_name: str | None = None
@@ -355,13 +355,13 @@ class ExecutionEventResponse(BaseModel):
     created_at: datetime
 
 
-class ExecutionLogResponse(BaseModel):
+class ExecutionLogResponse(BaseModel):  # 执行日志响应模型
     task_id: UUID
     latest_sequence: int = Field(ge=0)
     events: list[ExecutionEventResponse] = Field(default_factory=list)
 
 
-class TaskResponse(BaseModel):
+class TaskResponse(BaseModel):  # 完整任务状态响应模型
     task_id: UUID
     status: TaskStatus
     input_type: Literal["text", "audio"]

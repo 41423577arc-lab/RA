@@ -9,3 +9,5 @@ frontend/.next/
 frontend/.npm-cache/
 shared/audio/*
 !shared/audio/.gitkeep
+reports/run-export-*.zip
+reports/run-export-*/
