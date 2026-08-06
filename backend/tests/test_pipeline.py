@@ -445,5 +445,5 @@ def test_confirmed_intake_merges_public_and_internal_evidence_without_requester(
     assert task.internal_results[0]["owner_name"] == "张伟"
     assert "宏远制造有限公司持续推进制造园区能源管理" in task.detailed_report_markdown
     assert "制造园区能源管理" in task.detailed_report_markdown
-    assert "客户联系人为 郑伟（能源管理部经理），联系电话 17010000006" in task.detailed_report_markdown
-    assert "我方项目销售员为 张伟；联系电话 17000001001" in task.detailed_report_markdown
+    assert "客户联系人为郑伟（能源管理部经理），联系电话 17010000006" in task.detailed_report_markdown
+    assert "我方项目销售员为张伟；联系电话 17000001001" in task.detailed_report_markdown

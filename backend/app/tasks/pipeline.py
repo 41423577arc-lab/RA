@@ -101,7 +101,7 @@ class ResearchPipeline:
         task = self.repository.get(task_id)
         if task is None:
             raise KeyError(f"Task {task_id} not found")
-        if task.status == "CANCELLED":
+        if getattr(task, "status", None) == "CANCELLED":
             return
         audio_path = Path(task.audio_path) if task.audio_path else None
         degraded = list(task.degraded_nodes or [])
@@ -476,7 +476,7 @@ class ResearchPipeline:
     def _is_cancelled(self, task_id: str) -> bool:
         getter = getattr(self.repository, "get_fresh", self.repository.get)
         task = getter(task_id)
-        return bool(task is not None and task.status == "CANCELLED")
+        return bool(task is not None and getattr(task, "status", None) == "CANCELLED")
 
     def _run_web(
         self, task_id: str, queries: list[WebSearchQuery]
