@@ -1,7 +1,18 @@
-from app.schemas.intake import IntakeChatResult, IntakeStructuredContext
+from app.schemas.intake import (
+    IntakeChatResult,
+    IntakeEntityAssessment,
+    IntakeEntityResolution,
+    IntakePersonCandidate,
+    IntakeStructuredContext,
+)
 from app.schemas.task import EntityMention, IntentUnderstanding, WebPage
 from app.services.entity_resolver import EntityResolver
 from app.services.intake_completeness import is_intake_ready
+from app.services.intake_field_state import (
+    derive_field_states,
+    fallback_confirmation_question,
+    fields_ready_for_confirmation,
+)
 
 
 def _understanding(*, people=None, organizations=None) -> IntentUnderstanding:
@@ -198,3 +209,91 @@ def test_entity_deduplication_uses_normalized_identity_key() -> None:
     )
 
     assert len(confirmed) == 1
+
+
+def test_field_states_advance_from_completion_to_user_confirmation() -> None:
+    incomplete = IntakeStructuredContext(
+        people=["王总"],
+        event_type="宴请",
+        entity_assessments=[
+            IntakeEntityAssessment(
+                entity_type="PERSON",
+                mention="王总",
+                is_standard=False,
+                reason="不是完整姓名",
+            )
+        ],
+    )
+
+    incomplete_states = derive_field_states(incomplete)
+
+    assert incomplete_states["people"].status == "NEEDS_COMPLETION"
+    assert fields_ready_for_confirmation(incomplete_states) is False
+
+    completed = incomplete.model_copy(
+        update={
+            "people": ["王伟"],
+            "people_details": [
+                IntakePersonCandidate(
+                    name="王伟",
+                    title="总经理",
+                    organization="示例科技有限公司",
+                )
+            ],
+            "organizations": ["示例科技有限公司"],
+            "entity_resolutions": [
+                IntakeEntityResolution(
+                    entity_type="PERSON",
+                    mention="王总",
+                    canonical_name="王伟",
+                    organization="示例科技有限公司",
+                    title="总经理",
+                    confirmed_by="USER",
+                ),
+                IntakeEntityResolution(
+                    entity_type="ORGANIZATION",
+                    mention="示例科技",
+                    canonical_name="示例科技有限公司",
+                    confirmed_by="USER",
+                ),
+            ],
+        }
+    )
+    completed_states = derive_field_states(completed)
+
+    assert completed_states["people"].status == "STANDARD_COMPLETE"
+    assert completed_states["organizations"].status == "STANDARD_COMPLETE"
+    assert completed_states["event_type"].status == "STANDARD_COMPLETE"
+    assert completed_states["event_time"].status == "NOT_PROVIDED"
+    assert fields_ready_for_confirmation(completed_states) is True
+
+    confirmed_states = derive_field_states(completed, final_confirmed=True)
+    assert confirmed_states["people"].status == "USER_CONFIRMED"
+    assert confirmed_states["event_type"].status == "USER_CONFIRMED"
+    assert confirmed_states["event_time"].status == "NOT_PROVIDED"
+
+
+def test_fallback_confirmation_uses_only_explicit_relationship() -> None:
+    context = IntakeStructuredContext(
+        people=["王伟"],
+        organizations=["示例科技有限公司"],
+        people_details=[
+            IntakePersonCandidate(
+                name="王伟",
+                title="总经理",
+                organization="示例科技有限公司",
+            )
+        ],
+        event_type="宴请",
+        event_time="今天晚上",
+        event_location="滨江餐厅",
+        focus_questions=["合作项目进展"],
+    )
+
+    question = fallback_confirmation_question(context)
+
+    assert "今天晚上" in question
+    assert "在滨江餐厅" in question
+    assert "示例科技有限公司的总经理王伟" in question
+    assert "见面吃饭" in question
+    assert "合作项目进展" in question

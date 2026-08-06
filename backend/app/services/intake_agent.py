@@ -1,5 +1,6 @@
 from app.schemas.intake import (
     ExternalIdentityNormalizationResult,
+    IntakeFinalConfirmationResult,
     IntakeChatRequest,
     IntakeChatResult,
     IntakeFollowupResult,
@@ -76,4 +77,22 @@ class IntakeAgent:
                 "default_requester_context": DEFAULT_REQUESTER_CONTEXT,
             },
             IntakeReadinessResult,
+        )
+
+    def summarize_for_confirmation(
+        self,
+        request: IntakeChatRequest,
+        structured_context: IntakeStructuredContext,
+        analysis_input: str,
+    ) -> IntakeFinalConfirmationResult:
+        return self.llm.parse(
+            str(request.session_id),
+            "intake_final_confirmation",
+            {
+                "messages": [message.model_dump() for message in request.messages],
+                "structured_context": structured_context.model_dump(mode="json"),
+                "analysis_input": analysis_input,
+                "default_requester_context": DEFAULT_REQUESTER_CONTEXT,
+            },
+            IntakeFinalConfirmationResult,
         )

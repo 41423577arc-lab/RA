@@ -12,11 +12,13 @@ from app.config import settings
 from app.database import IntakeSessionRepository, TaskRepository, get_session
 from app.models.database import IntakeAudioJob, IntakeSession, ResearchTask
 from app.schemas.intake import (
+    ConfirmIntakeSummaryRequest,
     IntakeActivityResponse,
     IntakeChatRequest,
     IntakeChatResponse,
     IntakeChatResult,
-    IntakeReadinessResult,
+    IntakeFinalConfirmation,
+    IntakeFinalConfirmationResult,
     IntakeAudioJobResponse,
     IntakeSessionResponse,
     IntakeStructuredContext,
@@ -34,11 +36,20 @@ from app.services.intake_entity_candidates import (
     IntakeEntityCandidateService,
     user_provided_entity_resolutions,
 )
+from app.services.intake_field_state import (
+    derive_field_states,
+    fallback_confirmation_question,
+    fields_ready_for_confirmation,
+)
 from app.services.intake_defaults import with_default_requester_context
 from app.services.llm_client import LLMCallFailed, LLMUnavailable, StructuredLLM
 from app.services.mcp_client import ProjectMcpClient
 from app.services.tavily_client import TavilyClient
-from app.tasks.pipeline import context_from_intake_snapshot, run_research_pipeline
+from app.tasks.pipeline import (
+    context_from_intake_snapshot,
+    infer_event_type,
+    run_research_pipeline,
+)
 from app.tasks.intake_audio import run_intake_audio_transcription
 
 
@@ -95,6 +106,9 @@ def _chat_response(intake_session: IntakeSession) -> IntakeChatResponse:
         ),
         "请继续补充本次分析信息。",
     )
+    structured_context = IntakeStructuredContext.model_validate(
+        intake_session.structured_context or {}
+    )
     return IntakeChatResponse(
         session_id=UUID(intake_session.id),
         status=intake_session.status,
@@ -103,13 +117,12 @@ def _chat_response(intake_session: IntakeSession) -> IntakeChatResponse:
         analysis_input=intake_session.analysis_input or "等待补充分析信息。",
         ready_to_analyze=intake_session.ready_to_analyze,
         missing_information=intake_session.missing_information or [],
-        structured_context=IntakeStructuredContext.model_validate(
-            intake_session.structured_context or {}
-        ),
+        structured_context=structured_context,
         next_action="PROPOSE_READY"
         if intake_session.status == "READY"
         else "ASK_USER",
         confirmation_request=intake_session.confirmation_request,
+        final_confirmation=structured_context.final_confirmation,
     )
 
 
@@ -233,6 +246,51 @@ def _standardized_context(context: dict, resolutions: list[dict] | None) -> dict
     return output
 
 
+def _with_field_states(context: dict, *, final_confirmed: bool = False) -> dict:
+    output = dict(context)
+    structured = IntakeStructuredContext.model_validate(output)
+    output["field_states"] = {
+        name: state.model_dump(mode="json")
+        for name, state in derive_field_states(
+            structured, final_confirmed=final_confirmed
+        ).items()
+    }
+    return output
+
+
+def _prepare_final_confirmation(
+    agent: IntakeAgent,
+    request: IntakeChatRequest,
+    context: dict,
+    analysis_input: str,
+    version: int,
+) -> tuple[dict, IntakeFinalConfirmation | None]:
+    if not context.get("event_type"):
+        context = {**context, "event_type": infer_event_type(analysis_input)}
+    context = _with_field_states(context)
+    structured = IntakeStructuredContext.model_validate(context)
+    if not fields_ready_for_confirmation(structured.field_states):
+        return context, None
+    fallback = IntakeFinalConfirmationResult(
+        question=fallback_confirmation_question(structured)
+    )
+    summarize = getattr(agent, "summarize_for_confirmation", None)
+    if callable(summarize):
+        try:
+            summary = summarize(request, structured, analysis_input)
+        except (LLMUnavailable, LLMCallFailed):
+            summary = fallback
+    else:
+        summary = fallback
+    final_confirmation = IntakeFinalConfirmation(
+        version=version,
+        question=summary.question,
+        status="PENDING",
+    )
+    context["final_confirmation"] = final_confirmation.model_dump(mode="json")
+    return context, final_confirmation
+
+
 def _merge_resolutions(existing: list[dict], additions: list[dict]) -> list[dict]:
     merged: dict[tuple[str | None, str | None], dict] = {}
     for item in [*existing, *additions]:
@@ -249,6 +307,8 @@ def _repair_ready_session(
     context = IntakeStructuredContext.model_validate(
         intake_session.structured_context or {}
     )
+    if not context.final_confirmation or context.final_confirmation.status != "CONFIRMED":
+        return intake_session
     result = IntakeChatResult(
         assistant_reply="信息已完整，可以开始分析。",
         analysis_input=intake_session.analysis_input or "等待补充分析信息。",
@@ -599,13 +659,42 @@ def chat(
         result.analysis_input,
         stored_context.get("entity_resolutions", []),
     )
+    stored_context["final_confirmation"] = None
+    stored_context = _with_field_states(stored_context)
+    final_confirmation = None
+    identities_ready = (
+        not settings.intake_entity_resolution_enabled
+        or _has_resolved_entities(stored_context)
+    )
+    if ready and not confirmation_request and identities_ready:
+        stored_context, final_confirmation = _prepare_final_confirmation(
+            request_agent,
+            request,
+            stored_context,
+            result.analysis_input,
+            next_version,
+        )
+        if final_confirmation:
+            result.assistant_reply = final_confirmation.question
+            result.ready_to_analyze = False
+            result.missing_information = []
+        else:
+            result.assistant_reply = "当前字段仍有待补全，请继续提供相关信息。"
+            result.ready_to_analyze = False
+        ready = False
     persisted_messages = [
         *incoming_messages,
         {"role": "assistant", "content": result.assistant_reply},
     ]
     values = {
-        "status": "READY" if ready else (
-            "NEEDS_CONFIRMATION" if confirmation_request else "COLLECTING"
+        "status": (
+            "NEEDS_CONFIRMATION"
+            if confirmation_request
+            else "AWAITING_FINAL_CONFIRMATION"
+            if final_confirmation
+            else "READY"
+            if ready
+            else "COLLECTING"
         ),
         "messages": persisted_messages,
         "structured_context": stored_context,
@@ -866,90 +955,155 @@ def confirm_intake_entities(
     )
     intake_activity.update(
         str(session_id),
-        "CALLING_TOOL",
-        "正在检查确认后的信息是否可以开始分析",
-        tool_name="check_intake_readiness",
+        "PROCESSING_TOOL_RESULT",
+        "正在整理确认后的字段并生成最终确认问题",
+        tool_name="summarize_intake_confirmation",
     )
     required_missing = required_missing_information(validation_result, source_text)
     all_entities_resolved = _has_resolved_entities(structured_context)
     server_ready = not required_missing and all_entities_resolved
-    tool_observation = {
-        "tool": "check_intake_readiness",
-        "server_ready": server_ready,
-        "all_entities_resolved": all_entities_resolved,
-        "required_missing_information": required_missing,
-        "confirmed_selections": confirmed_selections,
-    }
     fallback_missing = required_missing or (
         [] if all_entities_resolved else ["人物或企业身份确认"]
     )
-    readiness_review = IntakeReadinessResult(
-        assistant_reply=(
-            f"已复核确认的标准身份：{'、'.join(confirmed_names)}。可以开始分析。"
-            if server_ready and confirmed_names
-            else "身份选择已记录，但还需要补充分析目标或确认关键身份。"
-        ),
-        ready_to_analyze=server_ready,
-        missing_information=fallback_missing,
-        next_action="PROPOSE_READY" if server_ready else "ASK_USER",
+    readiness_reply = (
+        f"已复核确认的标准身份：{'、'.join(confirmed_names)}。"
+        if server_ready and confirmed_names
+        else "身份选择已记录，但还需要补充分析目标或确认关键身份。"
     )
-    assess_readiness = getattr(request_agent, "assess_readiness", None)
-    if callable(assess_readiness):
-        intake_activity.update(
-            str(session_id),
-            "PROCESSING_TOOL_RESULT",
-            "大模型正在复核确认结果与分析条件",
-            tool_name="check_intake_readiness",
-        )
+    ready = server_ready
+    next_version = intake_session.version + 1
+    structured_context = _with_field_states(structured_context)
+    final_confirmation = None
+    if ready:
         review_messages = [
             *(intake_session.messages or []),
             {"role": "user", "content": confirmation_message},
         ]
-        try:
-            readiness_review = assess_readiness(
-                IntakeChatRequest(
-                    session_id=session_id,
-                    messages=review_messages[-30:],
-                ),
-                IntakeStructuredContext.model_validate(structured_context),
-                tool_observation,
-            )
-        except (LLMUnavailable, LLMCallFailed):
-            pass
-    ready = bool(
-        server_ready
-        and readiness_review.ready_to_analyze
-        and readiness_review.next_action == "PROPOSE_READY"
-    )
+        structured_context, final_confirmation = _prepare_final_confirmation(
+            request_agent,
+            IntakeChatRequest(
+                session_id=session_id,
+                messages=review_messages[-30:],
+            ),
+            structured_context,
+            standardized_input,
+            next_version,
+        )
+        ready = False
     missing_information = (
         []
         if ready
         else fallback_missing
-        or readiness_review.missing_information
         or ["身份或分析目标确认"]
     )
+    if final_confirmation:
+        missing_information = []
     messages = [
         *(intake_session.messages or []),
         {"role": "user", "content": confirmation_message},
-        {"role": "assistant", "content": readiness_review.assistant_reply},
+        {
+            "role": "assistant",
+            "content": final_confirmation.question
+            if final_confirmation
+            else readiness_reply,
+        },
     ]
     intake_session = repository.update(
         str(session_id),
-        status="READY" if ready else "COLLECTING",
+        status="AWAITING_FINAL_CONFIRMATION" if final_confirmation else (
+            "READY" if ready else "COLLECTING"
+        ),
         messages=messages,
         structured_context=structured_context,
         analysis_input=standardized_input,
         missing_information=missing_information,
         confirmation_request=None,
         ready_to_analyze=ready,
+        version=next_version,
+    )
+    intake_activity.update(
+        str(session_id),
+        "COMPLETED",
+        "当前信息已整理，等待最终确认",
+        active=False,
+        tool_name="summarize_intake_confirmation",
+    )
+    response = _chat_response(intake_session)
+    return IntakeSessionResponse(
+        **response.model_dump(),
+        messages=intake_session.messages or [],
+        research_task_id=None,
+        active_audio_job=None,
+    )
+
+
+@router.post(
+    "/{session_id}/confirm-summary",
+    response_model=IntakeSessionResponse,
+)
+def confirm_intake_summary(
+    session_id: UUID,
+    payload: ConfirmIntakeSummaryRequest,
+    session: Session = Depends(get_session),
+) -> IntakeSessionResponse:
+    repository = IntakeSessionRepository(session)
+    intake_session = repository.get(str(session_id), for_update=True)
+    if intake_session is None:
+        raise HTTPException(status_code=404, detail="信息采集会话不存在")
+    context = IntakeStructuredContext.model_validate(
+        intake_session.structured_context or {}
+    )
+    confirmation = context.final_confirmation
+    if (
+        intake_session.status != "AWAITING_FINAL_CONFIRMATION"
+        or confirmation is None
+        or confirmation.status != "PENDING"
+    ):
+        raise HTTPException(status_code=409, detail="当前没有待确认的信息摘要")
+    if (
+        payload.expected_version != intake_session.version
+        or payload.expected_version != confirmation.version
+    ):
+        raise HTTPException(status_code=409, detail="确认版本已更新，请刷新后重试")
+
+    validation_result = IntakeChatResult(
+        assistant_reply=confirmation.question,
+        analysis_input=intake_session.analysis_input,
+        ready_to_analyze=False,
+        structured_context=context,
+    )
+    if required_missing_information(validation_result, _source_text(intake_session)):
+        raise HTTPException(status_code=422, detail="当前信息仍不完整，不能确认")
+    if settings.intake_entity_resolution_enabled and not _has_resolved_entities(
+        intake_session.structured_context or {}
+    ):
+        raise HTTPException(status_code=422, detail="人物或企业身份尚未确认")
+
+    structured_context = _with_field_states(
+        intake_session.structured_context or {}, final_confirmed=True
+    )
+    structured_context["final_confirmation"] = confirmation.model_copy(
+        update={"status": "CONFIRMED"}
+    ).model_dump(mode="json")
+    intake_session = repository.update(
+        str(session_id),
+        status="READY",
+        messages=[
+            *(intake_session.messages or []),
+            {"role": "user", "content": "对，是这样的"},
+            {"role": "assistant", "content": "好的，当前信息已经确认，可以立即开始分析。"},
+        ],
+        structured_context=structured_context,
+        missing_information=[],
+        ready_to_analyze=True,
         version=intake_session.version + 1,
     )
     intake_activity.update(
         str(session_id),
         "COMPLETED",
-        "确认结果复核完成",
+        "用户已确认当前信息",
         active=False,
-        tool_name="check_intake_readiness",
+        tool_name="confirm_intake_summary",
     )
     response = _chat_response(intake_session)
     return IntakeSessionResponse(
@@ -986,6 +1140,11 @@ def start_analysis(
         raise HTTPException(status_code=409, detail="信息尚未完整，不能开始分析")
     if intake_session.confirmation_request:
         raise HTTPException(status_code=409, detail="仍有待确认的身份信息")
+    final_confirmation = IntakeStructuredContext.model_validate(
+        intake_session.structured_context or {}
+    ).final_confirmation
+    if not final_confirmation or final_confirmation.status != "CONFIRMED":
+        raise HTTPException(status_code=409, detail="请先确认当前信息摘要")
     if (
         settings.intake_entity_resolution_enabled
         and not _has_resolved_entities(intake_session.structured_context or {})

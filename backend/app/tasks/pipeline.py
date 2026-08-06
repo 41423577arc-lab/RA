@@ -69,6 +69,10 @@ class ProjectService(Protocol):
     ) -> list[ProjectResult]: ...
 
 
+class PipelineCancelled(Exception):
+    pass
+
+
 class ResearchPipeline:
     def __init__(
         self,
@@ -97,9 +101,12 @@ class ResearchPipeline:
         task = self.repository.get(task_id)
         if task is None:
             raise KeyError(f"Task {task_id} not found")
+        if task.status == "CANCELLED":
+            return
         audio_path = Path(task.audio_path) if task.audio_path else None
         degraded = list(task.degraded_nodes or [])
         try:
+            self._checkpoint(task_id)
             input_text = sanitize_research_input(
                 task.input_text or "", getattr(task, "input_snapshot", None)
             )
@@ -109,6 +116,8 @@ class ResearchPipeline:
                 if not input_text:
                     raise ValueError("未识别到有效语音，请重新录制")
                 self.repository.update(task_id, input_text=input_text)
+
+            self._checkpoint(task_id)
 
             if task.confirmed_context:
                 context = ConfirmedContext.model_validate(task.confirmed_context)
@@ -168,6 +177,7 @@ class ResearchPipeline:
                     confirmation_request=None,
                 )
 
+            self._checkpoint(task_id)
             intake_claims = identity_claims_from_intake_snapshot(
                 getattr(task, "input_snapshot", None)
             )
@@ -187,6 +197,7 @@ class ResearchPipeline:
             _, pages, web_search_status, web_fetch_status = self._run_web(
                 task_id, web_plan.queries
             )
+            self._checkpoint(task_id)
             if web_search_status == "FAILED" and "web_search" not in degraded:
                 degraded.append("web_search")
             if web_fetch_status == "FAILED" and "web_fetch" not in degraded:
@@ -239,6 +250,7 @@ class ResearchPipeline:
             )
 
             self.repository.update(task_id, status="PROJECT_SEARCHING")
+            self._checkpoint(task_id)
             project_results: list[ProjectResult] = []
             internal_search_status = "SUCCESS"
             project_arguments = {
@@ -271,6 +283,7 @@ class ResearchPipeline:
                 project_results = [
                     item for item in project_results if item.status in project_plan.statuses
                 ]
+                self._checkpoint(task_id)
                 self._record_event(
                     task_id,
                     event_type="TOOL_RESPONSE",
@@ -284,6 +297,8 @@ class ResearchPipeline:
                         ]
                     },
                 )
+            except PipelineCancelled:
+                raise
             except Exception as exc:
                 internal_search_status = "FAILED"
                 self._record_event(
@@ -304,6 +319,7 @@ class ResearchPipeline:
                 internal_search_status=internal_search_status,
             )
 
+            self._checkpoint(task_id)
             self.repository.update(task_id, status="RERANKING_PROJECTS")
             rankings = self._with_fallback(
                 task_id,
@@ -321,6 +337,7 @@ class ResearchPipeline:
                 ranked_internal_results=[item.model_dump(mode="json") for item in rankings],
             )
 
+            self._checkpoint(task_id)
             self.repository.update(task_id, status="ANALYZING_ASSOCIATIONS")
             fallback_analysis = fallback_association(
                 claims, project_results, rankings
@@ -342,6 +359,7 @@ class ResearchPipeline:
                 task_id, association_analysis=analysis.model_dump(mode="json")
             )
 
+            self._checkpoint(task_id)
             self.repository.update(task_id, status="GENERATING_REPORT_CONTENT")
             fallback_content = validate_report_content(
                 fallback_report_content(
@@ -375,6 +393,7 @@ class ResearchPipeline:
                 task_id, generated_report_content=report_content.model_dump(mode="json")
             )
 
+            self._checkpoint(task_id)
             self.repository.update(task_id, status="RENDERING_REPORT")
             detailed, action = self.renderer.render_generated(
                 report_content,
@@ -384,6 +403,7 @@ class ResearchPipeline:
                 web_fetch_status,
                 internal_search_status,
             )
+            self._checkpoint(task_id)
             self.repository.update(
                 task_id,
                 status="COMPLETED",
@@ -393,17 +413,36 @@ class ResearchPipeline:
                 degraded_nodes=degraded,
                 error_message=None,
             )
-        except Exception as exc:
+        except PipelineCancelled:
             self._record_event(
                 task_id,
-                event_type="PIPELINE_ERROR",
+                event_type="PIPELINE_CANCELLED",
                 node_name="research_pipeline",
-                status="FAILED",
-                title="研究流水线执行失败",
-                detail=str(exc)[:1000],
-                payload={"error_type": type(exc).__name__},
+                status="CANCELLED",
+                title="研究流水线已停止",
+                detail="收到用户停止请求，后续分析阶段不再执行。",
             )
-            self.repository.update(task_id, status="FAILED", error_message=str(exc), degraded_nodes=degraded)
+        except Exception as exc:
+            if self._is_cancelled(task_id):
+                self._record_event(
+                    task_id,
+                    event_type="PIPELINE_CANCELLED",
+                    node_name="research_pipeline",
+                    status="CANCELLED",
+                    title="研究流水线已停止",
+                    detail="任务执行期间收到用户停止请求。",
+                )
+            else:
+                self._record_event(
+                    task_id,
+                    event_type="PIPELINE_ERROR",
+                    node_name="research_pipeline",
+                    status="FAILED",
+                    title="研究流水线执行失败",
+                    detail=str(exc)[:1000],
+                    payload={"error_type": type(exc).__name__},
+                )
+                self.repository.update(task_id, status="FAILED", error_message=str(exc), degraded_nodes=degraded)
         finally:
             if audio_path:
                 audio_path.unlink(missing_ok=True)
@@ -429,6 +468,15 @@ class ResearchPipeline:
         logger = getattr(self.repository, "log_execution_event", None)
         if logger is not None:
             logger(task_id, **values)
+
+    def _checkpoint(self, task_id: str) -> None:
+        if self._is_cancelled(task_id):
+            raise PipelineCancelled
+
+    def _is_cancelled(self, task_id: str) -> bool:
+        getter = getattr(self.repository, "get_fresh", self.repository.get)
+        task = getter(task_id)
+        return bool(task is not None and task.status == "CANCELLED")
 
     def _run_web(
         self, task_id: str, queries: list[WebSearchQuery]
@@ -468,6 +516,7 @@ class ResearchPipeline:
                 search_results = asyncio.run(
                     self.web.search([item.query for item in queries])
                 )
+                self._checkpoint(task_id)
                 query_targets = {item.query: item for item in queries}
                 for index, item in enumerate(search_results, 1):
                     if not item.web_result_id:
@@ -490,6 +539,8 @@ class ResearchPipeline:
                         ]
                     },
                 )
+            except PipelineCancelled:
+                raise
             except Exception as exc:
                 web_search_status = "FAILED"
                 self._record_event(
@@ -525,6 +576,7 @@ class ResearchPipeline:
                 extracted_pages: list[WebPage] = []
                 try:
                     extracted_pages = asyncio.run(self.web.extract(search_results))
+                    self._checkpoint(task_id)
                     by_url = {item.url: item for item in search_results}
                     for page in extracted_pages:
                         source = by_url.get(page.url)
@@ -537,6 +589,8 @@ class ResearchPipeline:
                             page.target_organization or source.target_organization
                         )
                         page.search_snippet = page.search_snippet or source.content
+                except PipelineCancelled:
+                    raise
                 except Exception as exc:
                     web_fetch_status = "FAILED"
                     self._record_event(
@@ -829,7 +883,7 @@ def context_from_intake_snapshot(
         for item in focus_questions
         if not any(term in item for term in requester_terms)
     ]
-    event_type = (
+    event_type = structured.get("event_type") or (
         understanding.event_type
         if understanding
         else infer_event_type(snapshot_text)

@@ -361,6 +361,32 @@ class ExecutionLogResponse(BaseModel):
     events: list[ExecutionEventResponse] = Field(default_factory=list)
 
 
+class TaskChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=2_000)
+
+
+class TaskChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=2_000)
+
+
+class TaskChatResult(BaseModel):
+    assistant_reply: str = Field(min_length=1, max_length=2_000)
+
+
+class TaskChatResponse(BaseModel):
+    task_id: UUID
+    task_status: TaskStatus
+    messages: list[TaskChatMessage] = Field(default_factory=list, max_length=40)
+
+
+class TaskClearResponse(BaseModel):
+    task_id: UUID
+    cleared: Literal[True] = True
+    intake_session_version: int | None = Field(default=None, ge=0)
+    ready_to_analyze: bool = False
+
+
 class TaskResponse(BaseModel):
     task_id: UUID
     status: TaskStatus
@@ -385,3 +411,4 @@ class TaskResponse(BaseModel):
     report_markdown: str | None = None
     degraded_nodes: list[str] = Field(default_factory=list)
     error_message: str | None = None
+    analysis_chat_messages: list[TaskChatMessage] = Field(default_factory=list)
