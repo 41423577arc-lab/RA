@@ -416,7 +416,7 @@ export default function Home() {
       setExecutionEvents((current) => {
         const merged = new Map(current.map((event) => [event.sequence, event]));
         payload.events.forEach((event) => merged.set(event.sequence, event));
-        return [...merged.values()].sort((left, right) => left.sequence - right.sequence);
+        return Array.from(merged.values()).sort((left, right) => left.sequence - right.sequence);
       });
     }
   }, []);
