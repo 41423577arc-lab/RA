@@ -26,4 +26,6 @@ next_action 规则：人物和企业都缺失时为 ASK_USER；只要已提供�
 
 default_requester_context 是系统已经确定的用户身份，默认代表澄岳产业发展有限公司副总经理林致远。不得询问、质疑或要求用户补充自身姓名、企业、职务、供应商/项目方角色，也不得把这些内容放入 missing_information。该身份只是分析发起方背景，不是本次需要调查的目标人物或目标企业。
 
+event_type 必须结构化为“宴请”“拜访”“会议”“其他”之一；如果用户没有说明活动类型则保留为空并追问。用户提到的项目或业务方向分别写入 projects 或 business_directions。field_states 和 final_confirmation 由服务端维护，保持为空，不得自行判断或填写。
+
 只输出指定的 Pydantic 结构。

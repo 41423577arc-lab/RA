@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import TaskRepository, get_session
-from app.models.database import ResearchTask
+from app.models.database import IntakeSession, ResearchTask
 from app.schemas.task import (
     AssociationAnalysis,
     ConfirmationPayload,
@@ -22,12 +22,22 @@ from app.schemas.task import (
     ProjectResult,
     PublicClaim,
     TaskCreated,
+    TaskChatMessage,
+    TaskChatRequest,
+    TaskChatResponse,
+    TaskClearResponse,
     TaskResponse,
     TextTaskRequest,
     WebSearchPlan,
     WebVerification,
 )
 from app.services.entity_resolver import EntityResolver
+from app.services.analysis_chat import (
+    AnalysisChatAgent,
+    build_task_chat_context,
+    fallback_task_chat_reply,
+)
+from app.services.llm_client import LLMCallFailed, LLMUnavailable, StructuredLLM
 from app.tasks.pipeline import run_research_pipeline
 
 
@@ -72,6 +82,7 @@ def get_task(task_id: UUID, session: Session = Depends(get_session)) -> TaskResp
     task = TaskRepository(session).get(str(task_id))
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
+    snapshot = dict(task.input_snapshot or {})
     return TaskResponse(
         task_id=UUID(task.id),
         status=task.status,
@@ -114,6 +125,10 @@ def get_task(task_id: UUID, session: Session = Depends(get_session)) -> TaskResp
         report_markdown=task.report_markdown,
         degraded_nodes=task.degraded_nodes or [],
         error_message=task.error_message,
+        analysis_chat_messages=[
+            TaskChatMessage.model_validate(item)
+            for item in snapshot.get("analysis_chat_messages", [])
+        ],
     )
 
 
@@ -127,7 +142,16 @@ def get_execution_log(
     task = repository.get(str(task_id))
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
-    scope_ids = [item for item in (task.intake_session_id, task.id) if item]
+    snapshot = dict(task.input_snapshot or {})
+    scope_ids = [
+        item
+        for item in (
+            task.intake_session_id,
+            snapshot.get("cleared_from_intake_session_id"),
+            task.id,
+        )
+        if item
+    ]
     events = repository.list_execution_events(scope_ids, after_sequence=after_sequence)
     return ExecutionLogResponse(
         task_id=task_id,
@@ -190,7 +214,91 @@ def cancel_task(task_id: UUID, session: Session = Depends(get_session)) -> TaskR
     task = repository.get(str(task_id))
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
-    if task.status not in {"PENDING", "NEEDS_CONFIRMATION"}:
-        raise HTTPException(status_code=409, detail="当前任务不能取消")
+    if task.status in {"COMPLETED", "FAILED", "CANCELLED"}:
+        raise HTTPException(status_code=409, detail="当前任务已经结束")
     repository.update(str(task_id), status="CANCELLED")
     return get_task(task_id, session)
+
+
+@router.post("/{task_id}/chat", response_model=TaskChatResponse)
+def chat_with_task(
+    task_id: UUID,
+    payload: TaskChatRequest,
+    session: Session = Depends(get_session),
+) -> TaskChatResponse:
+    repository = TaskRepository(session)
+    task = repository.get_fresh(str(task_id))
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    snapshot = dict(task.input_snapshot or {})
+    history = [
+        TaskChatMessage.model_validate(item).model_dump(mode="json")
+        for item in snapshot.get("analysis_chat_messages", [])
+    ][-38:]
+    context = build_task_chat_context(task)
+    try:
+        result = AnalysisChatAgent(StructuredLLM(settings, repository)).respond(
+            str(task_id), payload.message.strip(), history, context
+        )
+        assistant_reply = result.assistant_reply
+    except (LLMUnavailable, LLMCallFailed):
+        assistant_reply = fallback_task_chat_reply(context)
+    messages = [
+        *history,
+        {"role": "user", "content": payload.message.strip()},
+        {"role": "assistant", "content": assistant_reply},
+    ][-40:]
+    snapshot["analysis_chat_messages"] = messages
+    repository.update(str(task_id), input_snapshot=snapshot)
+    return TaskChatResponse(
+        task_id=task_id,
+        task_status=task.status,
+        messages=[TaskChatMessage.model_validate(item) for item in messages],
+    )
+
+
+@router.post("/{task_id}/clear", response_model=TaskClearResponse)
+def clear_task_analysis(
+    task_id: UUID, session: Session = Depends(get_session)
+) -> TaskClearResponse:
+    repository = TaskRepository(session)
+    task = repository.get_fresh(str(task_id))
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if task.status not in {"COMPLETED", "FAILED", "CANCELLED", "NEEDS_CONFIRMATION"}:
+        raise HTTPException(status_code=409, detail="请先停止当前分析，再清空")
+
+    intake_version = None
+    ready_to_analyze = False
+    if task.intake_session_id:
+        previous_intake_session_id = task.intake_session_id
+        intake_session = session.get(IntakeSession, previous_intake_session_id)
+        if intake_session and intake_session.research_task_id == task.id:
+            final_confirmation = (
+                (intake_session.structured_context or {}).get("final_confirmation") or {}
+            )
+            confirmed = final_confirmation.get("status") == "CONFIRMED"
+            intake_session.research_task_id = None
+            intake_session.status = "READY" if confirmed else "COLLECTING"
+            intake_session.ready_to_analyze = confirmed
+            intake_session.version += 1
+            snapshot = dict(task.input_snapshot or {})
+            snapshot["cleared_from_intake_session_id"] = previous_intake_session_id
+            task.input_snapshot = snapshot
+            task.intake_session_id = None
+            session.commit()
+            session.refresh(intake_session)
+            intake_version = intake_session.version
+            ready_to_analyze = confirmed
+    repository.log_execution_event(
+        str(task_id),
+        event_type="TASK_CLEARED",
+        status=task.status,
+        title="当前分析已清空",
+        detail="已解除信息采集会话与当前分析任务的关联，任务记录仍保留。",
+    )
+    return TaskClearResponse(
+        task_id=task_id,
+        intake_session_version=intake_version,
+        ready_to_analyze=ready_to_analyze,
+    )

@@ -39,11 +39,15 @@ class IntakeStructuredContext(BaseModel):
     people_details: list["IntakePersonCandidate"] = Field(default_factory=list, max_length=20)
     organizations: list[str] = Field(default_factory=list, max_length=20)
     projects: list[str] = Field(default_factory=list, max_length=20)
+    business_directions: list[str] = Field(default_factory=list, max_length=20)
     focus_questions: list[str] = Field(default_factory=list, max_length=20)
+    event_type: Literal["宴请", "拜访", "会议", "其他"] | None = None
     event_time: str | None = None
     event_location: str | None = None
     entity_assessments: list["IntakeEntityAssessment"] = Field(default_factory=list, max_length=40)
     entity_resolutions: list[IntakeEntityResolution] = Field(default_factory=list, max_length=40)
+    field_states: dict[str, "IntakeFieldState"] = Field(default_factory=dict)
+    final_confirmation: "IntakeFinalConfirmation | None" = None
 
 
 class IntakePersonCandidate(BaseModel):
@@ -57,6 +61,28 @@ class IntakeEntityAssessment(BaseModel):
     mention: str
     is_standard: bool
     reason: str = ""
+
+
+class IntakeFieldState(BaseModel):
+    status: Literal[
+        "MISSING",
+        "NEEDS_COMPLETION",
+        "STANDARD_COMPLETE",
+        "USER_CONFIRMED",
+        "NOT_PROVIDED",
+    ]
+    required: bool
+    reason: str = ""
+
+
+class IntakeFinalConfirmation(BaseModel):
+    version: int = Field(ge=1)
+    question: str = Field(min_length=1, max_length=1_000)
+    status: Literal["PENDING", "CONFIRMED"] = "PENDING"
+
+
+class IntakeFinalConfirmationResult(BaseModel):
+    question: str = Field(min_length=1, max_length=1_000)
 
 
 class IntakeChatResult(BaseModel):
@@ -93,6 +119,10 @@ class IntakeReadinessResult(BaseModel):
         return self
 
 
+class ConfirmIntakeSummaryRequest(BaseModel):
+    expected_version: int = Field(ge=1)
+
+
 class ExternalIdentityCandidate(BaseModel):
     mention: str
     entity_type: Literal["PERSON", "ORGANIZATION"]
@@ -114,12 +144,14 @@ class IntakeChatResponse(IntakeChatResult):
         "COLLECTING",
         "PROCESSING_AUDIO",
         "NEEDS_CONFIRMATION",
+        "AWAITING_FINAL_CONFIRMATION",
         "READY",
         "STARTING_ANALYSIS",
         "ANALYZING",
     ]
     version: int = Field(ge=0)
     confirmation_request: ConfirmationRequest | None = None
+    final_confirmation: IntakeFinalConfirmation | None = None
 
 
 class IntakeSessionResponse(IntakeChatResponse):

@@ -94,10 +94,18 @@ class TaskRepository:
     def get(self, task_id: str) -> ResearchTask | None:
         return self.session.get(ResearchTask, task_id)
 
-    def update(self, task_id: str, **values: object) -> ResearchTask:
+    def get_fresh(self, task_id: str) -> ResearchTask | None:
         task = self.get(task_id)
+        if task is not None:
+            self.session.refresh(task)
+        return task
+
+    def update(self, task_id: str, **values: object) -> ResearchTask:
+        task = self.get_fresh(task_id)
         if task is None:
             raise KeyError(f"Task {task_id} not found")
+        if task.status == "CANCELLED" and set(values) != {"input_snapshot"}:
+            return task
         previous_status = task.status
         for key, value in values.items():
             setattr(task, key, value)

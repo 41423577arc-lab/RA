@@ -4,12 +4,15 @@ import {
   AlertCircle,
   Bot,
   Check,
+  CircleStop,
   Database,
+  Eraser,
   FileText,
   Globe2,
   LoaderCircle,
   Mic,
   MessageSquare,
+  PencilLine,
   RefreshCw,
   RotateCcw,
   Search,
@@ -23,6 +26,16 @@ type InputType = "text" | "audio";
 type ReportTab = "detailed" | "action";
 type TaskView = "activity" | "report";
 type ChatMessage = { role: "user" | "assistant"; content: string };
+type IntakeFieldState = {
+  status: "MISSING" | "NEEDS_COMPLETION" | "STANDARD_COMPLETE" | "USER_CONFIRMED" | "NOT_PROVIDED";
+  required: boolean;
+  reason: string;
+};
+type IntakeFinalConfirmation = {
+  version: number;
+  question: string;
+  status: "PENDING" | "CONFIRMED";
+};
 type IntakeActivity = {
   session_id?: string;
   phase: "IDLE" | "THINKING" | "CHECKING_CONTEXT" | "CALLING_TOOL" | "PROCESSING_TOOL_RESULT" | "COMPLETED" | "FAILED";
@@ -138,6 +151,12 @@ type Task = {
   report_markdown?: string;
   degraded_nodes?: string[];
   error_message?: string;
+  analysis_chat_messages?: ChatMessage[];
+};
+type TaskChatResponse = {
+  task_id: string;
+  task_status: string;
+  messages: ChatMessage[];
 };
 
 type IntakeResponse = {
@@ -146,11 +165,16 @@ type IntakeResponse = {
   analysis_input: string;
   ready_to_analyze: boolean;
   missing_information: string[];
-  status: "COLLECTING" | "PROCESSING_AUDIO" | "NEEDS_CONFIRMATION" | "READY" | "STARTING_ANALYSIS" | "ANALYZING";
+  status: "COLLECTING" | "PROCESSING_AUDIO" | "NEEDS_CONFIRMATION" | "AWAITING_FINAL_CONFIRMATION" | "READY" | "STARTING_ANALYSIS" | "ANALYZING";
   version: number;
   messages?: ChatMessage[];
   research_task_id?: string;
   confirmation_request?: Task["confirmation_request"];
+  final_confirmation?: IntakeFinalConfirmation;
+  structured_context?: {
+    event_type?: "宴请" | "拜访" | "会议" | "其他";
+    field_states?: Record<string, IntakeFieldState>;
+  };
   active_audio_job?: IntakeAudioJob;
 };
 
@@ -170,7 +194,9 @@ const IDLE_ACTIVITY: IntakeActivity = {
 const TOOL_LABELS: Record<string, string> = {
   lookup_internal_identity: "内部身份查询",
   search_key_person_identity_web: "联网身份补全",
-  check_intake_readiness: "分析就绪复核"
+  check_intake_readiness: "分析就绪复核",
+  summarize_intake_confirmation: "当前信息总结",
+  confirm_intake_summary: "最终信息确认"
 };
 const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "NEEDS_CONFIRMATION"]);
 const STATUS_LABELS: Record<string, string> = {
@@ -350,9 +376,15 @@ export default function Home() {
   const [readyToAnalyze, setReadyToAnalyze] = useState(false);
   const [missingInformation, setMissingInformation] = useState<string[]>([]);
   const [intakeConfirmationRequest, setIntakeConfirmationRequest] = useState<Task["confirmation_request"]>();
+  const [finalConfirmation, setFinalConfirmation] = useState<IntakeFinalConfirmation>();
+  const [showSummaryCorrection, setShowSummaryCorrection] = useState(false);
+  const [summaryCorrection, setSummaryCorrection] = useState("");
   const [audioJob, setAudioJob] = useState<IntakeAudioJob>();
   const [audioTranscript, setAudioTranscript] = useState("");
   const [isChatting, setIsChatting] = useState(false);
+  const [analysisChatMessages, setAnalysisChatMessages] = useState<ChatMessage[]>([]);
+  const [analysisChatInput, setAnalysisChatInput] = useState("");
+  const [isAnalysisChatting, setIsAnalysisChatting] = useState(false);
   const [intakeActivity, setIntakeActivity] = useState<IntakeActivity>(IDLE_ACTIVITY);
   const [task, setTask] = useState<Task | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -416,6 +448,7 @@ export default function Home() {
         setReadyToAnalyze(payload.ready_to_analyze);
         setMissingInformation(payload.missing_information);
         setIntakeConfirmationRequest(payload.confirmation_request);
+        setFinalConfirmation(payload.final_confirmation);
         if (payload.active_audio_job) {
           setAudioJob(payload.active_audio_job);
           setAudioTranscript(payload.active_audio_job.transcript ?? "");
@@ -461,7 +494,11 @@ export default function Home() {
 
   useEffect(() => {
     chatThreadRef.current?.scrollTo({ top: chatThreadRef.current.scrollHeight });
-  }, [chatMessages, isChatting]);
+  }, [chatMessages, analysisChatMessages, isChatting, isAnalysisChatting]);
+
+  useEffect(() => {
+    if (task) setAnalysisChatMessages(task.analysis_chat_messages ?? []);
+  }, [task?.task_id]);
 
   useEffect(() => {
     if (!chatSessionId || (!isChatting && !isSubmitting)) return;
@@ -521,6 +558,9 @@ export default function Home() {
       setReadyToAnalyze(payload.ready_to_analyze);
       setMissingInformation(payload.missing_information);
       setIntakeConfirmationRequest(payload.confirmation_request);
+      setFinalConfirmation(payload.final_confirmation);
+      setShowSummaryCorrection(false);
+      setSummaryCorrection("");
       setChatMessages((current) => [
         ...current,
         { role: "assistant", content: payload.assistant_reply }
@@ -568,11 +608,85 @@ export default function Home() {
         throw new Error(payload.detail ?? "任务创建失败");
       }
       setTaskView("activity");
+      setAnalysisChatMessages([]);
+      setAnalysisChatInput("");
       setTask(await response.json());
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "任务创建失败");
     } finally {
       setIsSubmitting(false);
+    }
+  };
+
+  const stopAnalysis = async () => {
+    if (!task || TERMINAL.has(task.status)) return;
+    if (!window.confirm("停止后将保留已经收集到的信息，但不会继续执行后续分析。是否停止？")) return;
+    setIsSubmitting(true);
+    setError("");
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/tasks/${task.task_id}/cancel`, {
+        method: "POST"
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.detail ?? "停止分析失败");
+      setTask(payload as Task);
+      await fetchExecutionLog(task.task_id);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "停止分析失败");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const clearAnalysis = async () => {
+    if (!task || !TERMINAL.has(task.status)) return;
+    if (!window.confirm("清空后将返回信息确认阶段；服务端任务记录仍会保留。是否继续？")) return;
+    setIsSubmitting(true);
+    setError("");
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/tasks/${task.task_id}/clear`, {
+        method: "POST"
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.detail ?? "清空当前分析失败");
+      if (typeof payload.intake_session_version === "number") {
+        setChatSessionVersion(payload.intake_session_version);
+        setReadyToAnalyze(Boolean(payload.ready_to_analyze));
+      }
+      setTask(null);
+      setExecutionEvents([]);
+      executionCursorRef.current = 0;
+      executionTaskRef.current = null;
+      setAnalysisChatMessages([]);
+      setAnalysisChatInput("");
+      setTaskView("activity");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "清空当前分析失败");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const sendAnalysisMessage = async () => {
+    const message = analysisChatInput.trim();
+    if (!task || !message || isAnalysisChatting) return;
+    setAnalysisChatMessages((current) => [...current, { role: "user", content: message }]);
+    setAnalysisChatInput("");
+    setIsAnalysisChatting(true);
+    setError("");
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/tasks/${task.task_id}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.detail ?? "任务对话暂时不可用");
+      setAnalysisChatMessages((payload as TaskChatResponse).messages);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "任务对话暂时不可用");
+    } finally {
+      setIsAnalysisChatting(false);
     }
   };
 
@@ -597,6 +711,9 @@ export default function Home() {
     setReadyToAnalyze(false);
     setMissingInformation([]);
     setIntakeConfirmationRequest(undefined);
+    setFinalConfirmation(undefined);
+    setShowSummaryCorrection(false);
+    setSummaryCorrection("");
     setAudioJob(undefined);
     setAudioTranscript("");
     setSelections({});
@@ -604,6 +721,9 @@ export default function Home() {
     setReportTab("detailed");
     setTaskView("activity");
     setIntakeActivity(IDLE_ACTIVITY);
+    setAnalysisChatMessages([]);
+    setAnalysisChatInput("");
+    setIsAnalysisChatting(false);
   };
 
   const confirmEntities = async () => {
@@ -674,6 +794,7 @@ export default function Home() {
       setReadyToAnalyze(intake.ready_to_analyze);
       setMissingInformation(intake.missing_information);
       setIntakeConfirmationRequest(intake.confirmation_request);
+      setFinalConfirmation(intake.final_confirmation);
       if (intake.messages?.length) setChatMessages(intake.messages);
       setSelections({});
       setManualValues({});
@@ -682,6 +803,42 @@ export default function Home() {
     } finally {
       setIsSubmitting(false);
     }
+  };
+
+  const confirmFinalSummary = async () => {
+    if (!chatSessionId || !finalConfirmation || finalConfirmation.status !== "PENDING") return;
+    setIsSubmitting(true);
+    setError("");
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/intake/${chatSessionId}/confirm-summary`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expected_version: finalConfirmation.version })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.detail ?? "当前信息确认失败");
+      const intake = payload as IntakeResponse;
+      setChatSessionVersion(intake.version);
+      setAnalysisInput(intake.analysis_input);
+      setReadyToAnalyze(intake.ready_to_analyze);
+      setMissingInformation(intake.missing_information);
+      setFinalConfirmation(intake.final_confirmation);
+      if (intake.messages?.length) setChatMessages(intake.messages);
+      setShowSummaryCorrection(false);
+      setSummaryCorrection("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "当前信息确认失败");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const submitSummaryCorrection = () => {
+    const correction = summaryCorrection.trim();
+    if (!correction) return;
+    setShowSummaryCorrection(false);
+    setSummaryCorrection("");
+    void sendChatMessage(`不是，${correction}`);
   };
 
   const uploadAudio = async (file: File) => {
@@ -700,6 +857,8 @@ export default function Home() {
       if (!response.ok) throw new Error(payload.detail ?? "音频上传失败");
       setAudioJob(payload as IntakeAudioJob);
       setReadyToAnalyze(false);
+      setFinalConfirmation(undefined);
+      setShowSummaryCorrection(false);
       setMissingInformation(["等待音频转写和确认"]);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "音频上传失败");
@@ -777,7 +936,11 @@ export default function Home() {
                 </div>
                 <div className={`intake-status ${readyToAnalyze ? "ready" : ""}`}>
                   {readyToAnalyze ? <Check size={14} /> : <MessageSquare size={14} />}
-                  {readyToAnalyze ? "信息已基本齐全" : "正在收集信息"}
+                  {readyToAnalyze
+                    ? "信息已确认"
+                    : finalConfirmation?.status === "PENDING"
+                      ? "等待确认当前信息"
+                      : "正在收集信息"}
                 </div>
               </div>
 
@@ -807,6 +970,72 @@ export default function Home() {
                     <div className="chat-bubble">{message.content}</div>
                   </div>
                 ))}
+                {finalConfirmation?.status === "PENDING" && !isChatting && !audioJob && (
+                  <div className="chat-row assistant summary-confirmation-row">
+                    <div className="summary-confirmation-actions">
+                      <div className="summary-choice-buttons">
+                        <button
+                          className="primary-button"
+                          disabled={isSubmitting}
+                          onClick={() => void confirmFinalSummary()}
+                        >
+                          {isSubmitting ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}
+                          对，是这样的
+                        </button>
+                        <button
+                          className="secondary-button"
+                          disabled={isSubmitting}
+                          onClick={() => setShowSummaryCorrection(true)}
+                        >
+                          <PencilLine size={16} />
+                          不是，我要补充
+                        </button>
+                      </div>
+                      {showSummaryCorrection && (
+                        <div className="summary-correction-editor">
+                          <textarea
+                            value={summaryCorrection}
+                            onChange={(event) => setSummaryCorrection(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter" && !event.shiftKey) {
+                                event.preventDefault();
+                                submitSummaryCorrection();
+                              }
+                            }}
+                            rows={2}
+                            maxLength={2000}
+                            placeholder="不是，是……请输入需要修改或补充的信息"
+                            disabled={isSubmitting || isChatting}
+                          />
+                          <div className="summary-correction-tools">
+                            <label className="icon-button" title="上传 WebM 语音补充">
+                              <Mic size={17} />
+                              <input
+                                type="file"
+                                accept="audio/webm"
+                                hidden
+                                disabled={isSubmitting || Boolean(audioJob)}
+                                onChange={(event) => {
+                                  const file = event.target.files?.[0];
+                                  if (file) void uploadAudio(file);
+                                  event.target.value = "";
+                                }}
+                              />
+                            </label>
+                            <button
+                              className="send-button"
+                              onClick={submitSummaryCorrection}
+                              disabled={!summaryCorrection.trim() || isSubmitting || isChatting}
+                              title="提交补充信息"
+                            >
+                              <Send size={17} />
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
                 {isChatting && (
                   <div className="chat-row assistant">
                     <div className="chat-bubble chat-typing"><LoaderCircle className="spin" size={15} />正在整理</div>
@@ -934,7 +1163,9 @@ export default function Home() {
                     ? `待补充：${missingInformation.join("、")}`
                     : readyToAnalyze
                       ? "可以继续补充，也可以立即开始分析"
-                      : "正在确认信息是否完整"}
+                      : finalConfirmation?.status === "PENDING"
+                        ? "确认当前理解无误后即可立即分析"
+                        : "正在确认信息是否完整"}
                 </div>
                 <button className="primary-button" disabled={!readyToAnalyze || !analysisInput || isSubmitting || isChatting} onClick={startAnalysis}>
                   {isSubmitting ? <LoaderCircle className="spin" size={17} /> : <Search size={17} />}
@@ -947,11 +1178,89 @@ export default function Home() {
 
           {task && (
             <>
+              <section className="input-panel analysis-chat-panel">
+                <div className="panel-heading">
+                  <div>
+                    <span className="section-label">任务协作</span>
+                    <h2>分析对话</h2>
+                  </div>
+                  <div className="intake-status ready">
+                    <MessageSquare size={14} />
+                    {STATUS_LABELS[task.status] ?? task.status}
+                  </div>
+                </div>
+                <div className="chat-thread analysis-chat-thread" ref={chatThreadRef} aria-live="polite">
+                  {chatMessages.map((message, index) => (
+                    <div key={`intake-${message.role}-${index}`} className={`chat-row ${message.role}`}>
+                      <div className="chat-bubble">{message.content}</div>
+                    </div>
+                  ))}
+                  {analysisChatMessages.map((message, index) => (
+                    <div key={`analysis-${message.role}-${index}`} className={`chat-row ${message.role}`}>
+                      <div className="chat-bubble">{message.content}</div>
+                    </div>
+                  ))}
+                  {isAnalysisChatting && (
+                    <div className="chat-row assistant">
+                      <div className="chat-bubble chat-typing">
+                        <LoaderCircle className="spin" size={15} />正在读取当前任务信息
+                      </div>
+                    </div>
+                  )}
+                </div>
+                <div className="chat-composer analysis-chat-composer">
+                  <textarea
+                    value={analysisChatInput}
+                    onChange={(event) => setAnalysisChatInput(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" && !event.shiftKey) {
+                        event.preventDefault();
+                        void sendAnalysisMessage();
+                      }
+                    }}
+                    maxLength={2000}
+                    rows={2}
+                    placeholder="询问当前进度、网页信息或内部项目"
+                    disabled={isAnalysisChatting}
+                  />
+                  <button
+                    className="send-button"
+                    onClick={() => void sendAnalysisMessage()}
+                    disabled={!analysisChatInput.trim() || isAnalysisChatting}
+                    title="发送任务问题"
+                  >
+                    <Send size={18} />
+                  </button>
+                </div>
+              </section>
+
               <div className={`status-strip ${task.status.toLowerCase()}`}>
-                {task.status === "COMPLETED" ? <Check size={18} /> : task.status === "FAILED" ? <AlertCircle size={18} /> : <LoaderCircle className="spin" size={18} />}
+                {task.status === "COMPLETED" ? <Check size={18} /> : task.status === "FAILED" || task.status === "CANCELLED" ? <AlertCircle size={18} /> : <LoaderCircle className="spin" size={18} />}
                 <div>
                   <strong>{STATUS_LABELS[task.status] ?? task.status}</strong>
                   <span>任务 {task.task_id.slice(0, 8)}</span>
+                </div>
+                <div className="task-control-actions">
+                  {!TERMINAL.has(task.status) && (
+                    <button
+                      className="secondary-button danger-button"
+                      onClick={() => void stopAnalysis()}
+                      disabled={isSubmitting}
+                    >
+                      <CircleStop size={16} />
+                      停止分析
+                    </button>
+                  )}
+                  {TERMINAL.has(task.status) && (
+                    <button
+                      className="secondary-button"
+                      onClick={() => void clearAnalysis()}
+                      disabled={isSubmitting}
+                    >
+                      <Eraser size={16} />
+                      清空分析
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -1007,7 +1316,13 @@ export default function Home() {
                     </div>
                     <span className={`live-indicator ${TERMINAL.has(task.status) ? "stopped" : ""}`}>
                       <span aria-hidden="true" />
-                      {task.status === "COMPLETED" ? "已完成" : task.status === "FAILED" ? "已停止" : "实时更新"}
+                      {task.status === "COMPLETED"
+                        ? "已完成"
+                        : task.status === "FAILED" || task.status === "CANCELLED"
+                          ? "已停止"
+                          : task.status === "NEEDS_CONFIRMATION"
+                            ? "等待确认"
+                            : "实时更新"}
                     </span>
                   </header>
                   <ol className="log-list">
