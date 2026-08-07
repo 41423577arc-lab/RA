@@ -4,6 +4,7 @@ from datetime import date
 
 from app.schemas.task import (
     ActionBrief,
+    AssociationAnalysis,
     ConfirmedContext,
     ConfirmedEntity,
     EvidenceBackedItem,
@@ -13,11 +14,63 @@ from app.schemas.task import (
     ProjectResult,
     PublicClaim,
 )
-from app.services.agent_nodes import build_person_identity_summaries, validate_report_content
+from app.services.agent_nodes import (
+    build_person_identity_summaries,
+    complete_report_content,
+    fallback_report_content,
+    validate_report_content,
+)
 from app.services.report_renderer import ReportRenderer
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _project_items(count: int) -> list[EvidenceBackedItem]:
+    return [
+        EvidenceBackedItem(
+            text=f"Project {index}",
+            statement_type="FACT",
+            evidence_refs=[f"PROJECT:P{index:03d}"],
+            confidence=1,
+        )
+        for index in range(count)
+    ]
+
+
+def test_fallback_report_content_caps_priority_projects() -> None:
+    items = _project_items(6)
+    context = ConfirmedContext(
+        intents=["REPORT_GENERATION"],
+        entities=[],
+        event_type="其他",
+    )
+
+    content = fallback_report_content(
+        "input",
+        context,
+        AssociationAnalysis(related_projects=items),
+        [],
+        [],
+    )
+
+    assert content.priority_projects == items[:3]
+
+
+def test_complete_report_content_caps_merged_priority_projects() -> None:
+    items = _project_items(6)
+    primary = GeneratedReportContent(
+        priority_projects=items[:3],
+        action_brief=ActionBrief(objective="Primary"),
+    )
+    fallback = GeneratedReportContent(
+        priority_projects=items[3:],
+        action_brief=ActionBrief(objective="Fallback"),
+    )
+
+    completed = complete_report_content(primary, fallback)
+
+    assert completed.priority_projects == items[:3]
 
 
 def test_report_escapes_raw_html_from_external_content() -> None:
