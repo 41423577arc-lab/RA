@@ -538,7 +538,7 @@ def fallback_report_content(
             )
             for claim in claims[:6]
         ],
-        priority_projects=analysis.related_projects,
+        priority_projects=analysis.related_projects[:3],
         resource_analysis=analysis.available_resources,
         recommended_topics=analysis.recommended_topics,
         advancement_advice=analysis.next_actions,
@@ -594,7 +594,7 @@ def validate_report_content(
         "public_information_summary": clean(
             content.public_information_summary, web_refs
         ),
-        "priority_projects": clean(content.priority_projects, project_refs),
+        "priority_projects": clean(content.priority_projects, project_refs)[:3],
         "resource_analysis": clean(content.resource_analysis, web_refs | project_refs),
         "recommended_topics": clean(content.recommended_topics, allowed),
         "advancement_advice": clean(content.advancement_advice, allowed),
@@ -725,6 +725,7 @@ def complete_report_content(
         )
         for field in fields
     }
+    updates["priority_projects"] = updates["priority_projects"][:3]
     updates["action_brief"] = primary_brief.model_copy(
         update={
             "destination": primary_brief.destination or fallback_brief.destination,
