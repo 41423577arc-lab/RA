@@ -2,7 +2,13 @@ from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
-from app.schemas.task import ProjectResult, SearchResult, WebPage
+from app.schemas.task import (
+    ProjectResult,
+    SearchResult,
+    SupportedWebEvidence,
+    WebEvidenceDecision,
+    WebPage,
+)
 from app.services.extractor import RuleExtractor
 from app.services.report_renderer import ReportRenderer
 from app.tasks.pipeline import (
@@ -164,6 +170,17 @@ class MacroProjects:
 
 
 class FallbackAgents:
+    def web_verify(self, _task_id, candidates):
+        assert candidates
+        return WebEvidenceDecision(
+            supported=[
+                SupportedWebEvidence(
+                    candidate_id=candidates[0].candidate_id,
+                    position="负责",
+                )
+            ]
+        )
+
     def __getattr__(self, _):
         def fail(*args, **kwargs):
             raise RuntimeError("use deterministic fallback")
