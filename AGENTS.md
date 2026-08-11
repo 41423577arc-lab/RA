@@ -1,15 +1,15 @@
-# Codex Parallel Development Rules
+# Codex Development Rules
 
 ## Repository workflow
 
-- `main` is the integration branch. Feature tasks must never commit, force-push, or merge directly into `main`.
-- Keep each task in its own Codex-managed worktree and feature branch.
-- A feature task may commit and push only its own branch. The integration task owns merges and pushes `main` explicitly to both `origin` and `vftci`.
-- Do not use `git reset --hard`, overwrite another task's changes, or delete branches that belong to another task.
-- Before editing, confirm the current branch/worktree and keep unrelated changes untouched.
-- Codex-managed worktrees should run `powershell -ExecutionPolicy Bypass -File scripts/setup_worktree.ps1` once before testing. The script links the main worktree's `.venv` and `frontend/node_modules` without copying them.
-- Feature worktrees must not run package installation or upgrade commands against these shared dependency links. Dependency changes belong to the integration task and are installed from the main worktree.
-- Next.js Turbopack rejects a `node_modules` junction that points outside the worktree. Feature worktrees using the shared junction must run frontend commands with Webpack, for example `npm run build -- --webpack` or `npm run dev -- --webpack`. The main integration worktree can use the normal scripts.
+- `main` is the only long-lived branch and `C:\Users\86139\code\resource-agent-demo` is the canonical worktree.
+- Routine work happens in the canonical worktree on `main`. Before editing, confirm the branch and worktree are correct and preserve unrelated changes.
+- Do not force-push `main`, use `git reset --hard`, overwrite another task's changes, or delete unmerged work.
+- Create a temporary feature branch or worktree only when the user requests isolation or concurrent work makes it necessary. Merge it into `main` after verification, then remove the temporary worktree and delete the merged branch.
+- Push approved `main` updates explicitly to both `origin` and `vftci`.
+- Run the `resource-agent-demo` Compose project only from the canonical `main` worktree. Always pass `-p resource-agent-demo` and preserve the existing named volumes; never use `down -v` when live data is in scope.
+- Dockerfiles use `COPY`, so source changes require rebuilding the affected application services from the canonical worktree. Container labels must identify the canonical worktree as `com.docker.compose.project.working_dir`.
+- If a temporary worktree is needed, run `powershell -ExecutionPolicy Bypass -File scripts/setup_worktree.ps1` once before testing. Do not install or upgrade packages through its shared `.venv` or `frontend/node_modules` links. Use Webpack for frontend commands in that worktree, for example `npm run build -- --webpack`.
 
 ## Functional ownership
 
@@ -50,9 +50,9 @@ Owns intake activity storage, polling, progress presentation, and intake interac
 
 The frontend displays server state and must not infer identity or research outcomes independently.
 
-## Shared integration files
+## Shared cross-module files
 
-These files are integration-owned and must not be edited by feature tasks without explicit user or integration-task authorization:
+Changes to these files can affect multiple functional areas and require explicit scope review before editing:
 
 - `backend/app/api/intake.py`
 - `backend/app/schemas/intake.py`
@@ -62,12 +62,12 @@ These files are integration-owned and must not be edited by feature tasks withou
 - `backend/tests/test_intake.py`
 - Project-wide configuration, dependency, Docker, and documentation files
 
-When a feature needs a shared change, stop before editing it and report a compact contract proposal: affected file, new or changed field/function, compatibility impact, and required tests. The integration task applies cross-module wiring after reviewing all proposals.
+For cross-module changes, report a compact contract proposal before editing: affected file, new or changed field/function, compatibility impact, and required tests. Apply the wiring on `main` only after the scope is understood.
 
 ## Verification
 
 - Add or update focused tests for changed behavior.
 - Backend changes: run the focused test file, then `.\.venv\Scripts\python -m pytest backend\tests -q` when practical.
-- Frontend changes in a feature worktree: run `npm run build -- --webpack` from `frontend`. The integration task runs the normal `npm run build` from the main worktree.
+- Frontend changes in a temporary feature worktree: run `npm run build -- --webpack` from `frontend`. Run the normal `npm run build` from the canonical main worktree.
 - Before handoff, run `git diff --check`, review `git status`, and summarize changed files, tests, and any shared-contract proposal.
-- The integration task merges in this order unless dependencies require otherwise: identity resolution, intake web lookup, intake activity UI. It then runs the complete backend suite and frontend production build before updating `main` on both remotes.
+- Before pushing or deploying `main`, run the complete backend suite and frontend production build when practical, then verify the live Compose services after rebuilding from the canonical worktree.
