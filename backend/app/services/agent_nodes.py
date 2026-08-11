@@ -15,6 +15,9 @@ from app.schemas.task import (
     ProjectRankingBatch,
     ProjectResult,
     PublicClaim,
+    SupportedWebEvidence,
+    WebEvidenceCandidate,
+    WebEvidenceDecision,
     WebEvidence,
     WebPage,
     WebSearchPlan,
@@ -45,16 +48,20 @@ class AgentNodes:
         )
 
     def web_verify(
-        self, task_id: str, context: ConfirmedContext, pages: list[WebPage]
-    ) -> WebVerificationBatch:
+        self, task_id: str, candidates: list[WebEvidenceCandidate]
+    ) -> WebEvidenceDecision:
         return self.llm.parse(
             task_id,
             "web_verify",
             {
-                "confirmed_context": context.model_dump(mode="json"),
-                "pages": [page.model_dump(mode="json") for page in pages],
+                "candidates": [
+                    candidate.model_dump(
+                        mode="json", exclude={"web_result_id"}
+                    )
+                    for candidate in candidates
+                ],
             },
-            WebVerificationBatch,
+            WebEvidenceDecision,
         )
 
     def project_query(self, task_id: str, context: ConfirmedContext) -> ProjectQueryPlan:
@@ -214,6 +221,284 @@ def fallback_project_query(context: ConfirmedContext) -> ProjectQueryPlan:
         statuses=["ACTIVE", "COMPLETED"],
         purpose="、".join(context.intents),
     )
+
+
+WEB_VERIFY_MAX_SEGMENTS_PER_PAGE = 3
+WEB_VERIFY_MAX_SEGMENT_CHARS = 1000
+WEB_VERIFY_MAX_BATCH_CHARS = 20_000
+
+IDENTITY_QUERY_MARKERS = (
+    "身份",
+    "职位",
+    "任职",
+    "履历",
+    "简历",
+    "背景",
+    "董事长",
+    "总裁",
+    "负责人",
+    "管理范围",
+    "分管",
+    "公开活动",
+    "演讲",
+    "采访",
+    "发言",
+)
+ORGANIZATION_TOPIC_MARKERS = (
+    "主营业务",
+    "业务布局",
+    "战略",
+    "项目",
+    "销量",
+    "产能",
+    "近期动态",
+    "新能源",
+    "储能",
+    "组织架构",
+    "子公司",
+    "事业部",
+    "市场",
+)
+POSITION_MARKERS = (
+    "董事长",
+    "总裁",
+    "经理",
+    "主任",
+    "书记",
+    "委员",
+    "创始人",
+    "负责人",
+    "任职",
+    "担任",
+    "现任",
+    "职位",
+    "履历",
+    "管理",
+)
+
+
+def build_web_verification_candidates(
+    pages: list[WebPage],
+    context: ConfirmedContext,
+    queries: list[WebSearchQuery],
+    *,
+    max_segments_per_page: int = WEB_VERIFY_MAX_SEGMENTS_PER_PAGE,
+    max_segment_chars: int = WEB_VERIFY_MAX_SEGMENT_CHARS,
+    max_batch_chars: int = WEB_VERIFY_MAX_BATCH_CHARS,
+) -> list[WebEvidenceCandidate]:
+    """Build a bounded, source-backed input for the web verification model."""
+    query_by_text = {item.query: item for item in queries}
+    output: list[WebEvidenceCandidate] = []
+    used_chars = 0
+
+    for page in sorted(pages, key=lambda item: (item.rank, item.web_result_id)):
+        query = query_by_text.get(page.query)
+        kind = classify_web_evidence_kind(page, query)
+        person = page.target_person or (query.target_person if query else None)
+        target_organization = page.target_organization or (
+            query.target_organization if query else None
+        )
+        organization_terms = _organization_terms(context, target_organization)
+        source_text = _clean_candidate_text(page.raw_content or page.search_snippet)
+        if len(source_text) < 10 or not organization_terms:
+            continue
+
+        required_terms = unique(
+            [
+                *(query.required_terms if query else []),
+                *context.business_directions,
+            ]
+        )
+        if kind == "IDENTITY":
+            if not person:
+                continue
+            anchors = [person]
+            relevant_terms = unique([*organization_terms, *POSITION_MARKERS])
+        else:
+            anchors = organization_terms
+            excluded = {person, *organization_terms, None}
+            topic_terms = [term for term in required_terms if term not in excluded]
+            topic_terms.extend(
+                marker
+                for marker in ORGANIZATION_TOPIC_MARKERS
+                if marker in f"{page.query} {query.purpose if query else ''}"
+            )
+            relevant_terms = unique(topic_terms)
+
+        ranked: list[tuple[int, str, list[str]]] = []
+        for window in _bounded_candidate_windows(
+            source_text, anchors, max_segment_chars=max_segment_chars
+        ):
+            if kind == "IDENTITY":
+                if person not in window or not any(
+                    term in window for term in organization_terms
+                ):
+                    continue
+            else:
+                if not any(term in window for term in organization_terms):
+                    continue
+            matched_terms = unique(
+                [term for term in relevant_terms if term and term in window]
+            )[:8]
+            score = 100 if kind == "IDENTITY" else 50
+            score += 10 * len(matched_terms)
+            score += sum(2 for term in required_terms if term and term in window)
+            ranked.append((score, window, matched_terms))
+
+        seen_text: set[str] = set()
+        page_candidates: list[tuple[str, list[str]]] = []
+        for _, window, matched_terms in sorted(
+            ranked, key=lambda item: (-item[0], len(item[1]))
+        ):
+            key = window.casefold()
+            if key in seen_text:
+                continue
+            seen_text.add(key)
+            page_candidates.append((window, matched_terms))
+            if len(page_candidates) >= max_segments_per_page:
+                break
+
+        for window, matched_terms in page_candidates:
+            if used_chars + len(window) > max_batch_chars:
+                return output
+            candidate_id = f"{page.web_result_id[:56]}-C{len(output) + 1:02d}"
+            output.append(
+                WebEvidenceCandidate(
+                    candidate_id=candidate_id,
+                    web_result_id=page.web_result_id,
+                    kind=kind,
+                    text=window,
+                    target_person=person if kind == "IDENTITY" else None,
+                    target_organization=target_organization
+                    or next(iter(organization_terms), None),
+                    matched_terms=matched_terms,
+                )
+            )
+            used_chars += len(window)
+    return output
+
+
+def classify_web_evidence_kind(
+    page: WebPage, query: WebSearchQuery | None
+) -> str:
+    target_person = page.target_person or (query.target_person if query else None)
+    descriptor = " ".join(
+        [
+            page.query,
+            query.purpose if query else "",
+            *(query.required_terms if query else []),
+        ]
+    )
+    if target_person and any(marker in descriptor for marker in IDENTITY_QUERY_MARKERS):
+        return "IDENTITY"
+    if any(marker in descriptor for marker in ORGANIZATION_TOPIC_MARKERS):
+        return "ORGANIZATION_TOPIC"
+    return "IDENTITY" if target_person else "ORGANIZATION_TOPIC"
+
+
+def materialize_web_verifications(
+    decision: WebEvidenceDecision,
+    candidates: list[WebEvidenceCandidate],
+) -> list[WebVerification]:
+    supported_by_id: dict[str, SupportedWebEvidence] = {}
+    for item in decision.supported:
+        supported_by_id.setdefault(item.candidate_id, item)
+    ambiguous_ids = set(decision.ambiguous_candidate_ids)
+    by_page: dict[str, list[WebEvidenceCandidate]] = {}
+    for candidate in candidates:
+        by_page.setdefault(candidate.web_result_id, []).append(candidate)
+
+    output: list[WebVerification] = []
+    for web_result_id, page_candidates in by_page.items():
+        evidence: list[WebEvidence] = []
+        positions: list[str] = []
+        matched_person = None
+        matched_organization = None
+        has_ambiguous = False
+        for candidate in page_candidates:
+            supported = supported_by_id.get(candidate.candidate_id)
+            if candidate.candidate_id in ambiguous_ids:
+                has_ambiguous = True
+            if supported is None:
+                continue
+            position = normalize(supported.position or "")
+            if candidate.kind == "IDENTITY":
+                if not position or position not in normalize(candidate.text):
+                    has_ambiguous = True
+                    continue
+                positions.append(position)
+                matched_person = candidate.target_person
+            matched_organization = candidate.target_organization
+            if candidate.kind == "IDENTITY" and position:
+                claim = (
+                    f"{candidate.target_person}在"
+                    f"{candidate.target_organization}担任{position}"
+                )
+            else:
+                claim = candidate.text[:500]
+            evidence.append(
+                WebEvidence(
+                    evidence_id=f"E{len(evidence) + 1}",
+                    quote=candidate.text,
+                    claim=claim,
+                    matched_terms=candidate.matched_terms,
+                )
+            )
+
+        keep = bool(evidence)
+        if positions:
+            reason = f"候选原文明确支持目标人物任职：{'、'.join(unique(positions))}"
+        elif keep:
+            reason = "候选原文明确支持目标企业相关事实"
+        elif has_ambiguous:
+            reason = "候选原文存在歧义或未给出可逐字核验的职位"
+        else:
+            reason = "候选原文不足以支持目标事实"
+        output.append(
+            WebVerification(
+                web_result_id=web_result_id,
+                keep=keep,
+                matched_person=matched_person,
+                matched_organization=matched_organization,
+                identity_reason=reason,
+                confidence=0.9 if keep else 0.2,
+                same_name_risk=bool(
+                    not keep
+                    and any(item.kind == "IDENTITY" for item in page_candidates)
+                ),
+                conflicts=["候选原文存在歧义"] if has_ambiguous else [],
+                evidence=evidence,
+            )
+        )
+    return output
+
+
+def _clean_candidate_text(value: str) -> str:
+    without_controls = re.sub(
+        r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", value or ""
+    )
+    return normalize(without_controls)
+
+
+def _bounded_candidate_windows(
+    text: str, anchors: list[str], *, max_segment_chars: int
+) -> list[str]:
+    windows: list[str] = []
+    radius = max_segment_chars // 2
+    for anchor in unique(anchors):
+        start = 0
+        while True:
+            position = text.find(anchor, start)
+            if position < 0:
+                break
+            left = max(0, position - radius)
+            right = min(len(text), left + max_segment_chars)
+            left = max(0, right - max_segment_chars)
+            window = text[left:right].strip()
+            if len(window) >= 10:
+                windows.append(window)
+            start = position + len(anchor)
+    return unique(windows)
 
 
 def validate_web_results(

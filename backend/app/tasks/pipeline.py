@@ -21,6 +21,7 @@ from app.schemas.task import (
 )
 from app.services.agent_nodes import (
     AgentNodes,
+    build_web_verification_candidates,
     claims_from_verifications,
     complete_analysis,
     complete_report_content,
@@ -30,12 +31,11 @@ from app.services.agent_nodes import (
     fallback_report_content,
     fallback_understanding,
     fallback_web_plan,
+    materialize_web_verifications,
     organization_aliases,
-    strict_rule_verifications,
     validate_analysis,
     validate_rankings,
     validate_report_content,
-    validate_web_results,
 )
 from app.services.entity_resolver import EntityResolver
 from app.services.extractor import RuleExtractor
@@ -205,23 +205,15 @@ class ResearchPipeline:
 
             self.repository.update(task_id, status="VERIFYING_WEB_RESULTS")
             if pages:
-                verifications = self._with_fallback(
-                    task_id,
-                    "web_verify",
-                    degraded,
-                    lambda: validate_web_results(
-                        self.agents.web_verify(task_id, context, pages),
-                        pages,
-                        context,
-                        settings.llm_web_identity_threshold,
-                    ),
-                    lambda: strict_rule_verifications(
-                        pages, context, extracted.keywords
-                    ),
+                candidates = build_web_verification_candidates(
+                    pages, context, web_plan.queries
                 )
-                verifications = merge_snippet_verifications(
-                    verifications,
-                    strict_rule_verifications(pages, context, extracted.keywords),
+                verifications = (
+                    materialize_web_verifications(
+                        self.agents.web_verify(task_id, candidates), candidates
+                    )
+                    if candidates
+                    else []
                 )
             else:
                 verifications = []

@@ -40,6 +40,7 @@ IntentType = Literal[
 EntityType = Literal["PERSON", "ORGANIZATION", "PROJECT"]
 EntityResolution = Literal["CONFIRMED", "NEEDS_CONFIRMATION", "MISSING"]
 StatementType = Literal["FACT", "INFERENCE", "RECOMMENDATION"]
+WebEvidenceKind = Literal["IDENTITY", "ORGANIZATION_TOPIC"]
 
 
 class Person(BaseModel):  # 人物信息模型
@@ -235,6 +236,26 @@ class WebVerification(BaseModel):  # 网页结果核验模型
 
 class WebVerificationBatch(BaseModel):  # 网页结果批量核验模型
     results: list[WebVerification]
+
+
+class WebEvidenceCandidate(BaseModel):  # 送入模型的精简网页证据候选
+    candidate_id: str = Field(min_length=1, max_length=64)
+    web_result_id: str = Field(min_length=1, max_length=64)
+    kind: WebEvidenceKind
+    text: str = Field(min_length=10, max_length=1000)
+    target_person: str | None = None
+    target_organization: str | None = None
+    matched_terms: list[str] = Field(default_factory=list, max_length=8)
+
+
+class SupportedWebEvidence(BaseModel):  # 模型只返回支持结论的候选
+    candidate_id: str = Field(min_length=1, max_length=64)
+    position: str | None = Field(default=None, max_length=100)
+
+
+class WebEvidenceDecision(BaseModel):  # 未列出的候选视为不支持
+    supported: list[SupportedWebEvidence] = Field(default_factory=list, max_length=30)
+    ambiguous_candidate_ids: list[str] = Field(default_factory=list, max_length=30)
 
 
 class ProjectQueryPlan(BaseModel):  # 内部项目查询计划模型
