@@ -86,7 +86,7 @@ def test_llm_execution_events_include_exact_messages_and_parsed_output() -> None
 
     result = service.parse(
         "task-execution-log",
-        "web_plan",
+        "agent_turn",
         {"confirmed_name": "范玉峰"},
         WebSearchPlan,
     )

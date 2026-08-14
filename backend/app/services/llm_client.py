@@ -12,13 +12,11 @@ from app.config import Settings
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
 REVIEW_NODES = {
-    "web_verify",
-    "project_rerank",
-    "association",
+    "evidence_verify",
     "intake_identity_normalize",
     "intake_readiness",
 }
-LONG_NODES = {"association", "report_content"}
+LONG_NODES = {"final_synthesis"}
 
 
 class LLMUnavailable(RuntimeError):

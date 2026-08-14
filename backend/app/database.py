@@ -109,17 +109,19 @@ class TaskRepository:
         previous_status = task.status
         for key, value in values.items():
             setattr(task, key, value)
-        self.session.commit()
-        self.session.refresh(task)
         next_status = values.get("status")
         if isinstance(next_status, str) and next_status != previous_status:
-            self.log_execution_event(
-                task_id,
-                event_type="STATUS",
-                status=next_status,
-                title="执行阶段更新",
-                detail=f"{previous_status} -> {next_status}",
+            self.session.add(
+                ExecutionEvent(
+                    scope_id=task_id,
+                    event_type="STATUS",
+                    status=next_status,
+                    title="执行阶段更新",
+                    detail=f"{previous_status} -> {next_status}",
+                )
             )
+        self.session.commit()
+        self.session.refresh(task)
         return task
 
     def log_llm_call(self, task_id: str, **values: object) -> None:

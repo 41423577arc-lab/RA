@@ -19,7 +19,7 @@ import {
   Send,
   TerminalSquare
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -64,11 +64,7 @@ type ExecutionEvent = {
   payload?: Record<string, unknown> | unknown[] | string;
   created_at: string;
 };
-type ExecutionLogResponse = {
-  task_id: string;
-  latest_sequence: number;
-  events: ExecutionEvent[];
-};
+type StreamConnection = "CONNECTING" | "LIVE" | "RECONNECTING" | "STOPPED";
 
 type Person = { name?: string; organization?: string; title?: string };
 type EntityMention = {
@@ -185,6 +181,7 @@ const INITIAL_MESSAGE: ChatMessage = {
 };
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+const DEBUG_EXECUTION_DEFAULT = process.env.NEXT_PUBLIC_DEBUG_EXECUTION === "true";
 const INTAKE_SESSION_STORAGE_KEY = "resource-agent-intake-session-id";
 const IDLE_ACTIVITY: IntakeActivity = {
   phase: "IDLE",
@@ -200,6 +197,47 @@ const TOOL_LABELS: Record<string, string> = {
   confirm_intake_summary: "最终信息确认"
 };
 const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "NEEDS_CONFIRMATION"]);
+const STREAM_EVENT_TYPES = [
+  "PHASE_CHANGED",
+  "AGENT_ACTION",
+  "TOOL_STARTED",
+  "TOOL_RESULT",
+  "CONTEXT_UPDATED",
+  "LLM_STARTED",
+  "LLM_TOKEN",
+  "DEGRADED",
+  "DONE"
+] as const;
+const AGENT_PHASE_LABELS: Record<string, string> = {
+  IDENTITY: "身份确认",
+  PUBLIC_RESEARCH: "公开信息研究",
+  PROJECT_RESEARCH: "内部项目研究",
+  SYNTHESIS: "综合整理",
+  WAITING_USER: "等待确认",
+  DONE: "分析完成"
+};
+const ACTION_LABELS: Record<string, string> = {
+  ASK_USER: "需要补充信息",
+  SEARCH_PUBLIC: "下一步检索公开信息",
+  SEARCH_INTERNAL: "下一步检索内部项目",
+  SYNTHESIZE: "材料已齐备，开始综合",
+  RESPOND: "准备回复",
+  FINISH: "结束当前任务"
+};
+const DEBUG_CODE_PATHS: Record<string, string> = {
+  agent_loop: "backend/app/services/agent_loop.py::AgentLoopRunner.run",
+  agent_turn: "backend/app/services/agent_nodes.py::AgentNodes.agent_turn",
+  SEARCH_PUBLIC: "backend/app/services/agent_tools.py::AgentToolExecutor._search_public",
+  SEARCH_INTERNAL: "backend/app/services/agent_tools.py::AgentToolExecutor._search_internal",
+  tavily_search: "backend/app/services/tavily_client.py::TavilyClient.search",
+  tavily_extract: "backend/app/services/tavily_client.py::TavilyClient.extract",
+  "mcp.search_projects": "backend/app/services/mcp_client.py::ProjectMcpClient.search_projects",
+  evidence_verify: "backend/app/services/evidence_verify.py::AgentEvidenceProcessor.process",
+  deterministic_project_ranker: "backend/app/services/project_ranker.py::ProjectRanker.rank",
+  resource_association_builder: "backend/app/services/resource_association.py::ResourceAssociationBuilder.build",
+  final_synthesis: "backend/app/services/agent_nodes.py::AgentNodes.final_synthesis",
+  research_pipeline: "backend/app/tasks/pipeline.py::ResearchPipeline._run_agent"
+};
 const STATUS_LABELS: Record<string, string> = {
   PENDING: "任务已创建",
   TRANSCRIBING: "正在识别语音",
@@ -364,6 +402,74 @@ function persistedActivityEntries(events: ExecutionEvent[]): ActivityEntry[] {
   }));
 }
 
+function eventPayload(event: ExecutionEvent): Record<string, unknown> {
+  return event.payload && !Array.isArray(event.payload) && typeof event.payload === "object"
+    ? event.payload
+    : {};
+}
+
+function streamAssistantMessages(events: ExecutionEvent[]): ChatMessage[] {
+  const messages: ChatMessage[] = [];
+  let tokenMessageIndex = -1;
+  for (const event of events) {
+    const payload = eventPayload(event);
+    if (event.event_type === "LLM_TOKEN") {
+      const token = String(payload.delta ?? payload.token ?? "");
+      if (!token) continue;
+      if (tokenMessageIndex < 0) {
+        messages.push({ role: "assistant", content: token });
+        tokenMessageIndex = messages.length - 1;
+      } else {
+        messages[tokenMessageIndex] = {
+          role: "assistant",
+          content: messages[tokenMessageIndex].content + token
+        };
+      }
+      continue;
+    }
+
+    tokenMessageIndex = -1;
+    let content = "";
+    if (event.event_type === "PHASE_CHANGED") {
+      const phase = String(payload.phase ?? event.status ?? "");
+      if (payload.source_event_type === "AGENT_PHASE") {
+        content = `进入${AGENT_PHASE_LABELS[phase] ?? phase}阶段。`;
+      }
+    } else if (event.event_type === "AGENT_ACTION") {
+      const action = String(payload.action ?? event.status ?? "");
+      content = ACTION_LABELS[action] ?? event.detail;
+    } else if (event.event_type === "TOOL_STARTED") {
+      content = `${toolDisplayName(event.node_name)}已开始。`;
+    } else if (event.event_type === "TOOL_RESULT") {
+      content = event.detail;
+    } else if (event.event_type === "CONTEXT_UPDATED" && payload.observation) {
+      const observation = payload.observation as Record<string, unknown>;
+      content = `已更新任务上下文：${String(observation.summary ?? event.detail)}`;
+    } else if (event.event_type === "LLM_STARTED") {
+      content = event.node_name === "final_synthesis" ? "正在综合已确认的材料。" : "正在判断下一步行动。";
+    } else if (event.event_type === "DEGRADED") {
+      content = `部分能力已降级，任务将继续：${event.detail}`;
+    } else if (event.event_type === "DONE") {
+      content = event.status === "NEEDS_CONFIRMATION" ? "需要你确认关键信息后才能继续。" : "本轮分析已经结束。";
+    }
+    if (content && messages.at(-1)?.content !== content) {
+      messages.push({ role: "assistant", content });
+    }
+  }
+  return messages;
+}
+
+function toolDisplayName(nodeName?: string) {
+  if (nodeName === "tavily_search") return "公开信息检索";
+  if (nodeName === "tavily_extract") return "网页正文读取";
+  if (nodeName === "mcp.search_projects") return "内部项目检索";
+  return "工具调用";
+}
+
+function debugCodePath(entry: ActivityEntry) {
+  return entry.nodeName ? DEBUG_CODE_PATHS[entry.nodeName] : undefined;
+}
+
 function safeReportUrl(url: string) {
   return /^https?:\/\//i.test(url) ? url : "";
 }
@@ -393,32 +499,19 @@ export default function Home() {
   const [reportTab, setReportTab] = useState<ReportTab>("detailed");
   const [taskView, setTaskView] = useState<TaskView>("activity");
   const [executionEvents, setExecutionEvents] = useState<ExecutionEvent[]>([]);
+  const [streamConnection, setStreamConnection] = useState<StreamConnection>("STOPPED");
+  const [debugExecution, setDebugExecution] = useState(DEBUG_EXECUTION_DEFAULT);
   const [selections, setSelections] = useState<Record<string, string>>({});
   const [manualValues, setManualValues] = useState<Record<string, string>>({});
   const chatThreadRef = useRef<HTMLDivElement | null>(null);
   const executionCursorRef = useRef(0);
   const executionTaskRef = useRef<string | null>(null);
+  const eventSourceRef = useRef<EventSource | null>(null);
 
-  const fetchExecutionLog = useCallback(async (taskId: string) => {
-    if (executionTaskRef.current !== taskId) {
-      executionTaskRef.current = taskId;
-      executionCursorRef.current = 0;
-      setExecutionEvents([]);
-    }
-    const response = await fetch(
-      `${API_BASE}/api/v1/tasks/${taskId}/execution-log?after_sequence=${executionCursorRef.current}`
+  useEffect(() => {
+    setDebugExecution(
+      DEBUG_EXECUTION_DEFAULT || new URLSearchParams(window.location.search).get("debug") === "1"
     );
-    if (!response.ok) throw new Error("执行日志获取失败");
-    const payload = (await response.json()) as ExecutionLogResponse;
-    if (executionTaskRef.current !== taskId) return;
-    executionCursorRef.current = Math.max(executionCursorRef.current, payload.latest_sequence);
-    if (payload.events.length) {
-      setExecutionEvents((current) => {
-        const merged = new Map(current.map((event) => [event.sequence, event]));
-        payload.events.forEach((event) => merged.set(event.sequence, event));
-        return Array.from(merged.values()).sort((left, right) => left.sequence - right.sequence);
-      });
-    }
   }, []);
 
   const fetchTask = useCallback(async (taskId: string) => {
@@ -426,9 +519,8 @@ export default function Home() {
     if (!response.ok) throw new Error("任务状态获取失败");
     const nextTask = (await response.json()) as Task;
     setTask(nextTask);
-    await fetchExecutionLog(taskId);
     return nextTask;
-  }, [fetchExecutionLog]);
+  }, []);
 
   useEffect(() => {
     const sessionId = window.localStorage.getItem(INTAKE_SESSION_STORAGE_KEY);
@@ -480,12 +572,64 @@ export default function Home() {
   }, [audioJob, chatSessionId]);
 
   useEffect(() => {
-    if (!task || TERMINAL.has(task.status)) return;
-    const interval = setInterval(() => {
-      fetchTask(task.task_id).catch((reason) => setError(reason.message));
-    }, 2000);
-    return () => clearInterval(interval);
-  }, [fetchTask, task]);
+    const taskId = task?.task_id;
+    if (!taskId) return;
+    if (executionTaskRef.current !== taskId) {
+      executionTaskRef.current = taskId;
+      executionCursorRef.current = 0;
+      setExecutionEvents([]);
+    }
+
+    eventSourceRef.current?.close();
+    setStreamConnection("CONNECTING");
+    const source = new EventSource(
+      `${API_BASE}/api/v1/tasks/${taskId}/events?after_sequence=${executionCursorRef.current}`
+    );
+    eventSourceRef.current = source;
+
+    const receiveEvent = (message: MessageEvent<string>) => {
+      let event: ExecutionEvent;
+      try {
+        event = JSON.parse(message.data) as ExecutionEvent;
+      } catch {
+        return;
+      }
+      if (executionTaskRef.current !== taskId) return;
+      setStreamConnection("LIVE");
+      executionCursorRef.current = Math.max(executionCursorRef.current, event.sequence);
+      setExecutionEvents((current) => {
+        const merged = new Map(current.map((item) => [item.sequence, item]));
+        merged.set(event.sequence, event);
+        return Array.from(merged.values()).sort((left, right) => left.sequence - right.sequence);
+      });
+
+      const payload = eventPayload(event);
+      if (
+        event.event_type === "PHASE_CHANGED" &&
+        payload.source_event_type === "STATUS" &&
+        event.status
+      ) {
+        setTask((current) => current?.task_id === taskId ? { ...current, status: event.status! } : current);
+      }
+      if (event.event_type === "DONE") {
+        source.close();
+        setStreamConnection("STOPPED");
+        void fetchTask(taskId).catch((reason) => setError(reason.message));
+      }
+    };
+
+    STREAM_EVENT_TYPES.forEach((eventType) => source.addEventListener(eventType, receiveEvent as EventListener));
+    source.onopen = () => setStreamConnection("LIVE");
+    source.onerror = () => {
+      if (source.readyState !== EventSource.CLOSED) setStreamConnection("RECONNECTING");
+    };
+
+    return () => {
+      STREAM_EVENT_TYPES.forEach((eventType) => source.removeEventListener(eventType, receiveEvent as EventListener));
+      source.close();
+      if (eventSourceRef.current === source) eventSourceRef.current = null;
+    };
+  }, [fetchTask, task?.task_id]);
 
   useEffect(() => {
     if (task?.status === "COMPLETED" && (task.detailed_report_markdown || task.report_markdown)) {
@@ -495,7 +639,7 @@ export default function Home() {
 
   useEffect(() => {
     chatThreadRef.current?.scrollTo({ top: chatThreadRef.current.scrollHeight });
-  }, [chatMessages, analysisChatMessages, isChatting, isAnalysisChatting]);
+  }, [chatMessages, analysisChatMessages, executionEvents, isChatting, isAnalysisChatting]);
 
   useEffect(() => {
     if (task) setAnalysisChatMessages(task.analysis_chat_messages ?? []);
@@ -631,7 +775,6 @@ export default function Home() {
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.detail ?? "停止分析失败");
       setTask(payload as Task);
-      await fetchExecutionLog(task.task_id);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "停止分析失败");
     } finally {
@@ -658,6 +801,9 @@ export default function Home() {
       setExecutionEvents([]);
       executionCursorRef.current = 0;
       executionTaskRef.current = null;
+      eventSourceRef.current?.close();
+      eventSourceRef.current = null;
+      setStreamConnection("STOPPED");
       setAnalysisChatMessages([]);
       setAnalysisChatInput("");
       setTaskView("activity");
@@ -702,6 +848,9 @@ export default function Home() {
     setExecutionEvents([]);
     executionCursorRef.current = 0;
     executionTaskRef.current = null;
+    eventSourceRef.current?.close();
+    eventSourceRef.current = null;
+    setStreamConnection("STOPPED");
     setError("");
     setChatMessages([INITIAL_MESSAGE]);
     setChatInput("");
@@ -885,6 +1034,12 @@ export default function Home() {
       ? persistedActivityEntries(executionEvents)
       : buildActivityEntries(task)
     : [];
+  const streamedAssistantMessages = useMemo(
+    () => streamAssistantMessages(executionEvents),
+    [executionEvents]
+  );
+  const latestActivity = taskActivityEntries.at(-1);
+  const currentCodePath = latestActivity ? debugCodePath(latestActivity) : undefined;
   const reportReady = Boolean(task?.status === "COMPLETED" && (task.detailed_report_markdown || task.report_markdown));
   const currentStatusIndex = task ? ANALYSIS_STATUS_ORDER.indexOf(task.status) : -1;
 
@@ -1196,6 +1351,12 @@ export default function Home() {
                       <div className="chat-bubble">{message.content}</div>
                     </div>
                   ))}
+                  {streamedAssistantMessages.map((message, index) => (
+                    <div key={`stream-assistant-${index}`} className="chat-row assistant stream-message">
+                      <span className="stream-avatar" aria-hidden="true"><Bot size={14} /></span>
+                      <div className="chat-bubble">{message.content}</div>
+                    </div>
+                  ))}
                   {analysisChatMessages.map((message, index) => (
                     <div key={`analysis-${message.role}-${index}`} className={`chat-row ${message.role}`}>
                       <div className="chat-bubble">{message.content}</div>
@@ -1294,7 +1455,7 @@ export default function Home() {
                   onClick={() => setTaskView("activity")}
                 >
                   <TerminalSquare size={16} />
-                  执行日志
+                  {debugExecution ? "执行日志" : "实时进展"}
                   <span className="tab-count">{taskActivityEntries.length}</span>
                 </button>
                 <button
@@ -1312,25 +1473,31 @@ export default function Home() {
                 <section className="execution-log" aria-live="polite">
                   <header className="log-header">
                     <div>
-                      <span className="section-label">实时运行结果</span>
-                      <h2>执行日志</h2>
+                      <span className="section-label">{debugExecution ? "调试执行轨迹" : "Agent 实时状态"}</span>
+                      <h2>{latestActivity?.label ?? "等待 Agent 行动"}</h2>
+                      {debugExecution && currentCodePath && (
+                        <code className="current-code-path">{currentCodePath}</code>
+                      )}
                     </div>
-                    <span className={`live-indicator ${TERMINAL.has(task.status) ? "stopped" : ""}`}>
+                    <span className={`live-indicator ${streamConnection === "STOPPED" ? "stopped" : ""}`}>
                       <span aria-hidden="true" />
-                      {task.status === "COMPLETED"
-                        ? "已完成"
-                        : task.status === "FAILED" || task.status === "CANCELLED"
-                          ? "已停止"
-                          : task.status === "NEEDS_CONFIRMATION"
-                            ? "等待确认"
-                            : "实时更新"}
+                      {streamConnection === "CONNECTING"
+                        ? "正在连接"
+                        : streamConnection === "RECONNECTING"
+                          ? "正在重连"
+                          : streamConnection === "LIVE"
+                            ? "实时更新"
+                            : task.status === "NEEDS_CONFIRMATION"
+                              ? "等待确认"
+                              : "已停止"}
                     </span>
                   </header>
                   <ol className="log-list">
                     {taskActivityEntries.map((entry, index) => {
                       const isCurrent = index === taskActivityEntries.length - 1 && !TERMINAL.has(task.status);
-                      const isFailed = entry.status === "FAILED" || entry.eventType === "TOOL_ERROR";
-                      const isWarning = entry.status === "DEGRADED" || entry.eventType === "FALLBACK" || entry.eventType === "LLM_ERROR";
+                      const isFailed = entry.status === "FAILED";
+                      const isWarning = entry.status === "DEGRADED" || entry.eventType === "DEGRADED";
+                      const codePath = debugCodePath(entry);
                       return (
                         <li
                           key={`${entry.status}-${index}`}
@@ -1348,19 +1515,20 @@ export default function Home() {
                                   : String(index + 1).padStart(2, "0")}
                               </span>
                             </div>
-                            {(entry.eventType || entry.nodeName) && (
+                            {debugExecution && (entry.eventType || entry.nodeName) && (
                               <div className="log-meta">
                                 {entry.eventType && <span>{entry.eventType}</span>}
                                 {entry.nodeName && <span>{entry.nodeName}</span>}
                               </div>
                             )}
+                            {debugExecution && codePath && <code className="log-code-path">{codePath}</code>}
                             <p>{entry.detail}</p>
                             {entry.lines && entry.lines.length > 0 && (
                               <ul>
                                 {entry.lines.map((line, lineIndex) => <li key={`${entry.status}-${lineIndex}`}>{line}</li>)}
                               </ul>
                             )}
-                            {entry.payload !== undefined && entry.payload !== null && (
+                            {debugExecution && entry.payload !== undefined && entry.payload !== null && (
                               <details className="log-payload">
                                 <summary>查看完整指令与数据</summary>
                                 <pre>
@@ -1375,8 +1543,8 @@ export default function Home() {
                       );
                     })}
                   </ol>
-                  {!TERMINAL.has(task.status) && (
-                    <div className="log-waiting"><LoaderCircle className="spin" size={14} />等待下一条运行结果</div>
+                  {streamConnection !== "STOPPED" && (
+                    <div className="log-waiting"><LoaderCircle className="spin" size={14} />等待下一条后端事件</div>
                   )}
                 </section>
               )}

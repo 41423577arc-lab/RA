@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     llm_project_confidence_threshold: float = 0.60
     llm_analysis_confidence_threshold: float = 0.60
     llm_safety_salt: str = "resource-agent-demo"
+    agent_max_loops: int = 8
+    agent_max_tool_calls: int = 4
+    agent_max_repeated_actions: int = 2
     intake_entity_resolution_enabled: bool = True
     intake_audio_enabled: bool = True
     intake_react_enabled: bool = True

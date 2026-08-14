@@ -112,6 +112,9 @@ textarea::placeholder { color: #9ca49f; }
 .chat-bubble { max-width: min(78%, 620px); padding: 10px 13px; border-radius: 6px; background: #fff; border: 1px solid #dce2dd; color: #26332b; font-size: 14px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
 .chat-row.user .chat-bubble { color: #fff; background: #176240; border-color: #176240; }
 .chat-typing { display: flex; align-items: center; gap: 7px; color: #68736b; }
+.stream-message { align-items: flex-start; gap: 8px; margin-bottom: 9px; }
+.stream-message .chat-bubble { max-width: calc(100% - 34px); padding: 5px 0; border: 0; background: transparent; color: #526057; font-size: 12px; }
+.stream-avatar { width: 26px; height: 26px; flex: 0 0 26px; display: grid; place-items: center; border: 1px solid #d6ddd8; border-radius: 50%; background: #fff; color: #287153; }
 .summary-confirmation-row { padding-left: 4px; }
 .summary-confirmation-actions { width: min(100%, 620px); display: grid; gap: 10px; }
 .summary-choice-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
@@ -278,6 +281,8 @@ textarea::placeholder { color: #9ca49f; }
   font: 9px/1.4 ui-monospace, monospace;
 }
 .log-entry p { margin: 5px 0 0; color: #657168; font-size: 12px; line-height: 1.6; }
+.current-code-path, .log-code-path { display: block; margin-top: 6px; color: #50645a; font: 10px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace; overflow-wrap: anywhere; }
+.current-code-path { color: #315d48; }
 .log-entry ul { margin: 8px 0 0; padding: 8px 11px; list-style: none; border-left: 2px solid #ccd8d0; background: #f7f9f7; }
 .log-entry li { margin: 3px 0; color: #425047; font: 11px/1.55 ui-monospace, "Microsoft YaHei", sans-serif; overflow-wrap: anywhere; }
 .log-entry li::before { content: "> "; color: #7f9185; }

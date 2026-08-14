@@ -12,14 +12,10 @@ from app.schemas.task import (
     EntityMention,
     IntentUnderstanding,
     ProjectResult,
-    WebEvidence,
     WebPage,
     WebSearchPlan,
     WebSearchQuery,
-    WebVerification,
-    WebVerificationBatch,
 )
-from app.services.agent_nodes import validate_web_results
 from app.services.entity_resolver import EntityResolver, InsufficientContextError
 from app.services.extractor import RuleExtractor
 from app.services.llm_client import LLMCallFailed, StructuredLLM
@@ -79,7 +75,7 @@ def test_llm_client_uses_chat_completions_with_pydantic_schema() -> None:
     fake = FakeChatCompletions(expected.model_dump_json())
     service.client = SimpleNamespace(chat=SimpleNamespace(completions=fake))
 
-    result = service.parse("task-1", "web_plan", {"name": "王传福"}, WebSearchPlan)
+    result = service.parse("task-1", "agent_turn", {"name": "王传福"}, WebSearchPlan)
 
     assert result.queries[0].query == "王传福 比亚迪"
     assert fake.kwargs["model"] == "MiniMax-M3"
@@ -102,7 +98,7 @@ def test_llm_client_rejects_invalid_chat_completion_json() -> None:
     service.client = SimpleNamespace(chat=SimpleNamespace(completions=fake))
 
     with pytest.raises(LLMCallFailed, match="调用失败"):
-        service.parse("task-1", "web_plan", {"name": "王传福"}, WebSearchPlan)
+        service.parse("task-1", "agent_turn", {"name": "王传福"}, WebSearchPlan)
 
 
 def test_llm_client_keeps_responses_mode_available() -> None:
@@ -116,108 +112,10 @@ def test_llm_client_keeps_responses_mode_available() -> None:
     fake = FakeResponses()
     service.client = SimpleNamespace(responses=fake)
 
-    result = service.parse("task-1", "web_plan", {"name": "王传福"}, WebSearchPlan)
+    result = service.parse("task-1", "agent_turn", {"name": "王传福"}, WebSearchPlan)
 
     assert result.queries[0].query == "王传福 比亚迪"
     assert fake.kwargs["reasoning"] == {"effort": "xhigh"}
-
-
-def test_web_verification_rejects_same_name_page_without_target_company() -> None:
-    context = ConfirmedContext(
-        intents=["PERSON_BACKGROUND_RESEARCH"],
-        entities=[
-            ConfirmedEntity(
-                entity_type="PERSON",
-                canonical_name="王传福",
-                organization="比亚迪股份有限公司",
-                confirmed_by="AUTO",
-            )
-        ],
-        event_type="会议",
-    )
-    pages = [
-        WebPage(
-            web_result_id="W001",
-            title="同名人物",
-            url="https://example.com/other",
-            raw_content="王传福参加某大学活动并发表演讲。",
-            rank=0,
-        )
-    ]
-    batch = WebVerificationBatch(
-        results=[
-            WebVerification(
-                web_result_id="W001",
-                keep=True,
-                matched_person="王传福",
-                identity_reason="姓名相同",
-                confidence=0.99,
-                same_name_risk=False,
-                evidence=[
-                    WebEvidence(
-                        evidence_id="E1",
-                        quote="王传福参加某大学活动并发表演讲",
-                        claim="参加大学活动",
-                    )
-                ],
-            )
-        ]
-    )
-
-    results = validate_web_results(batch, pages, context, 0.8)
-
-    assert results[0].keep is False
-    assert results[0].evidence == []
-
-
-def test_web_verification_rejects_evidence_from_an_unrelated_page_section() -> None:
-    context = ConfirmedContext(
-        intents=["PERSON_BACKGROUND_RESEARCH"],
-        entities=[
-            ConfirmedEntity(
-                entity_type="PERSON",
-                canonical_name="张伟",
-                organization="宏远制造有限公司",
-                confirmed_by="USER",
-            )
-        ],
-        event_type="宴请",
-    )
-    page = WebPage(
-        web_result_id="W001",
-        title="人员与企业名录",
-        url="https://example.com/directory",
-        raw_content=(
-            "张伟担任另一家公司的技术负责人。\n"
-            "宏远制造有限公司持续推进园区节能改造。"
-        ),
-        rank=0,
-    )
-    batch = WebVerificationBatch(
-        results=[
-            WebVerification(
-                web_result_id="W001",
-                keep=True,
-                matched_person="张伟",
-                matched_organization="宏远制造有限公司",
-                identity_reason="页面同时出现姓名和企业",
-                confidence=0.99,
-                same_name_risk=False,
-                evidence=[
-                    WebEvidence(
-                        evidence_id="E1",
-                        quote="张伟担任另一家公司的技术负责人",
-                        claim="张伟担任技术负责人",
-                    )
-                ],
-            )
-        ]
-    )
-
-    results = validate_web_results(batch, [page], context, 0.8)
-
-    assert results[0].keep is False
-    assert results[0].evidence == []
 
 
 def test_entity_resolver_requires_confirmation_for_huaxing_li_alias() -> None:
@@ -524,13 +422,9 @@ def test_v05_pipeline_completes_with_all_llm_nodes_degraded() -> None:
 
     assert task.status == "COMPLETED", getattr(task, "error_message", None)
     assert set(task.degraded_nodes) == {
-        "understanding",
-        "web_plan",
+        "agent_turn",
         "web_search",
-        "project_query",
-        "project_rerank",
-        "association",
-        "report_content",
+        "final_synthesis",
     }
     assert "P001" in task.detailed_report_markdown
     assert "和谁见面：王传福" in task.action_brief_markdown

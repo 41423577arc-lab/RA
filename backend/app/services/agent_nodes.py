@@ -1,8 +1,9 @@
 import re
-from collections.abc import Callable
-
 from app.schemas.task import (
     ActionBrief,
+    AgentAction,
+    AgentContext,
+    AgentTurnDecision,
     AssociationAnalysis,
     ConfirmedContext,
     EntityMention,
@@ -12,7 +13,6 @@ from app.schemas.task import (
     IntentUnderstanding,
     ProjectQueryPlan,
     ProjectRanking,
-    ProjectRankingBatch,
     ProjectResult,
     PublicClaim,
     SupportedWebEvidence,
@@ -23,7 +23,6 @@ from app.schemas.task import (
     WebSearchPlan,
     WebSearchQuery,
     WebVerification,
-    WebVerificationBatch,
 )
 from app.services.llm_client import StructuredLLM
 
@@ -32,101 +31,49 @@ class AgentNodes:
     def __init__(self, llm: StructuredLLM):
         self.llm = llm
 
-    def understanding(
-        self, task_id: str, input_text: str, extracted: ExtractedInfo
-    ) -> IntentUnderstanding:
-        return self.llm.parse(
+    def agent_turn(self, task_id: str, context: AgentContext) -> AgentAction:
+        decision = self.llm.parse(
             task_id,
-            "understanding",
-            {"input_text": input_text, "rule_extraction": extracted.model_dump(mode="json")},
-            IntentUnderstanding,
+            "agent_turn",
+            {"context": context.model_dump(mode="json")},
+            AgentTurnDecision,
         )
+        return decision.action
 
-    def web_plan(self, task_id: str, context: ConfirmedContext) -> WebSearchPlan:
-        return self.llm.parse(
-            task_id, "web_plan", {"confirmed_context": context.model_dump(mode="json")}, WebSearchPlan
-        )
-
-    def web_verify(
+    def evidence_verify(
         self, task_id: str, candidates: list[WebEvidenceCandidate]
     ) -> WebEvidenceDecision:
         return self.llm.parse(
             task_id,
-            "web_verify",
+            "evidence_verify",
             {
                 "candidates": [
-                    candidate.model_dump(
-                        mode="json", exclude={"web_result_id"}
-                    )
+                    candidate.model_dump(mode="json", exclude={"web_result_id"})
                     for candidate in candidates
                 ],
             },
             WebEvidenceDecision,
         )
 
-    def project_query(self, task_id: str, context: ConfirmedContext) -> ProjectQueryPlan:
-        return self.llm.parse(
-            task_id,
-            "project_query",
-            {"confirmed_context": context.model_dump(mode="json")},
-            ProjectQueryPlan,
-        )
-
-    def project_rerank(
+    def final_synthesis(
         self,
         task_id: str,
         context: ConfirmedContext,
-        projects: list[ProjectResult],
-    ) -> ProjectRankingBatch:
-        return self.llm.parse(
-            task_id,
-            "project_rerank",
-            {
-                "confirmed_context": context.model_dump(mode="json"),
-                "projects": [project.model_dump(mode="json") for project in projects],
-            },
-            ProjectRankingBatch,
-        )
-
-    def association(
-        self,
-        task_id: str,
-        context: ConfirmedContext,
-        claims: list[PublicClaim],
-        projects: list[ProjectResult],
-        rankings: list[ProjectRanking],
-    ) -> AssociationAnalysis:
-        return self.llm.parse(
-            task_id,
-            "association",
-            {
-                "confirmed_context": context.model_dump(mode="json"),
-                "public_claims": [claim.model_dump(mode="json") for claim in claims],
-                "projects": [project.model_dump(mode="json") for project in projects],
-                "rankings": [ranking.model_dump(mode="json") for ranking in rankings],
-            },
-            AssociationAnalysis,
-        )
-
-    def report_content(
-        self,
-        task_id: str,
-        input_text: str,
-        context: ConfirmedContext,
-        claims: list[PublicClaim],
-        projects: list[ProjectResult],
-        analysis: AssociationAnalysis,
+        evidence: list[PublicClaim],
+        ranked_projects: list[tuple[ProjectResult, ProjectRanking]],
+        association: AssociationAnalysis,
     ) -> GeneratedReportContent:
+        from app.services.final_synthesis import build_final_synthesis_input
+
         return self.llm.parse(
             task_id,
-            "report_content",
-            {
-                "input_text": input_text,
-                "confirmed_context": context.model_dump(mode="json"),
-                "public_claims": [claim.model_dump(mode="json") for claim in claims],
-                "projects": [project.model_dump(mode="json") for project in projects],
-                "association_analysis": analysis.model_dump(mode="json"),
-            },
+            "final_synthesis",
+            build_final_synthesis_input(
+                context,
+                evidence,
+                ranked_projects,
+                association,
+            ),
             GeneratedReportContent,
         )
 
@@ -501,130 +448,6 @@ def _bounded_candidate_windows(
     return unique(windows)
 
 
-def validate_web_results(
-    batch: WebVerificationBatch,
-    pages: list[WebPage],
-    context: ConfirmedContext,
-    threshold: float,
-) -> list[WebVerification]:
-    by_id = {page.web_result_id: page for page in pages}
-    people = {
-        entity.canonical_name
-        for entity in context.entities
-        if entity.entity_type == "PERSON"
-    }
-    output: list[WebVerification] = []
-    for result in batch.results:
-        page = by_id.get(result.web_result_id)
-        if page is None:
-            continue
-        body = normalize(_web_evidence_text(page))
-        target_person = page.target_person or (
-            result.matched_person if result.matched_person in people else None
-        )
-        organization_terms = _organization_terms(context, page.target_organization)
-        organization_present = bool(
-            not organization_terms
-            or any(name in body for name in organization_terms)
-        )
-        matched_person_valid = bool(
-            target_person
-            and result.matched_person == target_person
-            and target_person in body
-            and organization_present
-        )
-        matched_organization_valid = bool(
-            not target_person
-            and not people
-            and result.matched_organization
-            and result.matched_organization in organization_terms
-            and organization_present
-        )
-        identity_present = matched_person_valid or matched_organization_valid
-        evidence = []
-        for item in result.evidence:
-            quote = normalize(item.quote)
-            if quote not in body:
-                continue
-            if target_person:
-                if target_person not in quote or (
-                    organization_terms
-                    and not any(name in quote for name in organization_terms)
-                ):
-                    continue
-            elif not any(name in quote for name in organization_terms):
-                continue
-            evidence.append(item)
-        keep = result.keep and result.confidence >= threshold and identity_present and bool(evidence)
-        output.append(result.model_copy(update={"keep": keep, "evidence": evidence if keep else []}))
-    return output
-
-
-def strict_rule_verifications(
-    pages: list[WebPage], context: ConfirmedContext, keywords: list[str]
-) -> list[WebVerification]:
-    people = [item.canonical_name for item in context.entities if item.entity_type == "PERSON"]
-    output = []
-    for page in pages:
-        source_text = _web_evidence_text(page)
-        plain = normalize(source_text)
-        target_people = [page.target_person] if page.target_person else people
-        person = next((name for name in target_people if name and name in plain), None)
-        organization_terms = _organization_terms(context, page.target_organization)
-        organization = next(
-            (name for name in organization_terms if name in plain), None
-        )
-        keep = bool(person and (organization or not organization_terms))
-        if not target_people:
-            keep = bool(organization)
-        evidence: list[WebEvidence] = []
-        if keep:
-            candidates = (
-                _person_evidence_windows(source_text, person)
-                if person
-                else [
-                    item.strip()
-                    for item in re.split(r"[。！？!?；;\n]+", plain)
-                    if item.strip()
-                ]
-            )
-            for sentence in candidates:
-                if person and person not in sentence:
-                    continue
-                if person and organization_terms and not any(
-                    name in sentence for name in organization_terms
-                ):
-                    continue
-                if not person and organization and organization not in sentence:
-                    continue
-                matched = [word for word in keywords if word in sentence]
-                if len(sentence) >= 10:
-                    evidence.append(
-                        WebEvidence(
-                            evidence_id=f"E{len(evidence) + 1}",
-                            quote=sentence[:500],
-                            claim=sentence[:500],
-                            matched_terms=matched,
-                        )
-                    )
-                if len(evidence) >= 3:
-                    break
-            keep = bool(evidence)
-        output.append(
-            WebVerification(
-                web_result_id=page.web_result_id,
-                keep=keep,
-                matched_person=person,
-                matched_organization=organization,
-                identity_reason="规则确认正文命中已确认人物与单位或目标企业" if keep else "正文未命中已确认身份",
-                confidence=0.85 if keep else 0.2,
-                same_name_risk=bool(target_people and not organization),
-                evidence=evidence,
-            )
-        )
-    return output
-
-
 def claims_from_verifications(
     verifications: list[WebVerification], pages: list[WebPage]
 ) -> list[PublicClaim]:
@@ -653,152 +476,6 @@ def claims_from_verifications(
                 )
             )
     return claims
-
-
-def deterministic_rankings(projects: list[ProjectResult], context: ConfirmedContext) -> list[ProjectRanking]:
-    match_scores = {"PERSON_EXACT": 95, "ORG_EXACT": 85, "PROJECT_EXACT": 90, "TEXT_MATCH": 65, "VECTOR_MATCH": 50}
-    output = []
-    for project in projects:
-        score = match_scores[project.match_type]
-        if project.status == "ACTIVE":
-            score = min(100, score + 3)
-        output.append(
-            ProjectRanking(
-                project_id=project.project_id,
-                relevance_score=score,
-                relevance_reason=f"确定性匹配依据为 {project.match_type}，项目状态为 {project.status}",
-                recommended_use="会面中了解当前进展" if project.status == "ACTIVE" else "作为历史合作案例",
-                related_internal_resource=project.owner_name,
-                confidence=0.9 if project.match_type in {"PERSON_EXACT", "ORG_EXACT", "PROJECT_EXACT"} else 0.65,
-                evidence_refs=[f"PROJECT:{project.project_id}"],
-            )
-        )
-    return sorted(output, key=lambda item: (-item.relevance_score, item.project_id))
-
-
-def validate_rankings(
-    rankings: list[ProjectRanking], projects: list[ProjectResult], threshold: float
-) -> list[ProjectRanking]:
-    by_id = {project.project_id: project for project in projects}
-    fallback = {item.project_id: item for item in deterministic_rankings(projects, _empty_context())}
-    output = []
-    seen = set()
-    for ranking in rankings:
-        if ranking.project_id not in by_id or ranking.project_id in seen:
-            continue
-        seen.add(ranking.project_id)
-        valid_ref = f"PROJECT:{ranking.project_id}"
-        if ranking.confidence < threshold:
-            output.append(fallback[ranking.project_id])
-        else:
-            output.append(ranking.model_copy(update={"evidence_refs": [valid_ref]}))
-    for project_id, ranking in fallback.items():
-        if project_id not in seen:
-            output.append(ranking)
-    return sorted(output, key=lambda item: (-item.relevance_score, item.project_id))
-
-
-def fallback_association(
-    claims: list[PublicClaim], projects: list[ProjectResult], rankings: list[ProjectRanking]
-) -> AssociationAnalysis:
-    findings = [
-        EvidenceBackedItem(
-            text=claim.claim,
-            statement_type="FACT",
-            evidence_refs=[f"WEB:{claim.web_result_id}:{claim.evidence_id}"],
-            confidence=claim.confidence,
-        )
-        for claim in claims[:5]
-    ]
-    related = [
-        EvidenceBackedItem(
-            text=f"{project.project_name}，状态：{project.status}，负责人：{project.owner_name}",
-            statement_type="FACT",
-            evidence_refs=[f"PROJECT:{project.project_id}"],
-            confidence=next((item.confidence for item in rankings if item.project_id == project.project_id), 0.8),
-        )
-        for project in projects[:5]
-    ]
-    resources = [
-        EvidenceBackedItem(
-            text="；".join(
-                filter(
-                    None,
-                    (
-                        f"{project.project_name} 的我方项目销售员为 {project.owner_name}",
-                        f"联系电话 {project.owner_phone}" if project.owner_phone else None,
-                        f"邮箱 {project.owner_email}" if project.owner_email else None,
-                        (
-                            f"客户联系人为 {project.contact_name}"
-                            + (
-                                f"（{project.customer_contact_title}）"
-                                if project.customer_contact_title
-                                else ""
-                            )
-                            + (
-                                f"，联系电话 {project.customer_contact_phone}"
-                                if project.customer_contact_phone
-                                else ""
-                            )
-                            if project.contact_name
-                            else None
-                        ),
-                        (
-                            f"上级为 {project.owner_manager_name}，负责 {project.owner_region}"
-                            if project.owner_manager_name and project.owner_region
-                            else None
-                        ),
-                    ),
-                )
-            ),
-            statement_type="FACT",
-            evidence_refs=[f"PROJECT:{project.project_id}"],
-            confidence=0.8,
-        )
-        for project in projects[:3]
-    ]
-    gaps = []
-    if not claims:
-        gaps.append(EvidenceBackedItem(text="本次未使用联网身份来源", statement_type="FACT", evidence_refs=["INPUT:ORIGINAL"], confidence=1))
-    if not projects:
-        gaps.append(EvidenceBackedItem(text="未检索到相关内部项目", statement_type="FACT", evidence_refs=["INPUT:ORIGINAL"], confidence=1))
-    return AssociationAnalysis(
-        key_findings=findings,
-        related_projects=related,
-        available_resources=resources,
-        recommended_topics=[
-            EvidenceBackedItem(
-                text=f"可围绕 {project.project_name} 的当前进展、客户需求和下一步安排展开沟通",
-                statement_type="RECOMMENDATION",
-                evidence_refs=[f"PROJECT:{project.project_id}"],
-                confidence=0.8,
-            )
-            for project in projects[:3]
-        ],
-        risks=[],
-        information_gaps=gaps,
-        next_actions=resources,
-    )
-
-
-def validate_analysis(
-    analysis: AssociationAnalysis,
-    claims: list[PublicClaim],
-    projects: list[ProjectResult],
-    threshold: float,
-) -> AssociationAnalysis:
-    allowed = {f"WEB:{item.web_result_id}:{item.evidence_id}" for item in claims}
-    allowed.update(f"PROJECT:{item.project_id}" for item in projects)
-    allowed.update({"INPUT:ORIGINAL", "RULE:EXTRACTED", "CONFIRMATION:1"})
-
-    def clean(items: list[EvidenceBackedItem]) -> list[EvidenceBackedItem]:
-        return [
-            item.model_copy(update={"evidence_refs": [ref for ref in item.evidence_refs if ref in allowed]})
-            for item in items
-            if item.confidence >= threshold and any(ref in allowed for ref in item.evidence_refs)
-        ]
-
-    return AssociationAnalysis(**{name: clean(getattr(analysis, name)) for name in AssociationAnalysis.model_fields})
 
 
 def fallback_report_content(
@@ -966,28 +643,6 @@ def build_person_identity_summaries(
     return summaries
 
 
-def complete_analysis(
-    primary: AssociationAnalysis, fallback: AssociationAnalysis
-) -> AssociationAnalysis:
-    fields = (
-        "key_findings",
-        "related_projects",
-        "available_resources",
-        "recommended_topics",
-        "risks",
-        "information_gaps",
-        "next_actions",
-    )
-    return primary.model_copy(
-        update={
-            field: merge_evidence_items(
-                getattr(primary, field), getattr(fallback, field)
-            )
-            for field in fields
-        }
-    )
-
-
 def complete_report_content(
     primary: GeneratedReportContent, fallback: GeneratedReportContent
 ) -> GeneratedReportContent:
@@ -1100,9 +755,6 @@ def businessize_text(value: str) -> str:
     return output
 
 
-def _empty_context() -> ConfirmedContext:
-    return ConfirmedContext(intents=["REPORT_GENERATION"], entities=[], event_type="其他")
-
 
 def unique(values) -> list[str]:
     return list(dict.fromkeys(value.strip() for value in values if value and value.strip()))
@@ -1110,12 +762,6 @@ def unique(values) -> list[str]:
 
 def normalize(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
-
-
-def _web_evidence_text(page: WebPage) -> str:
-    if page.search_snippet and page.search_snippet not in page.raw_content:
-        return f"{page.raw_content}\n{page.search_snippet}"
-    return page.raw_content or page.search_snippet
 
 
 def _organization_terms(
@@ -1144,40 +790,6 @@ def organization_aliases(value: str | None) -> list[str]:
     if name.endswith("有限公司"):
         aliases.append(name[: -len("有限公司")])
     return unique(aliases)
-
-
-def _person_evidence_windows(text: str, person: str, radius: int = 250) -> list[str]:
-    lines = [normalize(line) for line in text.splitlines() if normalize(line)]
-    windows: list[str] = []
-    for index, line in enumerate(lines):
-        if person not in line:
-            continue
-        block = [line]
-        for following in lines[index + 1 : index + 4]:
-            if following.startswith("姓名："):
-                break
-            block.append(following)
-        windows.append(" ".join(block))
-
-    if windows:
-        distinct = sorted(unique(windows), key=len, reverse=True)
-        return [
-            window
-            for index, window in enumerate(distinct)
-            if not any(window in longer for longer in distinct[:index])
-        ]
-
-    plain = normalize(text)
-    start = 0
-    while True:
-        position = plain.find(person, start)
-        if position < 0:
-            break
-        windows.append(
-            plain[max(0, position - radius) : position + len(person) + radius].strip()
-        )
-        start = position + len(person)
-    return unique(windows)
 
 
 def _evidence_source(page: WebPage, quote: str) -> str:

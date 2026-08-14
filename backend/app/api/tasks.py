@@ -2,11 +2,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.database import TaskRepository, get_session
+from app.database import SessionLocal, TaskRepository, get_session
 from app.models.database import IntakeSession, ResearchTask
 from app.schemas.task import (
     AssociationAnalysis,
@@ -38,6 +39,7 @@ from app.services.analysis_chat import (
     fallback_task_chat_reply,
 )
 from app.services.llm_client import LLMCallFailed, LLMUnavailable, StructuredLLM
+from app.services.execution_stream import stream_execution_events
 from app.tasks.pipeline import run_research_pipeline
 
 
@@ -169,6 +171,38 @@ def get_execution_log(
             )
             for event in events
         ],
+    )
+
+
+@router.get("/{task_id}/events")
+async def stream_task_execution_events(
+    task_id: UUID,
+    request: Request,
+    after_sequence: int = Query(default=0, ge=0),
+) -> StreamingResponse:
+    with SessionLocal() as session:
+        if TaskRepository(session).get(str(task_id)) is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+    last_event_id = request.headers.get("last-event-id")
+    if last_event_id:
+        try:
+            after_sequence = max(after_sequence, int(last_event_id))
+        except ValueError:
+            pass
+
+    return StreamingResponse(
+        stream_execution_events(
+            str(task_id),
+            request,
+            after_sequence=after_sequence,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

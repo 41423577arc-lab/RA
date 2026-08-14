@@ -2,7 +2,7 @@ from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 TaskStatus = Literal[
@@ -41,6 +41,22 @@ EntityType = Literal["PERSON", "ORGANIZATION", "PROJECT"]
 EntityResolution = Literal["CONFIRMED", "NEEDS_CONFIRMATION", "MISSING"]
 StatementType = Literal["FACT", "INFERENCE", "RECOMMENDATION"]
 WebEvidenceKind = Literal["IDENTITY", "ORGANIZATION_TOPIC"]
+AgentPhase = Literal[
+    "IDENTITY",
+    "PUBLIC_RESEARCH",
+    "PROJECT_RESEARCH",
+    "SYNTHESIS",
+    "WAITING_USER",
+    "DONE",
+]
+AgentAction = Literal[
+    "ASK_USER",
+    "SEARCH_PUBLIC",
+    "SEARCH_INTERNAL",
+    "SYNTHESIZE",
+    "RESPOND",
+    "FINISH",
+]
 
 
 class Person(BaseModel):  # 人物信息模型
@@ -300,6 +316,16 @@ class ProjectResult(BaseModel):  # 内部项目查询结果模型
     similarity: float | None = None
 
 
+class Observation(BaseModel):  # Agent 动作执行后的最小结果记录
+    phase: AgentPhase
+    action: AgentAction
+    status: Literal["SUCCESS", "EMPTY", "FAILED"]
+    summary: str = Field(default="", max_length=2_000)
+    result_refs: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    project_ids: list[str] = Field(default_factory=list)
+
+
 class ProjectRanking(BaseModel):  # 项目相关性排序结果模型
     project_id: str
     relevance_score: int = Field(ge=0, le=100)
@@ -308,6 +334,17 @@ class ProjectRanking(BaseModel):  # 项目相关性排序结果模型
     related_internal_resource: str | None = None
     confidence: float = Field(ge=0, le=1)
     evidence_refs: list[str] = Field(default_factory=list)
+    score: int | None = Field(default=None, ge=0, le=100)
+    reason_codes: list[str] = Field(default_factory=list)
+    rank: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def synchronize_score(self):
+        if self.score is None:
+            self.score = self.relevance_score
+        elif self.score != self.relevance_score:
+            raise ValueError("score must equal relevance_score")
+        return self
 
 
 class ProjectRankingBatch(BaseModel):  # 项目相关性批量排序模型
@@ -382,9 +419,48 @@ class ExecutionLogResponse(BaseModel):  # 执行日志响应模型
     events: list[ExecutionEventResponse] = Field(default_factory=list)
 
 
+class StreamExecutionEvent(BaseModel):
+    sequence: int = Field(ge=1)
+    event_type: Literal[
+        "PHASE_CHANGED",
+        "AGENT_ACTION",
+        "TOOL_STARTED",
+        "TOOL_RESULT",
+        "CONTEXT_UPDATED",
+        "LLM_STARTED",
+        "LLM_TOKEN",
+        "DEGRADED",
+        "DONE",
+    ]
+    node_name: str | None = None
+    status: str | None = None
+    title: str
+    detail: str
+    payload: dict | list | str | None = None
+    created_at: datetime
+
+
 class TaskChatMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=2_000)
+
+
+class AgentContext(BaseModel):  # Agent Loop 每一步共享的裁剪状态
+    phase: AgentPhase
+    user_input: str = Field(default="", max_length=10_000)
+    confirmed_context: ConfirmedContext | None = None
+    identity_candidates: ConfirmationRequest | None = None
+    public_evidence: list[PublicClaim] = Field(default_factory=list)
+    project_results: list[ProjectResult] = Field(default_factory=list)
+    information_gaps: list[EvidenceBackedItem] = Field(default_factory=list)
+    recent_messages: list[TaskChatMessage] = Field(default_factory=list)
+    observations: list[Observation] = Field(default_factory=list)
+
+
+class AgentTurnDecision(BaseModel):  # agent_turn 只允许选择下一步动作
+    model_config = ConfigDict(extra="forbid")
+
+    action: AgentAction
 
 
 class TaskChatRequest(BaseModel):

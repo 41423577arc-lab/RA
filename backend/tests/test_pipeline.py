@@ -10,6 +10,7 @@ from app.schemas.task import (
     WebPage,
 )
 from app.services.extractor import RuleExtractor
+from app.services.entity_resolver import EntityResolver
 from app.services.report_renderer import ReportRenderer
 from app.tasks.pipeline import (
     ResearchPipeline,
@@ -24,7 +25,18 @@ ROOT = Path(__file__).resolve().parents[2]
 class FakeRepository:
     def __init__(self, task):
         self.task = task
+        for name, value in {
+            "degraded_nodes": [],
+            "confirmation_version": 0,
+            "confirmed_context": None,
+            "extracted_info": None,
+            "llm_understanding": None,
+            "input_snapshot": {},
+        }.items():
+            if not hasattr(task, name):
+                setattr(task, name, value)
         self.statuses: list[str] = []
+        self.events: list[dict] = []
 
     def get(self, task_id: str):
         return self.task if task_id == self.task.id else None
@@ -36,6 +48,10 @@ class FakeRepository:
         if "status" in values:
             self.statuses.append(values["status"])
         return self.task
+
+    def log_execution_event(self, task_id: str, **values):
+        assert task_id == self.task.id
+        self.events.append(values)
 
 
 class NoopTranscriber:
@@ -84,7 +100,7 @@ class FailedWeb:
 class FakeProjects:
     async def search_projects(self, person_names, organization_names, keywords):
         assert person_names == ["王传福"]
-        assert organization_names == ["比亚迪股份有限公司"]
+        assert "比亚迪股份有限公司" in organization_names
         assert keywords == ["新能源", "储能"]
         return [
             ProjectResult(
@@ -170,7 +186,10 @@ class MacroProjects:
 
 
 class FallbackAgents:
-    def web_verify(self, _task_id, candidates):
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def evidence_verify(self, _task_id, candidates):
         assert candidates
         return WebEvidenceDecision(
             supported=[
@@ -195,7 +214,13 @@ def make_pipeline(repository, web):
         extractor=RuleExtractor(ROOT / "seed"),
         web=web,
         projects=FakeProjects(),
-        renderer=ReportRenderer(ROOT / "backend/templates/report.md.j2"),
+        renderer=ReportRenderer(
+            ROOT / "backend/templates/report.md.j2",
+            ROOT / "backend/templates/detailed_report.md.j2",
+            ROOT / "backend/templates/action_brief.md.j2",
+        ),
+        agents=FallbackAgents(),
+        entity_resolver=EntityResolver(),
     )
 
 
@@ -285,14 +310,18 @@ def test_full_text_pipeline_generates_report_and_all_states() -> None:
     make_pipeline(repository, FailedWeb()).run(task.id)
 
     assert repository.statuses == [
-        "EXTRACTING",
+        "CONTEXT_EXTRACTING",
+        "WEB_SEARCHING",
         "PROJECT_SEARCHING",
-        "GENERATING",
+        "RERANKING_PROJECTS",
+        "ANALYZING_ASSOCIATIONS",
+        "GENERATING_REPORT_CONTENT",
+        "RENDERING_REPORT",
         "COMPLETED",
     ]
     assert "比亚迪园区储能管理平台" in task.report_markdown
     assert "比亚迪新能源汽车供应链分析" in task.report_markdown
-    assert task.web_search_status == "SKIPPED"
+    assert task.web_search_status == "FAILED"
     assert task.internal_search_status == "SUCCESS"
 
 
@@ -308,9 +337,9 @@ def test_search_failure_is_partial_and_internal_projects_continue() -> None:
     make_pipeline(repository, FailedWeb()).run(task.id)
 
     assert task.status == "COMPLETED"
-    assert task.web_search_status == "SKIPPED"
+    assert task.web_search_status == "FAILED"
     assert task.web_fetch_status == "SKIPPED"
-    assert "本次没有可复用的联网身份来源" in task.report_markdown
+    assert "MISSING_VERIFIED_PERSON_EVIDENCE" in task.report_markdown
     assert "比亚迪园区储能管理平台" in task.report_markdown
 
 
@@ -330,7 +359,13 @@ def test_audio_pipeline_transcribes_and_deletes_shared_file(tmp_path) -> None:
         extractor=RuleExtractor(ROOT / "seed"),
         web=FailedWeb(),
         projects=FakeProjects(),
-        renderer=ReportRenderer(ROOT / "backend/templates/report.md.j2"),
+        renderer=ReportRenderer(
+            ROOT / "backend/templates/report.md.j2",
+            ROOT / "backend/templates/detailed_report.md.j2",
+            ROOT / "backend/templates/action_brief.md.j2",
+        ),
+        agents=FallbackAgents(),
+        entity_resolver=EntityResolver(),
     )
 
     pipeline.run(task.id)
@@ -355,15 +390,21 @@ def test_mcp_failure_is_partial_and_public_information_continues() -> None:
         extractor=RuleExtractor(ROOT / "seed"),
         web=FailedWeb(),
         projects=FailedProjects(),
-        renderer=ReportRenderer(ROOT / "backend/templates/report.md.j2"),
+        renderer=ReportRenderer(
+            ROOT / "backend/templates/report.md.j2",
+            ROOT / "backend/templates/detailed_report.md.j2",
+            ROOT / "backend/templates/action_brief.md.j2",
+        ),
+        agents=FallbackAgents(),
+        entity_resolver=EntityResolver(),
     )
 
     pipeline.run(task.id)
 
     assert task.status == "COMPLETED"
     assert task.internal_search_status == "FAILED"
-    assert "公司内部项目信息检索失败" in task.report_markdown
-    assert task.web_search_status == "SKIPPED"
+    assert "NO_RANKED_PROJECTS" in task.report_markdown
+    assert task.web_search_status == "FAILED"
 
 
 def test_confirmed_intake_merges_public_and_internal_evidence_without_requester() -> None:
@@ -433,6 +474,7 @@ def test_confirmed_intake_merges_public_and_internal_evidence_without_requester(
     )
     repository = FakeRepository(task)
     projects = MacroProjects()
+    agents = FallbackAgents()
     pipeline = ResearchPipeline(
         repository=repository,
         transcriber=NoopTranscriber(),
@@ -444,7 +486,7 @@ def test_confirmed_intake_merges_public_and_internal_evidence_without_requester(
             ROOT / "backend/templates/detailed_report.md.j2",
             ROOT / "backend/templates/action_brief.md.j2",
         ),
-        agents=FallbackAgents(),
+        agents=agents,
         entity_resolver=object(),
     )
 
@@ -452,6 +494,69 @@ def test_confirmed_intake_merges_public_and_internal_evidence_without_requester(
 
     assert task.status == "COMPLETED", getattr(task, "error_message", None)
     assert "CONTEXT_EXTRACTING" not in repository.statuses
+    assert agents.calls == []
+    assert not {
+        "web_plan",
+        "web_verify",
+        "project_query",
+        "project_rerank",
+        "association",
+        "report_content",
+    }.intersection(event.get("node_name") for event in repository.events)
+    public_action_index = next(
+        index
+        for index, event in enumerate(repository.events)
+        if event.get("event_type") == "AGENT_ACTION"
+        and event.get("payload", {}).get("action") == "SEARCH_PUBLIC"
+    )
+    tavily_started_index = next(
+        index
+        for index, event in enumerate(repository.events)
+        if event.get("event_type") == "SEARCH_REQUEST"
+        and event.get("node_name") == "tavily_search"
+    )
+    tavily_completed_index = next(
+        index
+        for index, event in enumerate(repository.events)
+        if event.get("event_type") == "SEARCH_RESPONSE"
+        and event.get("node_name") == "tavily_search"
+    )
+    context_updated_index = next(
+        index
+        for index, event in enumerate(repository.events)
+        if event.get("event_type") == "AGENT_OBSERVATION"
+        and event.get("payload", {}).get("observation", {}).get("action")
+        == "SEARCH_PUBLIC"
+    )
+    assert (
+        public_action_index
+        < tavily_started_index
+        < tavily_completed_index
+        < context_updated_index
+    )
+    rule_events = [
+        event
+        for event in repository.events
+        if event.get("event_type") == "RULE_GENERATION"
+    ]
+    assert [event["node_name"] for event in rule_events] == [
+        "SEARCH_PUBLIC",
+        "SEARCH_INTERNAL",
+        "deterministic_project_ranker",
+        "resource_association_builder",
+    ]
+    assert all(event["status"] == "SUCCESS" for event in rule_events)
+    assert all(event["payload"]["generator"] for event in rule_events)
+    assert rule_events[0]["payload"]["result"]
+    assert rule_events[1]["payload"]["arguments"]
+    assert set(rule_events[2]["payload"]["results"][0]) == {
+        "project_id",
+        "score",
+        "reason_codes",
+        "rank",
+    }
+    assert rule_events[3]["payload"]["generator"] == "resource_association_v1"
+    assert "risk_flags" in rule_events[3]["payload"]
     assert projects.arguments == (["张伟"], ["宏远制造有限公司", "宏远制造"], [])
     assert "林致远" not in str(task.project_query_plan)
     assert task.web_search_status == "SUCCESS"
@@ -464,3 +569,111 @@ def test_confirmed_intake_merges_public_and_internal_evidence_without_requester(
     assert "制造园区能源管理" in task.detailed_report_markdown
     assert "客户联系人为郑伟（能源管理部经理），联系电话 17010000006" in task.detailed_report_markdown
     assert "我方项目销售员为张伟；联系电话 17000001001" in task.detailed_report_markdown
+
+
+class RoutedAgents:
+    def __init__(self, actions):
+        self.actions = iter(actions)
+
+    def agent_turn(self, _task_id, _context):
+        return next(self.actions)
+
+    def final_synthesis(self, *_args, **_kwargs):
+        raise RuntimeError("use deterministic report fallback")
+
+
+def _confirmed_loop_task(task_id: str):
+    return SimpleNamespace(
+        id=task_id,
+        input_type="text",
+        input_text="准备与宏远制造有限公司会面。",
+        input_snapshot={},
+        audio_path=None,
+        degraded_nodes=[],
+        confirmation_version=0,
+        confirmed_context={
+            "intents": ["MEETING_PREPARATION", "REPORT_GENERATION"],
+            "entities": [
+                {
+                    "entity_type": "ORGANIZATION",
+                    "canonical_name": "宏远制造有限公司",
+                    "confirmed_by": "USER",
+                }
+            ],
+            "event_type": "会议",
+        },
+        extracted_info=None,
+        llm_understanding=None,
+    )
+
+
+def test_agent_pipeline_can_synthesize_without_calling_tools() -> None:
+    task = _confirmed_loop_task("task-direct-synthesis")
+    repository = FakeRepository(task)
+    pipeline = ResearchPipeline(
+        repository=repository,
+        transcriber=NoopTranscriber(),
+        extractor=RuleExtractor(ROOT / "seed"),
+        web=FailedWeb(),
+        projects=FailedProjects(),
+        renderer=ReportRenderer(
+            ROOT / "backend/templates/report.md.j2",
+            ROOT / "backend/templates/detailed_report.md.j2",
+            ROOT / "backend/templates/action_brief.md.j2",
+        ),
+        agents=RoutedAgents(["SYNTHESIZE"]),
+        entity_resolver=object(),
+    )
+
+    pipeline.run(task.id)
+
+    assert task.status == "COMPLETED"
+    assert task.web_search_status == "SKIPPED"
+    assert task.internal_search_status == "SKIPPED"
+    assert not [
+        event
+        for event in repository.events
+        if event.get("node_name") in {"tavily_search", "mcp.search_projects"}
+    ]
+    assert [
+        event["payload"]["action"]
+        for event in repository.events
+        if event.get("event_type") == "AGENT_ACTION"
+    ] == ["SYNTHESIZE"]
+
+
+def test_agent_pipeline_can_take_internal_only_route() -> None:
+    task = _confirmed_loop_task("task-internal-only")
+    repository = FakeRepository(task)
+    projects = MacroProjects()
+    pipeline = ResearchPipeline(
+        repository=repository,
+        transcriber=NoopTranscriber(),
+        extractor=RuleExtractor(ROOT / "seed"),
+        web=FailedWeb(),
+        projects=projects,
+        renderer=ReportRenderer(
+            ROOT / "backend/templates/report.md.j2",
+            ROOT / "backend/templates/detailed_report.md.j2",
+            ROOT / "backend/templates/action_brief.md.j2",
+        ),
+        agents=RoutedAgents(["SEARCH_INTERNAL", "SYNTHESIZE"]),
+        entity_resolver=object(),
+    )
+
+    pipeline.run(task.id)
+
+    assert task.status == "COMPLETED"
+    assert task.web_search_status == "SKIPPED"
+    assert task.internal_search_status == "SUCCESS"
+    assert projects.arguments is not None
+    assert not [
+        event
+        for event in repository.events
+        if event.get("node_name") == "tavily_search"
+    ]
+    assert [
+        event["payload"]["action"]
+        for event in repository.events
+        if event.get("event_type") == "AGENT_ACTION"
+    ] == ["SEARCH_INTERNAL", "SYNTHESIZE"]

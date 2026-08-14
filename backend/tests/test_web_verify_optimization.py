@@ -122,7 +122,7 @@ class CapturingLlm:
         return WebEvidenceDecision()
 
 
-def test_agent_sends_only_bounded_candidates_to_web_verify() -> None:
+def test_agent_sends_only_bounded_candidates_to_evidence_verify() -> None:
     candidate = WebEvidenceCandidate(
         candidate_id="W001-C01",
         web_result_id="W001",
@@ -134,10 +134,10 @@ def test_agent_sends_only_bounded_candidates_to_web_verify() -> None:
     )
     llm = CapturingLlm()
 
-    AgentNodes(llm).web_verify("task-1", [candidate])
+    AgentNodes(llm).evidence_verify("task-1", [candidate])
 
     _, node_name, payload, output_model = llm.call
-    assert node_name == "web_verify"
+    assert node_name == "evidence_verify"
     assert set(payload) == {"candidates"}
     assert payload["candidates"] == [
         candidate.model_dump(mode="json", exclude={"web_result_id"})
