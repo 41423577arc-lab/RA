@@ -17,6 +17,75 @@ class NoInternalCandidates:
         return []
 
 
+@pytest.mark.parametrize(
+    ("entity_type", "mention", "canonical_name"),
+    [
+        ("ORGANIZATION", "中建二局", "中建二局安装工程有限公司"),
+        ("PERSON", "王总", "王志远"),
+    ],
+)
+def test_partial_internal_candidate_always_requires_user_confirmation(
+    entity_type, mention, canonical_name
+) -> None:
+    option = IntakeEntityCandidateService._internal_option(
+        {
+            "candidate_id": "internal:test:001",
+            "entity_type": entity_type,
+            "canonical_name": canonical_name,
+            "match_type": "PARTIAL",
+        }
+    )
+    confirmation = ConfirmationRequest(
+        version=1,
+        items=[
+            ConfirmationItem(
+                mention=mention,
+                entity_type=entity_type,
+                candidates=[option],
+            )
+        ],
+    )
+
+    resolutions, pending = IntakeEntityCandidateService.apply_automatic_candidates(
+        [], confirmation, threshold=0
+    )
+
+    assert option.confidence == 0.8
+    assert resolutions == []
+    assert pending is not None
+    assert pending.items[0].candidates == [option]
+
+
+def test_exact_internal_candidate_can_still_be_automatically_confirmed() -> None:
+    option = IntakeEntityCandidateService._internal_option(
+        {
+            "candidate_id": "internal:customer:C001",
+            "entity_type": "ORGANIZATION",
+            "canonical_name": "比亚迪股份有限公司",
+            "match_type": "EXACT",
+        }
+    )
+    confirmation = ConfirmationRequest(
+        version=1,
+        items=[
+            ConfirmationItem(
+                mention="比亚迪股份有限公司",
+                entity_type="ORGANIZATION",
+                candidates=[option],
+            )
+        ],
+    )
+
+    resolutions, pending = IntakeEntityCandidateService.apply_automatic_candidates(
+        [], confirmation
+    )
+
+    assert option.confidence == 1.0
+    assert pending is None
+    assert resolutions[0]["canonical_name"] == "比亚迪股份有限公司"
+    assert resolutions[0]["confirmed_by"] == "INTERNAL"
+
+
 class FanYufengIdentityWeb:
     def __init__(self):
         self.queries: list[str] = []

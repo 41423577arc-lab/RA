@@ -777,7 +777,7 @@ def test_explicit_full_user_identity_does_not_require_web_confirmation() -> None
     assert web.calls == 0
 
 
-def test_nonstandard_organization_uses_internal_candidate_before_web() -> None:
+def test_nonstandard_organization_keeps_internal_partial_candidate() -> None:
     web = WebMustNotRun()
     service = IntakeEntityCandidateService(InternalOrganizationCandidate(), web)
     resolutions, confirmation = service.resolve(
@@ -793,13 +793,14 @@ def test_nonstandard_organization_uses_internal_candidate_before_web() -> None:
         "我想了解比亚迪",
     )
 
-    assert confirmation is None
-    assert resolutions[0]["canonical_name"] == "比亚迪股份有限公司"
-    assert resolutions[0]["confirmed_by"] == "INTERNAL"
+    assert resolutions == []
+    assert confirmation is not None
+    assert confirmation.items[0].mention == "比亚迪"
+    assert confirmation.items[0].candidates[0].canonical_name == "比亚迪股份有限公司"
     assert web.calls == 0
 
 
-def test_model_cannot_mark_organization_abbreviation_as_standard() -> None:
+def test_model_cannot_auto_confirm_abbreviation_from_partial_candidate() -> None:
     web = WebMustNotRun()
     service = IntakeEntityCandidateService(InternalOrganizationCandidate(), web)
     resolutions, confirmation = service.resolve(
@@ -815,8 +816,9 @@ def test_model_cannot_mark_organization_abbreviation_as_standard() -> None:
         "我想了解比亚迪",
     )
 
-    assert confirmation is None
-    assert resolutions[0]["canonical_name"] == "比亚迪股份有限公司"
+    assert resolutions == []
+    assert confirmation is not None
+    assert confirmation.items[0].candidates[0].canonical_name == "比亚迪股份有限公司"
     assert web.calls == 0
 
 def test_entity_service_auto_completes_unique_high_confidence_external_results() -> None:

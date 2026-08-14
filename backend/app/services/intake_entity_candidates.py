@@ -209,7 +209,13 @@ class IntakeEntityCandidateService:
         pending: list[ConfirmationItem] = []
         for item in confirmation.items:
             eligible = [
-                option for option in item.candidates if option.confidence >= threshold
+                option
+                for option in item.candidates
+                if option.confidence >= threshold
+                and (
+                    not option.candidate_id.startswith("internal:")
+                    or option.canonical_name == item.mention
+                )
             ]
             external_eligible = [
                 option
