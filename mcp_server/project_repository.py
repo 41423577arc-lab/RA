@@ -1,7 +1,20 @@
 from collections.abc import Iterable
+import re
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import ARRAY, Date, Numeric, SmallInteger, String, Text, create_engine, or_, select, text
+from sqlalchemy import (
+    ARRAY,
+    Date,
+    Numeric,
+    SmallInteger,
+    String,
+    Text,
+    bindparam,
+    create_engine,
+    or_,
+    select,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from app.schemas.task import ProjectResult
@@ -39,6 +52,65 @@ class InternalProject(Base):
 
 
 PRIORITY = {"PERSON_EXACT": 0, "ORG_EXACT": 1, "TEXT_MATCH": 2, "VECTOR_MATCH": 3}
+PERSON_REFERENCE_TITLES = (
+    "副董事长",
+    "董事长",
+    "副总经理",
+    "总经理",
+    "副总裁",
+    "总裁",
+    "负责人",
+    "经理",
+    "主任",
+    "书记",
+    "院长",
+    "校长",
+    "先生",
+    "女士",
+    "领导",
+    "总",
+    "董",
+)
+COURTESY_TITLES = {"先生", "女士"}
+TITLE_EQUIVALENTS = {
+    "总": ("董事长", "副董事长", "总经理", "副总经理", "总裁", "副总裁", "负责人"),
+    "董": ("董事长", "副董事长", "董事"),
+}
+
+
+def _normalize_identity(value: str) -> str:
+    return "".join(value.split())
+
+
+def _person_reference(value: str) -> tuple[str, str] | None:
+    normalized = _normalize_identity(value)
+    for title in PERSON_REFERENCE_TITLES:
+        normalized_title = _normalize_identity(title)
+        if not normalized.endswith(normalized_title):
+            continue
+        fragment = normalized[: -len(normalized_title)]
+        if re.fullmatch(r"[\u4e00-\u9fff]{1,3}", fragment):
+            return fragment, title
+    return None
+
+
+def _person_reference_matches(
+    reference: tuple[str, str], candidate_name: str, candidate_title: str | None
+) -> bool:
+    fragment, reference_title = reference
+    normalized_name = _normalize_identity(candidate_name)
+    if reference_title in COURTESY_TITLES:
+        return fragment in normalized_name
+    if not normalized_name.startswith(fragment):
+        return False
+    normalized_title = _normalize_identity(candidate_title or "")
+    if not normalized_title:
+        return False
+    expected_titles = TITLE_EQUIVALENTS.get(reference_title, (reference_title,))
+    return any(
+        _normalize_identity(expected_title) in normalized_title
+        for expected_title in expected_titles
+    )
 
 
 class ProjectRepository:
@@ -109,27 +181,82 @@ class ProjectRepository:
     ) -> list[dict]:
         output: list[dict] = []
         with self.session_factory() as session:
+            organization_rows = []
+            if organization_mention:
+                organization_rows = list(
+                    session.execute(
+                        text(
+                            """
+                            SELECT customer_id, customer_name, industry, region_name
+                            FROM customers
+                            WHERE customer_name ILIKE :organization_pattern
+                            ORDER BY
+                                CASE WHEN customer_name = :organization_mention THEN 0 ELSE 1 END,
+                                customer_id
+                            LIMIT 10
+                            """
+                        ),
+                        {
+                            "organization_mention": organization_mention,
+                            "organization_pattern": f"%{organization_mention}%",
+                        },
+                    ).mappings()
+                )
             if person_mention:
-                rows = session.execute(
-                    text(
-                        """
-                        SELECT
-                            cc.contact_id, cc.contact_name, cc.job_title,
-                            c.customer_id, c.customer_name
-                        FROM customer_contacts cc
-                        JOIN customers c ON c.customer_id = cc.customer_id
-                        WHERE cc.contact_name ILIKE :person_pattern
-                        ORDER BY
-                            CASE WHEN cc.contact_name = :person_mention THEN 0 ELSE 1 END,
-                            cc.contact_id
-                        LIMIT 10
-                        """
-                    ),
-                    {
-                        "person_mention": person_mention,
-                        "person_pattern": f"%{person_mention}%",
-                    },
-                ).mappings()
+                reference = _person_reference(person_mention)
+                if reference is not None and organization_mention:
+                    customer_ids = [row["customer_id"] for row in organization_rows]
+                    if customer_ids:
+                        statement = text(
+                            """
+                            SELECT
+                                cc.contact_id, cc.contact_name, cc.job_title,
+                                c.customer_id, c.customer_name
+                            FROM customer_contacts cc
+                            JOIN customers c ON c.customer_id = cc.customer_id
+                            WHERE cc.customer_id IN :customer_ids
+                              AND cc.contact_name ILIKE :person_pattern
+                            ORDER BY cc.contact_id
+                            LIMIT 50
+                            """
+                        ).bindparams(bindparam("customer_ids", expanding=True))
+                        rows = session.execute(
+                            statement,
+                            {
+                                "customer_ids": customer_ids,
+                                "person_pattern": f"{reference[0]}%",
+                            },
+                        ).mappings()
+                        rows = [
+                            row
+                            for row in rows
+                            if _person_reference_matches(
+                                reference, row["contact_name"], row["job_title"]
+                            )
+                        ][:10]
+                    else:
+                        rows = []
+                else:
+                    rows = session.execute(
+                        text(
+                            """
+                            SELECT
+                                cc.contact_id, cc.contact_name, cc.job_title,
+                                c.customer_id, c.customer_name
+                            FROM customer_contacts cc
+                            JOIN customers c ON c.customer_id = cc.customer_id
+                            WHERE cc.contact_name ILIKE :person_pattern
+                            ORDER BY
+                                CASE WHEN cc.contact_name = :person_mention THEN 0 ELSE 1 END,
+                                cc.contact_id
+                            LIMIT 10
+                            """
+                        ),
+                        {
+                            "person_mention": person_mention,
+                            "person_pattern": f"%{person_mention}%",
+                        },
+                    ).mappings()
                 output.extend(
                     {
                         "candidate_id": f"internal:contact:{row['contact_id']}",
@@ -147,23 +274,6 @@ class ProjectRepository:
                     for row in rows
                 )
             if organization_mention:
-                rows = session.execute(
-                    text(
-                        """
-                        SELECT customer_id, customer_name, industry, region_name
-                        FROM customers
-                        WHERE customer_name ILIKE :organization_pattern
-                        ORDER BY
-                            CASE WHEN customer_name = :organization_mention THEN 0 ELSE 1 END,
-                            customer_id
-                        LIMIT 10
-                        """
-                    ),
-                    {
-                        "organization_mention": organization_mention,
-                        "organization_pattern": f"%{organization_mention}%",
-                    },
-                ).mappings()
                 output.extend(
                     {
                         "candidate_id": f"internal:customer:{row['customer_id']}",
@@ -176,7 +286,7 @@ class ProjectRepository:
                         if row["customer_name"] == organization_mention
                         else "PARTIAL",
                     }
-                    for row in rows
+                    for row in organization_rows
                 )
         return output
 
