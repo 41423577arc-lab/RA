@@ -91,9 +91,9 @@ flowchart TB
     subgraph G["Agent 层：逻辑角色，非独立进程"]
         IntakeAgent["信息采集 Agent<br/>IntakeAgent"]
         IdentityAgent["身份确认 Agent<br/>IntakeEntityCandidateService<br/>EntityResolver"]
-        PublicAgent["公开研究 Agent<br/>AgentNodes.web_plan / web_verify"]
-        ResourceAgent["内部资源分析 Agent<br/>project_query / project_rerank / association"]
-        ReportAgent["报告生成 Agent<br/>report_content / ReportRenderer"]
+        TurnAgent["行动决策 Agent<br/>AgentNodes.agent_turn"]
+        EvidenceAgent["歧义证据核验 Agent<br/>AgentNodes.evidence_verify"]
+        FinalAgent["最终综合 Agent<br/>AgentNodes.final_synthesis"]
     end
 
     subgraph T["工具层"]
@@ -124,23 +124,23 @@ flowchart TB
     TaskRouter --> Queue
     Queue --> Redis
 
-    ResearchWorkflow --> PublicAgent
-    ResearchWorkflow --> ResourceAgent
-    ResearchWorkflow --> ReportAgent
+    ResearchWorkflow --> TurnAgent
+    ResearchWorkflow --> EvidenceAgent
+    ResearchWorkflow --> FinalAgent
     IntakeAgent --> LLMGateway
-    PublicAgent --> LLMGateway
-    ResourceAgent --> LLMGateway
-    ReportAgent --> LLMGateway
+    TurnAgent --> LLMGateway
+    EvidenceAgent --> LLMGateway
+    FinalAgent --> LLMGateway
 
     IdentityAgent --> MCPClient
     IdentityAgent --> TavilyClient
-    PublicAgent --> TavilyClient
-    ResourceAgent --> MCPClient
+    ResearchWorkflow --> TavilyClient
+    ResearchWorkflow --> MCPClient
     TavilyClient --> WebSearch
     DBTools --> PostgreSQL
     PostgreSQL --- EnterpriseDB
     CeleryWorker --> FileStore
-    ReportAgent --> PostgreSQL
+    ResearchWorkflow --> PostgreSQL
     TaskRouter -->|"TaskResponse 报告字段"| ReportView
 ```
 
@@ -203,14 +203,19 @@ flowchart TB
         IntakeAudioTask["run_intake_audio_transcription"]
         PipelineTask["run_research_pipeline"]
         Pipeline["ResearchPipeline"]
+        AgentLoop["AgentLoopRunner<br/>动作校验 / 循环保护"]
+        AgentTools["AgentToolExecutor<br/>工具 → Observation"]
+        Deterministic["ProjectRanker<br/>ResourceAssociationBuilder"]
         CeleryApp --> IntakeAudioTask
         CeleryApp --> PipelineTask --> Pipeline
+        Pipeline --> AgentLoop --> AgentTools
+        Pipeline --> Deterministic
     end
 
     subgraph Agents["Agent 模块"]
         StructuredLLM["StructuredLLM"]
         IntakeAgentNode["IntakeAgent"]
-        AgentNodes["AgentNodes<br/>7 个结构化 LLM 节点"]
+        AgentNodes["AgentNodes<br/>agent_turn / evidence_verify / final_synthesis"]
         IntakeAgentNode --> StructuredLLM
         AgentNodes --> StructuredLLM
     end
@@ -262,7 +267,7 @@ flowchart TB
     TaskService --> Repositories
 ```
 
-模块说明：API 输入是 Pydantic 请求模型，输出是 Intake/Task 响应模型；`ResearchPipeline` 承担 research service 和 workflow orchestration；`ReportRenderer` 只渲染内容，报告通过 `TaskResponse` 返回；所有持久化经 Repository 和 ORM 完成。
+模块说明：API 输入是 Pydantic 请求模型，输出是 Intake/Task 响应模型；`ResearchPipeline` 统一进入 `AgentLoopRunner`，由模型决定动作意图，规则代码生成工具参数并整理结果；`ProjectRanker` 和 `ResourceAssociationBuilder` 确定性运行，`ReportRenderer` 只渲染内容；所有持久化经 Repository 和 ORM 完成。
 
 ## 图4：Agent Workflow 详细图
 
@@ -276,38 +281,54 @@ flowchart TD
 
     Restore["[代码] 从 Intake snapshot<br/>恢复 ConfirmedContext"]
     Extract["[代码] RuleExtractor.extract"]
-    Understand["[LLM] AgentNodes.understanding<br/>失败时 fallback_understanding"]
+    Understand["[规则] fallback_understanding<br/>生成兼容 IntentUnderstanding"]
     Resolve["[代码] EntityResolver.resolve"]
     ConfirmNeeded{"[代码] 是否需要身份确认？"}
     UserConfirm["[用户] 选择候选或手工填写"]
     PersistConfirm["[代码] 保存 NEEDS_CONFIRMATION<br/>等待确认后重新调度"]
 
-    WebPlan["[LLM] AgentNodes.web_plan<br/>生成公开检索计划"]
-    WebTool["[代码调用工具] TavilyClient<br/>search → extract"]
-    WebVerify["[LLM + 代码校验] web_verify<br/>validate_web_results<br/>strict_rule_verifications"]
-    Evidence["[代码] 汇总 PublicClaim<br/>保存网页证据"]
+    Context["[代码] AgentContextBuilder<br/>裁剪 Context / Observation"]
+    Turn["[LLM] agent_turn<br/>只选择允许的 AgentAction"]
+    Validate{"[代码] AgentActionValidator<br/>动作是否合法？"}
+    Fallback["[规则] 确定性 fallback action"]
+    Action{"AgentAction"}
 
-    ProjectPlan["[LLM] AgentNodes.project_query<br/>生成内部查询计划"]
-    ProjectTool["[代码调用工具] ProjectMcpClient.search_projects"]
-    Rerank["[LLM + 代码校验] project_rerank<br/>validate_rankings"]
-    Match["[LLM + 代码补全] association<br/>公开证据 × 内部项目"]
+    WebPlan["[规则] fallback_web_plan<br/>生成 Tavily 查询"]
+    WebTool["[工具] TavilyClient<br/>search → extract"]
+    EvidenceRoute["[规则] 证据候选分流<br/>accepted / rejected / ambiguous"]
+    WebVerify["[LLM] evidence_verify<br/>仅核验 ambiguous"]
+    WebObservation["[代码] 标准化 / 去重 / 裁剪<br/>公开 Observation"]
 
-    Content["[LLM] report_content<br/>生成结构化报告内容"]
+    ProjectPlan["[规则] fallback_project_query<br/>生成 MCP 参数"]
+    ProjectTool["[工具] ProjectMcpClient.search_projects"]
+    ProjectObservation["[代码] 标准化 / 去重 / 裁剪<br/>项目 Observation"]
+
+    Rerank["[规则] ProjectRanker<br/>确定性评分与 reason_codes"]
+    Match["[规则] ResourceAssociationBuilder<br/>整理关系、缺口与风险"]
+    Content["[LLM] final_synthesis<br/>只综合白名单材料"]
     Render["[代码] ReportRenderer<br/>Jinja2 渲染"]
     Complete["[代码] 保存 COMPLETED<br/>详细报告 / 行动简报"]
 
     Input --> Load --> HasContext
-    HasContext -->|"是"| Restore --> WebPlan
+    HasContext -->|"是"| Restore --> Context
     HasContext -->|"否"| Extract --> Understand --> Resolve --> ConfirmNeeded
     ConfirmNeeded -->|"是"| PersistConfirm --> UserConfirm --> Resolve
-    ConfirmNeeded -->|"否"| WebPlan
+    ConfirmNeeded -->|"否"| Context
 
-    WebPlan --> WebTool --> WebVerify --> Evidence
-    Evidence --> ProjectPlan --> ProjectTool --> Rerank
-    Rerank --> Match --> Content --> Render --> Complete
+    Context --> Turn --> Validate
+    Validate -->|"否"| Fallback --> Action
+    Validate -->|"是"| Action
+    Action -->|"SEARCH_PUBLIC"| WebPlan --> WebTool --> EvidenceRoute
+    EvidenceRoute -->|"ambiguous"| WebVerify --> WebObservation
+    EvidenceRoute -->|"规则已处理"| WebObservation
+    Action -->|"SEARCH_INTERNAL"| ProjectPlan --> ProjectTool --> ProjectObservation
+    WebObservation --> Context
+    ProjectObservation --> Context
+    Action -->|"SYNTHESIZE / FINISH"| Rerank --> Match --> Content --> Render --> Complete
+    Action -->|"ASK_USER"| PersistConfirm
 ```
 
-模块说明：代码负责状态机、工具执行、证据验证、降级和持久化；LLM 只完成结构化理解、规划、重排、关联与内容生成；身份无法确定时任务进入 `NEEDS_CONFIRMATION`，必须由用户确认后继续。
+模块说明：业务 LLM 只保留 `agent_turn`、`evidence_verify` 和 `final_synthesis`。`agent_turn` 决定下一步意图但不生成工具参数；Tavily/MCP 参数、项目排序和资源关联均由确定性代码完成。工具原始结果经过标准化、去重和裁剪后形成 `Observation`，再进入下一轮 Context。循环受最大轮数、最大工具调用数和重复动作保护；身份无法确定时任务进入 `NEEDS_CONFIRMATION`。
 
 ## 图5：数据库 ER 关系图
 
@@ -465,7 +486,7 @@ erDiagram
 flowchart TB
     subgraph Decision["决策层"]
         IntakeAgent["IntakeAgent"]
-        AgentNodes["AgentNodes"]
+        AgentNodes["AgentNodes<br/>agent_turn / evidence_verify / final_synthesis"]
         LLM["StructuredLLM<br/>输入：受控上下文<br/>输出：Pydantic 结构化结果"]
         IntakeAgent --> LLM
         AgentNodes --> LLM
@@ -474,8 +495,11 @@ flowchart TB
     subgraph Control["代码控制层"]
         IntakeCandidates["IntakeEntityCandidateService"]
         Pipeline["ResearchPipeline"]
-        Validation["确定性校验与降级函数"]
+        AgentLoop["AgentLoopRunner<br/>Context → Action → Observation"]
+        ToolExecutor["AgentToolExecutor<br/>规则生成工具参数"]
+        Validation["证据分流 / ProjectRanker<br/>ResourceAssociationBuilder"]
         IntakeCandidates --> Validation
+        Pipeline --> AgentLoop --> ToolExecutor
         Pipeline --> Validation
     end
 
@@ -494,11 +518,11 @@ flowchart TB
     end
 
     IntakeAgent --> IntakeCandidates
-    AgentNodes --> Pipeline
+    AgentNodes --> AgentLoop
     IntakeCandidates --> TavilyClient
     IntakeCandidates --> MCPClient
-    Pipeline --> TavilyClient
-    Pipeline --> MCPClient
+    ToolExecutor --> TavilyClient
+    ToolExecutor --> MCPClient
     Pipeline --> Repositories
 
     TavilyClient --> TavilyAPI
@@ -510,7 +534,7 @@ flowchart TB
     LLM -.->|"禁止：不能直接调用"| TavilyAPI
 ```
 
-模块说明：Agent/LLM 输入是经过裁剪的上下文和工具结果，输出是结构化计划或判断；真正的网络和数据库访问由 Python 工具类完成；内部业务查询必须经过 MCP Server 的 `ProjectRepository` 和只读账号。
+模块说明：`agent_turn` 输入经过裁剪的 `AgentContext`，只输出动作意图；`evidence_verify` 只接收规则无法判断的证据候选；`final_synthesis` 只接收已确认材料。LLM 不生成 Tavily 查询、MCP 参数或项目排序，真正的网络和数据库访问由 Python 工具类完成；内部业务查询必须经过 MCP Server 的 `ProjectRepository` 和只读账号。
 
 ## 图7：部署架构图
 

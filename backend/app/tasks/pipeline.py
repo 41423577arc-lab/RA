@@ -77,8 +77,8 @@ class ResearchPipeline:
         web: SearchService,
         projects: ProjectService,
         renderer: ReportRenderer,
-        agents: AgentNodes,
-        entity_resolver: EntityResolver,
+        agents: AgentNodes | None = None,
+        entity_resolver: EntityResolver | None = None,
         project_ranker: ProjectRanker | None = None,
         association_builder: ResourceAssociationBuilder | None = None,
         agent_max_loops: int | None = None,
@@ -91,8 +91,8 @@ class ResearchPipeline:
         self.web = web
         self.projects = projects
         self.renderer = renderer
-        self.agents = agents
-        self.entity_resolver = entity_resolver
+        self.agents = agents or AgentNodes(StructuredLLM(settings, repository))
+        self.entity_resolver = entity_resolver or EntityResolver()
         self.project_ranker = project_ranker or ProjectRanker()
         self.association_builder = association_builder or ResourceAssociationBuilder()
         self.agent_max_loops = agent_max_loops or settings.agent_max_loops

@@ -224,6 +224,24 @@ def make_pipeline(repository, web):
     )
 
 
+def test_pipeline_constructor_defaults_to_current_agent_loop_dependencies() -> None:
+    task = SimpleNamespace(id="constructor-test")
+    repository = FakeRepository(task)
+
+    pipeline = ResearchPipeline(
+        repository=repository,
+        transcriber=NoopTranscriber(),
+        extractor=RuleExtractor(ROOT / "seed"),
+        web=FailedWeb(),
+        projects=FailedProjects(),
+        renderer=ReportRenderer(ROOT / "backend/templates/report.md.j2"),
+    )
+
+    assert pipeline.agents.__class__.__name__ == "AgentNodes"
+    assert pipeline.agents.llm.repository is repository
+    assert isinstance(pipeline.entity_resolver, EntityResolver)
+
+
 def test_pipeline_reuses_only_intake_identity_evidence() -> None:
     claims = identity_claims_from_intake_snapshot(
         {
