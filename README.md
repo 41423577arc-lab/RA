@@ -1,6 +1,6 @@
 # 资源推动 Agent Demo
 
-资源调查 Demo：规则提取与确定性降级、`MiniMax-M3` Chat Completions + Pydantic 结构化理解、intake 阶段受控的 Tavily 关键人身份补全、MCP 内部实体与项目查询、关联分析和 Jinja2 报告。
+资源调查 Demo：规则提取与确定性降级、`MiniMax-M3` Chat Completions + Pydantic 结构化输出、intake 阶段受控的 Tavily 关键人身份补全、MCP 内部实体与项目查询、关联分析和 Jinja2 报告。
 
 ## 启动
 
@@ -15,7 +15,7 @@ docker compose up --build
 
 首次启动只下载本地 Whisper 模型。内部项目向量由 HashingVectorizer 即时生成，不下载嵌入模型。页面固定支持最新版桌面端 Chrome。
 
-未配置 `OPENAI_API_KEY`、模型请求超时、输出格式错误或网关不可用时，七个大模型节点会标记为降级，任务继续使用规则、Tavily、MCP 和 Jinja2 生成基础报告。
+当前共有 9 个结构化 LLM 提示词节点：5 个 intake 节点、3 个研究节点和 1 个分析问答节点。未配置 `OPENAI_API_KEY`、模型请求超时、输出格式错误或网关不可用时，对应路径会记录降级事件，并在可降级的节点继续使用规则、Tavily、MCP 和 Jinja2 生成结果。
 
 固定文本测试：
 
@@ -47,683 +47,351 @@ npm run build
 - API 文档：`http://localhost:8000/docs`
 - MCP：`http://localhost:8001/mcp`
 
-## 架构图
+## 架构与流程
 
-以下以当前代码为准。已有 `2026-07-21` 验收文档中的“无生成式大模型”等描述已经过期；当前实现已包含 `StructuredLLM`、Intake Agent 和七个研究节点。
+以下内容以当前 `main` 分支代码为准。当前未实现 Authentication、Nginx/API Gateway、独立 Report API、对象存储和集中可观测性；报告直接作为任务响应字段返回。
 
-当前边界：未实现 Authentication、Nginx/API Gateway、独立 Report API，也没有独立的 User、Entity、Evidence、Report 数据表。
+当前 LLM 节点按职责分为：
 
-## 图1：系统总体架构图
+- Intake：`intake_chat`、`intake_followup`、`intake_identity_normalize`、`intake_readiness`、`intake_final_confirmation`
+- Research：`agent_turn`、`evidence_verify`、`final_synthesis`
+- Analysis chat：`analysis_chat`
 
-用途说明：展示当前系统分层、核心运行组件及外部依赖；括号内为真实工程模块。
+### 图 1：系统总览
+
+这张图只展示运行时主干，细节在后续小图中展开。
 
 ```mermaid
-flowchart TB
-    subgraph U["用户层"]
-        User["业务用户"]
-        Input["用户输入<br/>文字 / WebM 音频"]
-        WebUI["Web 前端<br/>frontend/src/app/page.tsx"]
-        ReportView["报告查看<br/>详细报告 / 行动简报"]
-        User --> Input --> WebUI
-        WebUI --> ReportView
-    end
-
-    subgraph A["应用层"]
-        FastAPI["FastAPI Backend<br/>app.main:app"]
-        IntakeRouter["API Router<br/>app.api.intake.router"]
-        TaskRouter["API Router<br/>app.api.tasks.router"]
-        Auth["Authentication<br/>当前未实现"]
-        TaskManagement["Task Management<br/>TaskRepository / IntakeSessionRepository"]
-        FastAPI --> IntakeRouter
-        FastAPI --> TaskRouter
-        IntakeRouter --> TaskManagement
-        TaskRouter --> TaskManagement
-        Auth -.->|"未来规划"| FastAPI
-    end
-
-    subgraph Q["任务层"]
-        ResearchWorkflow["Research Workflow<br/>ResearchPipeline.run"]
-        CeleryWorker["Celery Worker<br/>run_research_pipeline<br/>run_intake_audio_transcription"]
-        Queue["Celery Queue<br/>broker / result backend"]
-        Queue --> CeleryWorker --> ResearchWorkflow
-    end
-
-    subgraph G["Agent 层：逻辑角色，非独立进程"]
-        IntakeAgent["信息采集 Agent<br/>IntakeAgent"]
-        IdentityAgent["身份确认 Agent<br/>IntakeEntityCandidateService<br/>EntityResolver"]
-        TurnAgent["行动决策 Agent<br/>AgentNodes.agent_turn"]
-        EvidenceAgent["歧义证据核验 Agent<br/>AgentNodes.evidence_verify"]
-        FinalAgent["最终综合 Agent<br/>AgentNodes.final_synthesis"]
-    end
-
-    subgraph T["工具层"]
-        TavilyClient["Tavily Search<br/>TavilyClient"]
-        MCPClient["MCP Client<br/>ProjectMcpClient"]
-        MCPServer["MCP Server<br/>mcp_server.server"]
-        DBTools["数据库查询工具<br/>TaskRepository / ProjectRepository"]
-        MCPClient --> MCPServer --> DBTools
-    end
-
-    subgraph D["数据层"]
-        PostgreSQL["PostgreSQL + pgvector<br/>业务状态与内部项目数据"]
-        Redis["Redis 7<br/>Celery broker / result backend"]
-        FileStore["Docker Volumes<br/>audio_data / model_cache"]
-    end
-
-    subgraph X["外部系统"]
-        LLMGateway["LLM Gateway<br/>MiniMax-M3 / OpenAI-compatible API"]
-        WebSearch["Web Search<br/>api.tavily.com"]
-        EnterpriseDB["企业内部数据库<br/>Demo 中由 PostgreSQL 种子表模拟"]
-    end
-
-    WebUI -->|"REST JSON / multipart"| FastAPI
-    TaskManagement --> PostgreSQL
-    IntakeRouter --> IntakeAgent
-    IntakeRouter --> IdentityAgent
-    IntakeRouter --> Queue
-    TaskRouter --> Queue
-    Queue --> Redis
-
-    ResearchWorkflow --> TurnAgent
-    ResearchWorkflow --> EvidenceAgent
-    ResearchWorkflow --> FinalAgent
-    IntakeAgent --> LLMGateway
-    TurnAgent --> LLMGateway
-    EvidenceAgent --> LLMGateway
-    FinalAgent --> LLMGateway
-
-    IdentityAgent --> MCPClient
-    IdentityAgent --> TavilyClient
-    ResearchWorkflow --> TavilyClient
-    ResearchWorkflow --> MCPClient
-    TavilyClient --> WebSearch
-    DBTools --> PostgreSQL
-    PostgreSQL --- EnterpriseDB
-    CeleryWorker --> FileStore
-    ResearchWorkflow --> PostgreSQL
-    TaskRouter -->|"TaskResponse 报告字段"| ReportView
+flowchart LR
+    User["业务用户"] --> Browser["浏览器"]
+    Browser --> Frontend["Next.js 前端"]
+    Browser -->|"REST / SSE"| API["FastAPI"]
+    API --> AppDB[("PostgreSQL<br/>会话与任务状态")]
+    API -->|"入队"| Redis["Redis"]
+    API -->|"Intake / 分析问答"| LLM["LLM Gateway"]
+    API -->|"Intake 身份补全"| Tavily["Tavily"]
+    API -->|"Intake 内部候选"| MCP["MCP Server"]
+    Redis --> Worker["Celery Worker"]
+    Worker --> AppDB
+    Worker --> LLM
+    Worker --> Tavily
+    Worker --> MCP
+    MCP -->|"只读"| ProjectDB[("PostgreSQL<br/>内部项目数据")]
 ```
 
-模块说明：用户输入经 `page.tsx` 进入两个 FastAPI Router；Router 管理会话和任务，Celery 异步运行 `ResearchPipeline`；Agent 只产生结构化决策，工具负责实际检索；结果写入 PostgreSQL，并通过任务查询接口返回前端。
+前端页面由 Next.js 提供；浏览器使用 `NEXT_PUBLIC_API_BASE_URL` 直接访问 FastAPI。FastAPI 负责会话、任务和事件读取，并同步执行 Intake 与分析问答；耗时的音频转写与研究流程由 Celery Worker 执行。
 
-## 图2：业务流程图（用户视角）
+### 图 2：用户业务流程
 
-用途说明：只描述用户能感知的业务过程，不体现代码模块。
+```mermaid
+flowchart LR
+    Input["输入会面信息"] --> Intake["补全人物、企业、活动和关注方向"]
+    Intake --> Identity["确认标准身份"]
+    Identity --> Summary["确认最终摘要"]
+    Summary --> Start["开始分析"]
+    Start --> Research["公开研究与内部项目检索"]
+    Research --> Report["详细报告与行动简报"]
+    Report --> Chat["围绕当前结果继续问答"]
+```
+
+身份不完整时流程留在 intake 阶段继续追问或让用户选择候选。只有最终摘要确认后，`POST /api/v1/intake/{session_id}/start-analysis` 才会创建研究任务。
+
+### 图 3：信息采集
+
+#### 图 3.1：文字采集与身份补全
 
 ```mermaid
 flowchart TD
-    Start(["开始"])
-    Input["输入会面信息<br/>人物、企业、活动、关注方向"]
-    Collect["信息采集<br/>补充缺失的会面背景"]
-    Resolve["身份确认<br/>核对人物与企业标准身份"]
-    NeedConfirm{"身份是否唯一且信息完整？"}
-    UserConfirm["用户选择候选<br/>或手工补充身份"]
-    Ready["用户确认开始分析"]
-    CreateTask["创建研究任务"]
-    PublicResearch["公开信息研究"]
-    InternalSearch["查询内部项目与可用资源"]
-    Association["分析公开信息与内部资源关联"]
-    Report["生成详细报告与行动简报"]
-    Display["展示分析进度和最终结果"]
-    End(["结束"])
-
-    Start --> Input --> Collect --> Resolve --> NeedConfirm
-    NeedConfirm -->|"否"| UserConfirm --> Resolve
-    NeedConfirm -->|"是"| Ready --> CreateTask
-    CreateTask --> PublicResearch --> InternalSearch
-    InternalSearch --> Association --> Report --> Display --> End
+    Message["POST /api/v1/intake/chat"] --> Runner["IntakeRunner.run_chat"]
+    Runner --> Parse["IntakeAgent 提取结构化上下文"]
+    Parse --> Complete{"必要字段完整？"}
+    Complete -->|"否"| Followup["生成追问"]
+    Followup --> Message
+    Complete -->|"是"| Internal["MCP find_entity_candidates"]
+    Internal --> Resolved{"身份可自动确定？"}
+    Resolved -->|"否"| Web["Tavily 身份搜索与正文提取"]
+    Web --> Evidence["校验姓名、组织和原文证据"]
+    Evidence --> Candidate{"唯一高置信候选？"}
+    Candidate -->|"否"| UserConfirm["用户选择或手工填写身份"]
+    UserConfirm --> ConfirmEntity["POST /confirm"]
+    ConfirmEntity --> FinalSummary
+    Candidate -->|"是"| FinalSummary["生成最终确认摘要"]
+    Resolved -->|"是"| FinalSummary
+    FinalSummary --> Confirm["POST confirm-summary"]
+    Confirm --> Ready["IntakeSession = READY"]
 ```
 
-模块说明：输入为用户提供的会面信息；输出为可追溯的公开研究、内部项目匹配和行动建议。身份不完整时流程回到用户确认，用户明确点击开始分析后才创建研究任务。
+内部实体查询始终先执行；Web 查询只补全仍未解决的身份。外部候选只有在来源页面正文能够支持标准姓名和关系信息时才会被接受。
 
-## 图3：后端服务架构图
-
-用途说明：展示 FastAPI 后端当前真实代码组织和调用方向。工程没有独立的 `service/task_service.py`、`workflow/` 或 `agents/` 目录，下图映射到实际类。
+#### 图 3.2：音频采集
 
 ```mermaid
-flowchart TB
-    Main["FastAPI<br/>backend/app/main.py<br/>app.main:app"]
-
-    subgraph API["api/"]
-        IntakeAPI["app.api.intake.router<br/>chat / activity / audio / confirm / start-analysis"]
-        TaskAPI["app.api.tasks.router<br/>text / audio / get / confirm / cancel"]
-        ReportAPI["报告读取<br/>GET /api/v1/tasks/{task_id}<br/>当前无独立 Report Router"]
-    end
-
-    subgraph Services["services/"]
-        IntakeService["IntakeAgent<br/>信息采集与就绪复核"]
-        IdentityService["IntakeEntityCandidateService<br/>EntityResolver"]
-        TaskService["TaskRepository<br/>IntakeSessionRepository"]
-        ResearchService["RuleExtractor<br/>研究前置处理"]
-        ReportService["ReportRenderer<br/>Jinja2 渲染"]
-    end
-
-    subgraph Workflow["tasks/：工作流编排"]
-        CeleryApp["celery_app"]
-        IntakeAudioTask["run_intake_audio_transcription"]
-        PipelineTask["run_research_pipeline"]
-        Pipeline["ResearchPipeline"]
-        AgentLoop["AgentLoopRunner<br/>动作校验 / 循环保护"]
-        AgentTools["AgentToolExecutor<br/>工具 → Observation"]
-        Deterministic["ProjectRanker<br/>ResourceAssociationBuilder"]
-        CeleryApp --> IntakeAudioTask
-        CeleryApp --> PipelineTask --> Pipeline
-        Pipeline --> AgentLoop --> AgentTools
-        Pipeline --> Deterministic
-    end
-
-    subgraph Agents["Agent 模块"]
-        StructuredLLM["StructuredLLM"]
-        IntakeAgentNode["IntakeAgent"]
-        AgentNodes["AgentNodes<br/>agent_turn / evidence_verify / final_synthesis"]
-        IntakeAgentNode --> StructuredLLM
-        AgentNodes --> StructuredLLM
-    end
-
-    subgraph Tools["工具适配器"]
-        Whisper["LocalWhisperTranscriber"]
-        Tavily["TavilyClient"]
-        MCP["ProjectMcpClient"]
-    end
-
-    subgraph Models["Pydantic schemas"]
-        IntakeSchemas["schemas/intake.py"]
-        TaskSchemas["schemas/task.py"]
-    end
-
-    subgraph Database["database/"]
-        Repositories["database.py<br/>SessionLocal / repositories"]
-        ORM["models/database.py<br/>SQLAlchemy ORM models"]
-        PG["PostgreSQL"]
-        Repositories --> ORM --> PG
-    end
-
-    Main --> IntakeAPI
-    Main --> TaskAPI
-    TaskAPI --- ReportAPI
-
-    IntakeAPI --> IntakeService
-    IntakeAPI --> IdentityService
-    IntakeAPI --> TaskService
-    IntakeAPI --> IntakeAudioTask
-    IntakeAPI --> PipelineTask
-    TaskAPI --> TaskService
-    TaskAPI --> PipelineTask
-
-    IntakeService --> IntakeAgentNode
-    IdentityService --> Tavily
-    IdentityService --> MCP
-    Pipeline --> ResearchService
-    Pipeline --> AgentNodes
-    Pipeline --> Whisper
-    Pipeline --> Tavily
-    Pipeline --> MCP
-    Pipeline --> ReportService
-    Pipeline --> TaskService
-
-    IntakeAPI --> IntakeSchemas
-    TaskAPI --> TaskSchemas
-    Pipeline --> TaskSchemas
-    TaskService --> Repositories
+flowchart LR
+    Upload["上传 audio/webm"] --> Job["创建 IntakeAudioJob"]
+    Job --> Queue["Celery 入队"]
+    Queue --> Whisper["LocalWhisperTranscriber"]
+    Whisper --> Review["NEEDS_REVIEW"]
+    Review --> Correct["用户校对转写文本"]
+    Correct --> Chat["作为消息进入 IntakeRunner"]
+    Whisper -->|"失败"| Failed["FAILED，可重试"]
+    Failed --> Queue
 ```
 
-模块说明：API 输入是 Pydantic 请求模型，输出是 Intake/Task 响应模型；`ResearchPipeline` 统一进入 `AgentLoopRunner`，由模型决定动作意图，规则代码生成工具参数并整理结果；`ProjectRanker` 和 `ResourceAssociationBuilder` 确定性运行，`ReportRenderer` 只渲染内容；所有持久化经 Repository 和 ORM 完成。
+录音文件写入 `audio_data` 命名卷。前端轮询音频任务，转写成功后必须由用户确认文本，不能直接触发研究。
 
-## 图4：Agent Workflow 详细图
+### 图 4：后端模块
 
-用途说明：展示 `ResearchPipeline.run` 的控制流，并明确代码、LLM 和用户确认边界。
+#### 图 4.1：API 与状态读取
 
 ```mermaid
 flowchart TD
-    Input["[代码] Input<br/>task_id"]
-    Load["[代码] TaskRepository.get<br/>加载 ResearchTask"]
-    HasContext{"[代码] 是否已有 confirmed_context？"}
-
-    Restore["[代码] 从 Intake snapshot<br/>恢复 ConfirmedContext"]
-    Extract["[代码] RuleExtractor.extract"]
-    Understand["[规则] fallback_understanding<br/>生成兼容 IntentUnderstanding"]
-    Resolve["[代码] EntityResolver.resolve"]
-    ConfirmNeeded{"[代码] 是否需要身份确认？"}
-    UserConfirm["[用户] 选择候选或手工填写"]
-    PersistConfirm["[代码] 保存 NEEDS_CONFIRMATION<br/>等待确认后重新调度"]
-
-    Context["[代码] AgentContextBuilder<br/>裁剪 Context / Observation"]
-    Turn["[LLM] agent_turn<br/>只选择允许的 AgentAction"]
-    Validate{"[代码] AgentActionValidator<br/>动作是否合法？"}
-    Fallback["[规则] 确定性 fallback action"]
-    Action{"AgentAction"}
-
-    WebPlan["[规则] fallback_web_plan<br/>生成 Tavily 查询"]
-    WebTool["[工具] TavilyClient<br/>search → extract"]
-    EvidenceRoute["[规则] 证据候选分流<br/>accepted / rejected / ambiguous"]
-    WebVerify["[LLM] evidence_verify<br/>仅核验 ambiguous"]
-    WebObservation["[代码] 标准化 / 去重 / 裁剪<br/>公开 Observation"]
-
-    ProjectPlan["[规则] fallback_project_query<br/>生成 MCP 参数"]
-    ProjectTool["[工具] ProjectMcpClient.search_projects"]
-    ProjectObservation["[代码] 标准化 / 去重 / 裁剪<br/>项目 Observation"]
-
-    Rerank["[规则] ProjectRanker<br/>确定性评分与 reason_codes"]
-    Match["[规则] ResourceAssociationBuilder<br/>整理关系、缺口与风险"]
-    Content["[LLM] final_synthesis<br/>只综合白名单材料"]
-    Render["[代码] ReportRenderer<br/>Jinja2 渲染"]
-    Complete["[代码] 保存 COMPLETED<br/>详细报告 / 行动简报"]
-
-    Input --> Load --> HasContext
-    HasContext -->|"是"| Restore --> Context
-    HasContext -->|"否"| Extract --> Understand --> Resolve --> ConfirmNeeded
-    ConfirmNeeded -->|"是"| PersistConfirm --> UserConfirm --> Resolve
-    ConfirmNeeded -->|"否"| Context
-
-    Context --> Turn --> Validate
-    Validate -->|"否"| Fallback --> Action
-    Validate -->|"是"| Action
-    Action -->|"SEARCH_PUBLIC"| WebPlan --> WebTool --> EvidenceRoute
-    EvidenceRoute -->|"ambiguous"| WebVerify --> WebObservation
-    EvidenceRoute -->|"规则已处理"| WebObservation
-    Action -->|"SEARCH_INTERNAL"| ProjectPlan --> ProjectTool --> ProjectObservation
-    WebObservation --> Context
-    ProjectObservation --> Context
-    Action -->|"SYNTHESIZE / FINISH"| Rerank --> Match --> Content --> Render --> Complete
-    Action -->|"ASK_USER"| PersistConfirm
+    Main["app.main:app"] --> IntakeAPI["app.api.intake.router"]
+    Main --> TaskAPI["app.api.tasks.router"]
+    IntakeAPI --> IntakeRunner["IntakeRunner / IntakeAgent"]
+    IntakeAPI --> IntakeRepo["IntakeSessionRepository"]
+    TaskAPI --> TaskRepo["TaskRepository"]
+    TaskAPI --> AnalysisChat["AnalysisChatAgent"]
+    IntakeRepo --> ORM["SQLAlchemy ORM"]
+    TaskRepo --> ORM
+    ORM --> DB[("PostgreSQL")]
+    TaskAPI --> SSE["execution_stream"]
+    SSE -->|"读取 ExecutionEvent"| DB
 ```
 
-模块说明：业务 LLM 只保留 `agent_turn`、`evidence_verify` 和 `final_synthesis`。`agent_turn` 决定下一步意图但不生成工具参数；Tavily/MCP 参数、项目排序和资源关联均由确定性代码完成。工具原始结果经过标准化、去重和裁剪后形成 `Observation`，再进入下一轮 Context。循环受最大轮数、最大工具调用数和重复动作保护；身份无法确定时任务进入 `NEEDS_CONFIRMATION`。
+Intake Router 提供对话、活动查询、音频上传/重试、身份确认、摘要确认和开始分析；Task Router 提供兼容的文字/音频任务入口，以及任务查询、执行日志、SSE、确认、取消、清空和分析问答。`GET /api/v1/tasks/{task_id}` 同时返回任务状态和报告字段，当前没有独立 Report Router。`GET /api/v1/tasks/{task_id}/events` 从 `execution_events` 读取事件并输出 SSE；前端另外轮询 intake activity 和音频任务状态。
 
-## 图5：数据库 ER 关系图
+#### 图 4.2：异步任务与研究服务
 
-用途说明：同时展示当前物理模型和建议的规范化模型。名称带 `_PROPOSED` 的实体当前不存在。
+```mermaid
+flowchart TD
+    Celery["celery_app"] --> AudioTask["run_intake_audio_transcription"]
+    Celery --> PipelineTask["run_research_pipeline"]
+    AudioTask --> Whisper["LocalWhisperTranscriber"]
+    PipelineTask --> Pipeline["ResearchPipeline"]
+    Pipeline --> Loop["AgentLoopRunner"]
+    Loop --> Tools["AgentToolExecutor"]
+    Pipeline --> Ranker["ProjectRanker"]
+    Pipeline --> Association["ResourceAssociationBuilder"]
+    Pipeline --> Synthesis["final_synthesis"]
+    Pipeline --> Renderer["ReportRenderer"]
+```
+
+`AgentLoopRunner` 只负责上下文、动作校验、阶段转换和循环保护；工具参数由规则代码生成，工具结果被标准化为 `Observation`。
+
+### 图 5：研究流水线
+
+#### 图 5.1：任务启动与上下文准备
+
+```mermaid
+flowchart TD
+    Task["加载 ResearchTask"] --> Cancelled{"已取消？"}
+    Cancelled -->|"是"| Stop["停止"]
+    Cancelled -->|"否"| Context{"已有 confirmed_context？"}
+    Context -->|"是"| Restore["从 Intake 快照恢复上下文"]
+    Context -->|"否"| Extract["RuleExtractor.extract"]
+    Extract --> Understand["fallback_understanding"]
+    Understand --> Resolve["EntityResolver.resolve"]
+    Resolve --> NeedConfirm{"存在身份歧义？"}
+    NeedConfirm -->|"是"| Wait["NEEDS_CONFIRMATION<br/>保存后退出任务"]
+    NeedConfirm -->|"否"| Persist["保存 confirmed_context"]
+    Restore --> Loop["进入 PUBLIC_RESEARCH"]
+    Persist --> Loop
+```
+
+标准 intake 路径通常已经携带 `confirmed_context`。`/api/v1/tasks/text` 和 `/api/v1/tasks/audio` 仍保留兼容入口，因此 Pipeline 仍包含规则提取和任务级身份确认分支。当前 Pipeline 从 `PUBLIC_RESEARCH` 启动 Agent Loop；用户确认发生在进入循环之前，不是循环中的通用动作。
+
+#### 图 5.2：Agent Loop
+
+```mermaid
+flowchart TD
+    Context["AgentContextBuilder<br/>裁剪上下文与 Observation"] --> Turn["agent_turn 选择动作意图"]
+    Turn --> Validate{"动作符合当前阶段？"}
+    Validate -->|"否"| Fallback["使用阶段默认动作"]
+    Validate -->|"是"| Action{"AgentAction"}
+    Fallback --> Action
+
+    Action -->|"SEARCH_PUBLIC"| WebPlan["规则生成 Tavily 查询"]
+    WebPlan --> WebTool["search → extract → 证据分流"]
+    WebTool --> WebObs["公开信息 Observation"]
+    WebObs --> Context
+
+    Action -->|"SEARCH_INTERNAL"| ProjectPlan["规则生成 MCP 参数"]
+    ProjectPlan --> ProjectTool["search_projects"]
+    ProjectTool --> ProjectObs["内部项目 Observation"]
+    ProjectObs --> Context
+
+    Action -->|"SYNTHESIZE / RESPOND / FINISH"| Done["结束循环"]
+```
+
+规则先把公开证据分成接受、拒绝和歧义三类，只有歧义候选交给 `evidence_verify`。循环默认最多 8 轮、4 次工具调用，并阻止连续重复动作；达到限制时保留已取得的结果并标记 `agent_loop` 降级。
+
+#### 图 5.3：排序、关联与报告
+
+```mermaid
+flowchart LR
+    Inputs["公开证据 + 内部项目"] --> Rank["ProjectRanker<br/>确定性评分"]
+    Rank --> Associate["ResourceAssociationBuilder<br/>资源、缺口与风险"]
+    Associate --> Fallback["生成规则版内容"]
+    Associate --> LLM["final_synthesis<br/>白名单材料综合"]
+    LLM --> Validate["校验 LLM 输出"]
+    Fallback --> Merge["补全并再次校验"]
+    Validate --> Merge
+    Merge --> Render["Jinja2 渲染"]
+    Render --> Detailed["详细报告"]
+    Render --> Brief["行动简报"]
+```
+
+规则版内容始终先生成。`final_synthesis` 不可用或输出校验失败时使用规则版内容；成功时也会与规则版合并并再次校验，最后保存 `COMPLETED`。取消任务会在各阶段检查点停止；未处理异常将任务置为 `FAILED`。
+
+### 图 6：外部调用边界
+
+#### 图 6.1：公开信息
+
+```mermaid
+flowchart LR
+    Intake["IntakeEntityCandidateService"] --> Client["TavilyClient"]
+    Research["AgentToolExecutor"] --> Client
+    Client --> API["api.tavily.com"]
+    API --> Results["搜索结果与网页正文"]
+    Results --> Identity["身份原文校验"]
+    Results --> Evidence["研究证据分流"]
+```
+
+Intake Web 查询只用于未解决的身份补全；研究 Web 查询用于公开事实收集。LLM 不直接访问 Tavily，也不自行执行网络请求。
+
+#### 图 6.2：内部资源
+
+```mermaid
+flowchart LR
+    Identity["身份补全"] --> MCPClient["ProjectMcpClient"]
+    Research["项目检索"] --> MCPClient
+    MCPClient --> MCP["FastMCP Server"]
+    MCP --> Find["find_entity_candidates"]
+    MCP --> Search["search_projects"]
+    MCP --> Detail["get_project_details"]
+    MCP --> Portfolio["get_sales_portfolio"]
+    Find --> Repo["ProjectRepository"]
+    Search --> Repo
+    Detail --> Repo
+    Portfolio --> Repo
+    Repo -->|"resource_reader 只读"| DB[("PostgreSQL 内部业务表")]
+```
+
+内部业务查询必须经过 MCP Server。LLM 只接收经过裁剪的上下文并输出结构化决策，不能直接访问应用数据库或内部业务表。
+
+### 图 7：当前数据模型
+
+#### 图 7.1：应用状态表
 
 ```mermaid
 erDiagram
-    IntakeSession["IntakeSession（信息采集会话）"] {
-        string id PK "（信息采集会话ID）"
-        string status "（状态）"
-        jsonb messages "（消息记录）"
-        jsonb structured_context "（结构化上下文）"
-        jsonb confirmation_request "（确认请求）"
-        string research_task_id UK "（研究任务ID）"
+    intake_sessions {
+        varchar id PK
+        varchar status
+        jsonb messages
+        jsonb structured_context
+        jsonb confirmation_request
+        varchar research_task_id UK
     }
 
-    ResearchTask["ResearchTask（研究任务）"] {
-        string id PK "（研究任务ID）"
-        string intake_session_id UK "（信息采集会话ID）"
-        string status "（状态）"
-        json input_snapshot "（输入快照）"
-        json confirmed_context "（已确认上下文）"
-        json public_claims "（公开信息事实）"
-        json internal_results "（内部项目查询结果）"
-        json association_analysis "（关联分析）"
-        text detailed_report_markdown "（详细报告Markdown）"
-        text action_brief_markdown "（行动说明Markdown）"
-    }
-
-    IntakeAudioJob["IntakeAudioJob（信息采集音频任务）"] {
-        string id PK "（音频任务ID）"
-        string session_id "（信息采集会话ID）"
-        string status "（状态）"
-        text audio_path "（音频文件路径）"
-        text transcript "（音频转写文本）"
-    }
-
-    LlmCallLog["LlmCallLog（大模型调用日志）"] {
-        string id PK "（调用日志ID）"
-        string task_id "（研究任务ID）"
-        string node_name "（节点名称）"
-        string status "（调用状态）"
-        int latency_ms "（调用耗时，毫秒）"
-    }
-
-    Customer["Customer（客户）"] {
-        string customer_id PK "（客户ID）"
-        string customer_name "（客户名称）"
-    }
-
-    CustomerContact["CustomerContact（客户联系人）"] {
-        string contact_id PK "（联系人ID）"
-        string customer_id FK "（客户ID）"
-        string contact_name "（联系人姓名）"
-        string job_title "（职位）"
-    }
-
-    InternalProject["InternalProject（内部项目）"] {
-        string project_id PK "（项目ID）"
-        string customer_id FK "（客户ID）"
-        string customer_contact_id FK "（客户联系人ID）"
-        string sales_rep_id FK "（销售代表ID）"
-        string project_name "（项目名称）"
-        vector project_embedding "（项目向量）"
-    }
-
-    SalesManager["SalesManager（销售经理）"] {
-        string manager_id PK "（销售经理ID）"
-    }
-
-    SalesRepresentative["SalesRepresentative（销售代表）"] {
-        string sales_rep_id PK "（销售代表ID）"
-        string manager_id FK "（销售经理ID）"
-    }
-
-    ProjectStatusHistory["ProjectStatusHistory（项目状态历史）"] {
-        int history_id PK "（历史记录ID）"
-        string project_id FK "（项目ID）"
-    }
-
-    UserAccount_PROPOSED["UserAccount_PROPOSED（用户账户，建议新增）"] {
-        string id PK "（用户账户ID）"
-        string login_name UK "（登录名称）"
-        string display_name "（显示名称）"
-    }
-
-    ConversationMessage_PROPOSED["ConversationMessage_PROPOSED（会话消息，建议新增）"] {
-        string id PK "（会话消息ID）"
-        string intake_session_id FK "（信息采集会话ID）"
-        string role "（消息角色）"
-        text content "（消息内容）"
-    }
-
-    CanonicalEntity_PROPOSED["CanonicalEntity_PROPOSED（标准实体，建议新增）"] {
-        string id PK "（标准实体ID）"
-        string entity_type "（实体类型）"
-        string canonical_name "（标准名称）"
-    }
-
-    ResearchEntity_PROPOSED["ResearchEntity_PROPOSED（研究实体关联，建议新增）"] {
-        string task_id FK "（研究任务ID）"
-        string entity_id FK "（标准实体ID）"
-        string confirmed_by "（确认方式）"
-    }
-
-    Evidence_PROPOSED["Evidence_PROPOSED（证据，建议新增）"] {
-        string id PK "（证据ID）"
-        string task_id FK "（研究任务ID）"
-        string source_type "（来源类型）"
-        text claim "（事实陈述）"
-        text source_url "（来源链接）"
-    }
-
-    ProjectMatch_PROPOSED["ProjectMatch_PROPOSED（项目匹配，建议新增）"] {
-        string task_id FK "（研究任务ID）"
-        string project_id FK "（项目ID）"
-        float relevance_score "（相关性评分）"
-    }
-
-    Report_PROPOSED["Report_PROPOSED（报告，建议新增）"] {
-        string id PK "（报告ID）"
-        string task_id FK "（研究任务ID）"
-        string report_type "（报告类型）"
-        text markdown "（Markdown报告内容）"
-    }
-
-    IntakeSession ||--o| ResearchTask : "逻辑一对一"
-    IntakeSession ||--o{ IntakeAudioJob : "session_id 逻辑关联"
-    ResearchTask ||--o{ LlmCallLog : "task_id 逻辑关联"
-
-    Customer ||--o{ CustomerContact : "has（拥有）"
-    Customer ||--o{ InternalProject : "owns（拥有）"
-    CustomerContact ||--o{ InternalProject : "contacts（负责联系）"
-    SalesManager ||--o{ SalesRepresentative : "manages（管理）"
-    SalesRepresentative ||--o{ InternalProject : "owns（负责）"
-    InternalProject ||--o{ ProjectStatusHistory : "records（记录）"
-
-    UserAccount_PROPOSED ||--o{ IntakeSession : "owns（拥有）"
-    IntakeSession ||--o{ ConversationMessage_PROPOSED : "contains（包含）"
-    ResearchTask ||--o{ ResearchEntity_PROPOSED : "identifies（识别）"
-    CanonicalEntity_PROPOSED ||--o{ ResearchEntity_PROPOSED : "referenced_by（被引用）"
-    ResearchTask ||--o{ Evidence_PROPOSED : "collects（收集）"
-    ResearchTask ||--o{ ProjectMatch_PROPOSED : "matches（匹配）"
-    InternalProject ||--o{ ProjectMatch_PROPOSED : "referenced_by（被引用）"
-    ResearchTask ||--o{ Report_PROPOSED : "generates（生成）"
-```
-
-模块说明：当前会话消息、实体、证据、项目匹配和报告主要内嵌在 JSON/Text 字段中；应用表之间多数只有逻辑 ID，没有数据库外键。建议新增用户、消息、标准实体、证据、项目匹配和报告表，以支持权限、审计、检索和版本管理。
-
-## 图6：外部工具调用关系图
-
-用途说明：展示 Agent、工具适配器和外部资源的访问边界，强调 LLM 不直接访问数据库或外部工具。
-
-```mermaid
-flowchart TB
-    subgraph Decision["决策层"]
-        IntakeAgent["IntakeAgent"]
-        AgentNodes["AgentNodes<br/>agent_turn / evidence_verify / final_synthesis"]
-        LLM["StructuredLLM<br/>输入：受控上下文<br/>输出：Pydantic 结构化结果"]
-        IntakeAgent --> LLM
-        AgentNodes --> LLM
-    end
-
-    subgraph Control["代码控制层"]
-        IntakeCandidates["IntakeEntityCandidateService"]
-        Pipeline["ResearchPipeline"]
-        AgentLoop["AgentLoopRunner<br/>Context → Action → Observation"]
-        ToolExecutor["AgentToolExecutor<br/>规则生成工具参数"]
-        Validation["证据分流 / ProjectRanker<br/>ResourceAssociationBuilder"]
-        IntakeCandidates --> Validation
-        Pipeline --> AgentLoop --> ToolExecutor
-        Pipeline --> Validation
-    end
-
-    subgraph Tools["Tool Layer"]
-        TavilyClient["TavilyClient<br/>search / extract"]
-        MCPClient["ProjectMcpClient<br/>MCP tool call"]
-        Repositories["TaskRepository<br/>IntakeSessionRepository"]
-        ProjectRepository["ProjectRepository<br/>只读内部查询"]
-    end
-
-    subgraph Resources["External Resource / Data"]
-        TavilyAPI["api.tavily.com<br/>公开网页搜索"]
-        MCPServer["FastMCP Server<br/>find_entity_candidates<br/>search_projects"]
-        AppDB["PostgreSQL<br/>研究任务与会话"]
-        EnterpriseDB["PostgreSQL 内部业务表<br/>resource_reader 只读账号"]
-    end
-
-    IntakeAgent --> IntakeCandidates
-    AgentNodes --> AgentLoop
-    IntakeCandidates --> TavilyClient
-    IntakeCandidates --> MCPClient
-    ToolExecutor --> TavilyClient
-    ToolExecutor --> MCPClient
-    Pipeline --> Repositories
-
-    TavilyClient --> TavilyAPI
-    MCPClient --> MCPServer --> ProjectRepository --> EnterpriseDB
-    Repositories --> AppDB
-
-    LLM -.->|"禁止：不能直接访问"| AppDB
-    LLM -.->|"禁止：不能直接访问"| EnterpriseDB
-    LLM -.->|"禁止：不能直接调用"| TavilyAPI
-```
-
-模块说明：`agent_turn` 输入经过裁剪的 `AgentContext`，只输出动作意图；`evidence_verify` 只接收规则无法判断的证据候选；`final_synthesis` 只接收已确认材料。LLM 不生成 Tavily 查询、MCP 参数或项目排序，真正的网络和数据库访问由 Python 工具类完成；内部业务查询必须经过 MCP Server 的 `ProjectRepository` 和只读账号。
-
-## 图7：部署架构图
-
-用途说明：区分当前 Docker Compose 开发部署与尚未实现的生产部署。
-
-```mermaid
-flowchart TB
-    subgraph DEV["当前开发环境"]
-        Developer["Developer"]
-        Git["Git Repository<br/>resource-agent-demo"]
-        Compose["Docker Compose"]
-
-        BrowserDev["Browser"]
-        FrontendDev["frontend<br/>Next.js :3000"]
-        BackendDev["backend<br/>Uvicorn/FastAPI :8000"]
-        WorkerDev["worker<br/>Celery --pool=solo"]
-        MCPDev["mcp-server<br/>FastMCP :8001"]
-        RedisDev["redis:7-alpine"]
-        PGDev["pgvector/pgvector:pg16"]
-        VolumesDev["audio_data / model_cache / postgres_data"]
-
-        Developer --> Git --> Compose
-        Compose --> FrontendDev
-        Compose --> BackendDev
-        Compose --> WorkerDev
-        Compose --> MCPDev
-        Compose --> RedisDev
-        Compose --> PGDev
-
-        BrowserDev -->|"HTTP :3000"| FrontendDev
-        FrontendDev -->|"REST :8000"| BackendDev
-        BackendDev -->|"enqueue"| RedisDev
-        WorkerDev -->|"consume / result"| RedisDev
-        BackendDev --> PGDev
-        WorkerDev --> PGDev
-        WorkerDev --> MCPDev --> PGDev
-        WorkerDev --> VolumesDev
-        PGDev --> VolumesDev
-    end
-
-    subgraph PROD["生产环境：未来规划，当前仓库未实现"]
-        BrowserProd["Browser"]
-        Gateway["Nginx / API Gateway<br/>TLS、路由、限流"]
-        AuthProd["Authentication / Authorization"]
-        FrontendProd["Next.js Runtime 或静态托管"]
-        FastAPIProd["FastAPI Replicas"]
-        RedisProd["Managed Redis<br/>broker / result backend"]
-        WorkerProd["Celery Worker Pool"]
-        MCPProd["Private MCP Server"]
-        PGProd["Managed PostgreSQL / pgvector"]
-        ObjectStore["Object Storage<br/>音频与导出报告"]
-        Observability["Logs / Metrics / Tracing"]
-
-        BrowserProd --> Gateway
-        Gateway --> FrontendProd
-        Gateway --> AuthProd --> FastAPIProd
-        FastAPIProd -->|"enqueue"| RedisProd
-        RedisProd -->|"consume"| WorkerProd
-        FastAPIProd --> PGProd
-        WorkerProd --> PGProd
-        WorkerProd --> MCPProd --> PGProd
-        WorkerProd --> ObjectStore
-        FastAPIProd --> Observability
-        WorkerProd --> Observability
-        MCPProd --> Observability
-    end
-```
-
-模块说明：当前环境通过 Docker Compose 暴露 `3000/8000/8001`，没有反向代理、TLS、认证或集中可观测性；生产建议由网关统一接入，FastAPI 只负责入队，Celery 从 Redis 消费任务，PostgreSQL 和对象存储负责持久化。
-
-
-## 图8 resource_agent ER 关系图
-```mermaid
-erDiagram
-    customers {
-        varchar customer_id PK "（客户ID）"
-        varchar customer_name UK "（客户名称）"
-        varchar industry "（所属行业）"
-        varchar region_name "（区域名称）"
-        varchar account_tier "（客户等级）"
-        timestamptz created_at "（创建时间）"
-    }
-
-    customer_contacts {
-        varchar contact_id PK "（联系人ID）"
-        varchar customer_id FK "（客户ID）"
-        varchar contact_name "（联系人姓名）"
-        varchar job_title "（职位）"
-        varchar phone "（电话）"
-        varchar email "（邮箱）"
-        boolean is_primary "（是否主要联系人）"
-        timestamptz created_at "（创建时间）"
-    }
-
-    sales_managers {
-        varchar manager_id PK "（销售经理ID）"
-        varchar manager_name "（销售经理姓名）"
-        varchar region_name "（负责区域）"
-        varchar phone "（电话）"
-        varchar email "（邮箱）"
-        boolean active "（是否在职）"
-    }
-
-    sales_representatives {
-        varchar sales_rep_id PK "（销售人员ID）"
-        varchar manager_id FK "（销售经理ID）"
-        varchar sales_rep_name "（销售人员姓名）"
-        varchar territory "（负责区域）"
-        boolean active "（是否在职）"
-        date hired_on "（入职日期）"
-    }
-
-    internal_projects {
-        varchar project_id PK "（项目ID）"
-        varchar project_name "（项目名称）"
-        varchar customer_id FK "（客户ID）"
-        varchar customer_contact_id FK "（客户联系人ID）"
-        varchar sales_rep_id FK "（销售负责人ID）"
-        varchar customer_name "（客户名称快照）"
-        varchar contact_name "（联系人姓名快照）"
-        varchar status "（项目状态）"
-        varchar project_stage "（项目阶段）"
-        varchar health_status "（项目健康状态）"
-        varchar priority "（优先级）"
-        numeric contract_value "（合同金额）"
-        smallint win_probability "（赢单概率）"
-        date start_date "（开始日期）"
-        date end_date "（结束日期）"
-        date last_activity_date "（最近活动日期）"
-        date next_followup_date "（下次跟进日期）"
-        text description "（项目描述）"
-        vector project_embedding "（项目文本向量）"
-    }
-
-    project_status_history {
-        bigint history_id PK "（状态历史ID）"
-        varchar project_id FK "（项目ID）"
-        varchar status "（项目状态）"
-        varchar project_stage "（项目阶段）"
-        varchar health_status "（健康状态）"
-        timestamptz changed_at "（变更时间）"
-        varchar changed_by "（变更人）"
-        text change_note "（变更说明）"
-    }
-
-    entity_aliases {
-        varchar candidate_id PK "（候选实体ID）"
-        varchar entity_type "（实体类型）"
-        varchar canonical_name "（标准名称）"
-        varchar alias "（别名）"
-        varchar organization_name "（所属组织）"
-        varchar title "（职位）"
-        varchar region "（区域）"
+    intake_audio_jobs {
+        varchar id PK
+        varchar session_id
+        varchar status
+        text audio_path
+        text transcript
+        text corrected_transcript
     }
 
     research_tasks {
-        varchar id PK "（研究任务ID）"
-        varchar intake_session_id UK "（信息采集会话ID）"
-        varchar status "（任务状态）"
-        varchar input_type "（输入类型）"
-        text input_text "（输入文本）"
-        jsonb input_snapshot "（输入快照）"
-        jsonb confirmed_context "（已确认上下文）"
-        jsonb public_claims "（公开信息声明）"
-        jsonb internal_results "（内部项目结果）"
-        jsonb ranked_internal_results "（内部项目排序结果）"
-        jsonb association_analysis "（资源关联分析）"
-        jsonb generated_report_content "（结构化报告内容）"
-        text detailed_report_markdown "（详细报告）"
-        text action_brief_markdown "（行动简报）"
-        jsonb degraded_nodes "（降级节点）"
-        timestamptz created_at "（创建时间）"
-        timestamptz updated_at "（更新时间）"
+        varchar id PK
+        varchar intake_session_id UK
+        varchar status
+        jsonb input_snapshot
+        json confirmed_context
+        json public_claims
+        json internal_results
+        json association_analysis
+        text detailed_report_markdown
+        text action_brief_markdown
     }
 
     llm_call_logs {
-        varchar id PK "（调用日志ID）"
-        varchar task_id "（研究任务ID）"
-        varchar node_name "（Agent节点名称）"
-        varchar model "（模型名称）"
-        varchar status "（调用状态）"
-        varchar response_id "（模型响应ID）"
-        varchar prompt_version "（提示词版本）"
-        integer latency_ms "（调用耗时毫秒）"
-        integer input_tokens "（输入Token数）"
-        integer output_tokens "（输出Token数）"
-        varchar error_type "（错误类型）"
-        text error_message "（错误信息）"
-        timestamptz created_at "（创建时间）"
+        varchar id PK
+        varchar task_id
+        varchar node_name
+        varchar status
+        integer latency_ms
+    }
+
+    execution_events {
+        bigint id PK
+        varchar scope_id
+        varchar event_type
+        varchar node_name
+        varchar status
+        jsonb payload
+    }
+
+    intake_sessions ||--o{ intake_audio_jobs : "session_id 逻辑关联"
+    intake_sessions ||--o| research_tasks : "intake_session_id 逻辑关联"
+    research_tasks ||--o{ llm_call_logs : "task_id 逻辑关联"
+    research_tasks ||--o{ execution_events : "scope_id 可指向任务"
+    intake_sessions ||--o{ execution_events : "scope_id 也可指向会话"
+```
+
+这些表由 `backend/app/models/database.py` 定义，并由 `init_database()` 在 FastAPI 启动时创建或补充迁移。图中的关系均为逻辑关联：ORM 当前没有为这些字段声明数据库外键。会话消息、实体、证据、项目匹配和报告主要保存在 JSON/Text 字段中。
+
+#### 图 7.2：内部项目表
+
+```mermaid
+erDiagram
+    customers {
+        varchar customer_id PK
+        varchar customer_name UK
+        varchar industry
+        varchar region_name
+        varchar account_tier
+    }
+
+    customer_contacts {
+        varchar contact_id PK
+        varchar customer_id FK
+        varchar contact_name
+        varchar job_title
+    }
+
+    sales_managers {
+        varchar manager_id PK
+        varchar manager_name
+        varchar region_name
+    }
+
+    sales_representatives {
+        varchar sales_rep_id PK
+        varchar manager_id FK
+        varchar sales_rep_name
+        varchar territory
+    }
+
+    internal_projects {
+        varchar project_id PK
+        varchar customer_id FK
+        varchar customer_contact_id FK
+        varchar sales_rep_id FK
+        varchar project_name
+        varchar status
+        varchar project_stage
+        vector project_embedding
+    }
+
+    project_status_history {
+        bigint history_id PK
+        varchar project_id FK
+        varchar status
+        varchar project_stage
+        varchar health_status
+        timestamptz changed_at
     }
 
     customers ||--o{ customer_contacts : "拥有联系人"
@@ -732,9 +400,46 @@ erDiagram
     sales_managers ||--o{ sales_representatives : "管理"
     sales_representatives ||--o{ internal_projects : "负责项目"
     internal_projects ||--o{ project_status_history : "记录状态变化"
-    research_tasks ||--o{ llm_call_logs : "逻辑关联，无数据库外键"
 ```
 
+内部项目表和查询视图由 `seed/init.sql` 创建，`mcp_server/project_repository.py` 使用 `resource_reader` 只读账号查询。项目检索按人物/企业精确匹配、文本匹配和 HashingVectorizer 向量匹配组合返回结果。
 
+建议但尚未实现的规范化表包括 User、ConversationMessage、CanonicalEntity、Evidence、ProjectMatch 和 Report；它们不属于当前物理模型。
 
-注意：entity_aliases 当前没有外键；research_tasks 与 llm_call_logs 通过 task_id 逻辑关联，但数据库未建立外键。当前运行库中也没有代码模型里定义的 intake_sessions 和 intake_audio_jobs 表。
+### 图 8：Docker Compose 部署
+
+#### 图 8.1：启动依赖
+
+```mermaid
+flowchart LR
+    Postgres["postgres"] --> Seed["seed<br/>一次性初始化数据"]
+    Seed --> MCP["mcp-server"]
+    MCP --> Backend["backend"]
+    Backend --> Worker["worker"]
+    Backend --> Frontend["frontend"]
+    ModelInit["model-init<br/>一次性下载 Whisper"] --> Worker
+    Redis["redis"] --> Backend
+    Redis --> Worker
+```
+
+#### 图 8.2：运行时连接与卷
+
+```mermaid
+flowchart TD
+    Browser["Browser"] -->|":3000"| Frontend["Next.js"]
+    Browser -->|"REST / SSE :8000"| Backend["FastAPI"]
+    Backend --> Postgres[("PostgreSQL + pgvector")]
+    Backend --> Redis["Redis"]
+    Redis --> Worker["Celery --pool=solo"]
+    Worker --> Postgres
+    Worker --> MCP["FastMCP :8001"]
+    MCP -->|"只读"| Postgres
+    Worker --> Tavily["Tavily API"]
+    Worker --> LLM["LLM Gateway"]
+    Backend --> Audio[("audio_data")]
+    Worker --> Audio
+    Worker --> Models[("model_cache 只读")]
+    Postgres --> Data[("postgres_data")]
+```
+
+当前 Compose 暴露 `3000`、`8000` 和 `8001`，使用 `postgres_data`、`audio_data`、`model_cache` 三个命名卷。生产网关、TLS、认证授权、托管 Redis/PostgreSQL、对象存储和日志指标追踪仍属于未来规划。

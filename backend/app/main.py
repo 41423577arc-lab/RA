@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 # 从 intake 接口文件中导入路由对象。
-# “as intake_router”表示把导入的 router 重命名为 intake_router，
+
 # 这样可以看出它属于信息采集模块。
 from app.api.intake import router as intake_router
 
@@ -24,7 +24,7 @@ from app.database import init_database
 
 
 # asynccontextmanager 表示下面这个函数负责管理应用的生命周期。
-# 所谓生命周期，就是应用“启动”和“关闭”的整个过程。
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     # FastAPI 应用启动时执行数据库初始化。
