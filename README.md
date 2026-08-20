@@ -54,7 +54,7 @@ npm run build
 当前 LLM 节点按职责分为：
 
 - Intake：`intake_chat`、`intake_followup`、`intake_identity_normalize`、`intake_readiness`、`intake_final_confirmation`
-- Research：`agent_turn`、`evidence_verify`、`final_synthesis`
+- Research：`evidence_verify`、`final_synthesis`
 - Analysis chat：`analysis_chat`
 
 ### 图 1：系统总览
@@ -168,15 +168,14 @@ flowchart TD
     Celery --> PipelineTask["run_research_pipeline"]
     AudioTask --> Whisper["LocalWhisperTranscriber"]
     PipelineTask --> Pipeline["ResearchPipeline"]
-    Pipeline --> Loop["AgentLoopRunner"]
-    Loop --> Tools["AgentToolExecutor"]
+    Pipeline --> Tools["ResearchToolExecutor"]
     Pipeline --> Ranker["ProjectRanker"]
     Pipeline --> Association["ResourceAssociationBuilder"]
     Pipeline --> Synthesis["final_synthesis"]
     Pipeline --> Renderer["ReportRenderer"]
 ```
 
-`AgentLoopRunner` 只负责上下文、动作校验、阶段转换和循环保护；工具参数由规则代码生成，工具结果被标准化为 `Observation`。
+`ResearchPipeline` 按固定顺序调用公开检索、内部项目查询、排序、关联、综合和渲染；工具参数仍由规则代码生成。
 
 ### 图 5：研究流水线
 
@@ -194,36 +193,30 @@ flowchart TD
     Resolve --> NeedConfirm{"存在身份歧义？"}
     NeedConfirm -->|"是"| Wait["NEEDS_CONFIRMATION<br/>保存后退出任务"]
     NeedConfirm -->|"否"| Persist["保存 confirmed_context"]
-    Restore --> Loop["进入 PUBLIC_RESEARCH"]
-    Persist --> Loop
+    Restore --> Research["进入固定研究流水线"]
+    Persist --> Research
 ```
 
-标准 intake 路径通常已经携带 `confirmed_context`。`/api/v1/tasks/text` 和 `/api/v1/tasks/audio` 仍保留兼容入口，因此 Pipeline 仍包含规则提取和任务级身份确认分支。当前 Pipeline 从 `PUBLIC_RESEARCH` 启动 Agent Loop；用户确认发生在进入循环之前，不是循环中的通用动作。
+标准 intake 路径通常已经携带 `confirmed_context`。`/api/v1/tasks/text` 和 `/api/v1/tasks/audio` 仍保留兼容入口，因此 Pipeline 仍包含规则提取和任务级身份确认分支。用户确认完成后进入固定研究流水线。
 
-#### 图 5.2：Agent Loop
+#### 图 5.2：固定研究编排
 
 ```mermaid
 flowchart TD
-    Context["AgentContextBuilder<br/>裁剪上下文与 Observation"] --> Turn["agent_turn 选择动作意图"]
-    Turn --> Validate{"动作符合当前阶段？"}
-    Validate -->|"否"| Fallback["使用阶段默认动作"]
-    Validate -->|"是"| Action{"AgentAction"}
-    Fallback --> Action
-
-    Action -->|"SEARCH_PUBLIC"| WebPlan["规则生成 Tavily 查询"]
-    WebPlan --> WebTool["search → extract → 证据分流"]
-    WebTool --> WebObs["公开信息 Observation"]
-    WebObs --> Context
-
-    Action -->|"SEARCH_INTERNAL"| ProjectPlan["规则生成 MCP 参数"]
+    Context["confirmed_context"] --> WebPlan["规则生成 Tavily 查询"]
+    WebPlan --> WebTool["search → extract"]
+    WebTool --> Evidence["证据规则分流"]
+    Evidence -->|"歧义候选"| Verify["evidence_verify"]
+    Evidence --> ProjectPlan["规则生成 MCP 参数"]
+    Verify --> ProjectPlan
     ProjectPlan --> ProjectTool["search_projects"]
-    ProjectTool --> ProjectObs["内部项目 Observation"]
-    ProjectObs --> Context
-
-    Action -->|"SYNTHESIZE / RESPOND / FINISH"| Done["结束循环"]
+    ProjectTool --> Rank["ProjectRanker"]
+    Rank --> Associate["ResourceAssociationBuilder"]
+    Associate --> Synthesis["final_synthesis"]
+    Synthesis --> Render["ReportRenderer"]
 ```
 
-规则先把公开证据分成接受、拒绝和歧义三类，只有歧义候选交给 `evidence_verify`。循环默认最多 8 轮、4 次工具调用，并阻止连续重复动作；达到限制时保留已取得的结果并标记 `agent_loop` 降级。
+规则先把公开证据分成接受、拒绝和歧义三类，只有歧义候选交给 `evidence_verify`。Tavily 或 MCP 单路失败时记录降级状态并继续后续步骤。
 
 #### 图 5.3：排序、关联与报告
 
@@ -250,7 +243,7 @@ flowchart LR
 ```mermaid
 flowchart LR
     Intake["IntakeEntityCandidateService"] --> Client["TavilyClient"]
-    Research["AgentToolExecutor"] --> Client
+    Research["ResearchToolExecutor"] --> Client
     Client --> API["api.tavily.com"]
     API --> Results["搜索结果与网页正文"]
     Results --> Identity["身份原文校验"]

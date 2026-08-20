@@ -7,7 +7,7 @@ from app.schemas.task import (
     ProjectResult,
     PublicClaim,
 )
-from app.services.resource_association import ResourceAssociationBuilder
+from app.services.research.resource_association import ResourceAssociationBuilder
 
 
 def _context() -> ConfirmedContext:

@@ -3,7 +3,7 @@ from pathlib import Path
 from app.config import settings
 from app.database import SessionLocal
 from app.models.database import IntakeAudioJob, IntakeSession
-from app.services.transcriber import LocalWhisperTranscriber
+from app.services.integrations.transcriber import LocalWhisperTranscriber
 from app.tasks.celery_app import celery_app
 
 

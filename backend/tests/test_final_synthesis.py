@@ -12,8 +12,8 @@ from app.schemas.task import (
     ProjectResult,
     PublicClaim,
 )
-from app.services.agent_nodes import AgentNodes
-from app.services.final_synthesis import (
+from app.services.research.agent_nodes import AgentNodes
+from app.services.research.final_synthesis import (
     ordered_ranked_projects,
     validate_final_synthesis,
 )

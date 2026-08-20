@@ -3,7 +3,7 @@ from pathlib import Path
 
 import numpy as np
 
-from app.services.text_vectorizer import HASHING_DIMENSIONS, vectorize_text, vectorize_texts
+from app.services.research.text_vectorizer import HASHING_DIMENSIONS, vectorize_text, vectorize_texts
 
 
 ROOT = Path(__file__).resolve().parents[2]

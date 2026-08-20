@@ -32,14 +32,14 @@ from app.schemas.task import (
     WebSearchPlan,
     WebVerification,
 )
-from app.services.entity_resolver import EntityResolver
-from app.services.analysis_chat import (
+from app.services.intake.entity_resolver import EntityResolver
+from app.services.reporting.analysis_chat import (
     AnalysisChatAgent,
     build_task_chat_context,
     fallback_task_chat_reply,
 )
-from app.services.llm_client import LLMCallFailed, LLMUnavailable, StructuredLLM
-from app.services.execution_stream import stream_execution_events
+from app.services.integrations.llm_client import LLMCallFailed, LLMUnavailable, StructuredLLM
+from app.services.infrastructure.execution_stream import stream_execution_events
 from app.tasks.pipeline import run_research_pipeline
 
 

@@ -7,7 +7,7 @@ from app.config import Settings
 from app.database import SessionLocal, TaskRepository
 from app.main import app
 from app.schemas.task import WebSearchPlan, WebSearchQuery
-from app.services.llm_client import StructuredLLM
+from app.services.integrations.llm_client import StructuredLLM
 
 
 class RecordingRepository:
@@ -86,7 +86,7 @@ def test_llm_execution_events_include_exact_messages_and_parsed_output() -> None
 
     result = service.parse(
         "task-execution-log",
-        "agent_turn",
+        "evidence_verify",
         {"confirmed_name": "范玉峰"},
         WebSearchPlan,
     )

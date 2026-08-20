@@ -141,38 +141,39 @@ Agent Loop 默认从 `PUBLIC_RESEARCH` 开始，最多 8 轮、4 次工具调用
 | `backend/app/main.py` | FastAPI 应用、生命周期、CORS、路由注册 |
 | `backend/app/api/intake.py` | Intake、音频、身份确认、摘要确认和开始分析接口 |
 | `backend/app/api/tasks.py` | 兼容任务入口、任务查询、日志、SSE、取消和问答接口 |
-| `backend/app/services/intake_runner.py` | Intake 一轮对话的状态编排 |
-| `backend/app/services/intake_agent.py` | Intake 结构化 LLM 节点 |
-| `backend/app/services/intake_completeness.py` | 必要字段完整性判断 |
-| `backend/app/services/intake_entity_candidates.py` | 内部与外部身份候选、证据校验 |
-| `backend/app/services/intake_activity.py` | 进程内 Intake 活动状态存储 |
+| `backend/app/services/intake/intake_runner.py` | Intake 一轮对话的状态编排 |
+| `backend/app/services/intake/intake_agent.py` | Intake 结构化 LLM 节点 |
+| `backend/app/services/intake/intake_identity_loop.py` | Intake 身份确认 Agent Loop |
+| `backend/app/services/intake/intake_completeness.py` | 必要字段完整性判断 |
+| `backend/app/services/intake/intake_entity_candidates.py` | 内部与外部身份候选、证据校验 |
+| `backend/app/services/intake/intake_activity.py` | 进程内 Intake 活动状态存储 |
 | `backend/app/tasks/pipeline.py` | 研究任务总编排、取消检查和失败处理 |
-| `backend/app/services/agent_loop.py` | 阶段、动作校验、循环限制和 Observation 聚合 |
-| `backend/app/services/agent_tools.py` | Tavily 与 MCP 工具执行及结果标准化 |
-| `backend/app/services/evidence_verify.py` | 公开证据规则分流与模型复核 |
-| `backend/app/services/project_ranker.py` | 内部项目确定性评分与排序 |
-| `backend/app/services/resource_association.py` | 项目、资源、风险和行动关联分析 |
-| `backend/app/services/final_synthesis.py` | 最终综合输入构造与输出校验 |
-| `backend/app/services/report_renderer.py` | Jinja2 报告渲染 |
+| `backend/app/services/research/agent_tools.py` | Tavily 与 MCP 工具执行及结果标准化 |
+| `backend/app/services/research/evidence_verify.py` | 公开证据规则分流与模型复核 |
+| `backend/app/services/research/project_ranker.py` | 内部项目确定性评分与排序 |
+| `backend/app/services/research/resource_association.py` | 项目、资源、风险和行动关联分析 |
+| `backend/app/services/research/final_synthesis.py` | 最终综合输入构造与输出校验 |
+| `backend/app/services/reporting/report_renderer.py` | Jinja2 报告渲染 |
 | `backend/app/database.py` | 表初始化、轻量迁移和 Repository |
 | `backend/app/models/database.py` | 应用状态 ORM 模型 |
 | `mcp_server/server.py` | 四个内部只读 MCP 工具 |
 | `mcp_server/project_repository.py` | 内部实体与项目数据库查询 |
 
-建议的后端阅读顺序：`api/intake.py` -> `intake_runner.py` -> `api/tasks.py` -> `tasks/pipeline.py` -> `agent_loop.py` -> `agent_tools.py`。
+建议的后端阅读顺序：`api/intake.py` -> `intake/intake_runner.py` -> `intake/intake_identity_loop.py` -> `api/tasks.py` -> `tasks/pipeline.py` -> `research/agent_tools.py`。
 
 ## 6. LLM 节点与降级
 
-当前提示词位于 `backend/prompts`，共 9 个结构化节点：
+当前提示词位于 `backend/prompts`，共 10 个结构化节点：
 
 | 分组 | 节点 | 用途 |
 | --- | --- | --- |
 | Intake | `intake_chat` | 提取对话中的结构化上下文 |
 | Intake | `intake_followup` | 根据工具观察决定追问方式 |
 | Intake | `intake_identity_normalize` | 从有证据的外部页面标准化身份 |
+| Intake | `intake_identity_initialize` | 初始化身份确认 Context 与补充计划 |
+| Intake | `intake_identity_update` | 根据用户回复或工具观察更新身份 Context |
 | Intake | `intake_readiness` | 复核采集是否完整 |
 | Intake | `intake_final_confirmation` | 生成最终摘要确认问题 |
-| Research | `agent_turn` | 在受限动作集合中选择下一步 |
 | Research | `evidence_verify` | 复核规则无法判定的证据 |
 | Research | `final_synthesis` | 综合白名单材料形成报告内容 |
 | Analysis | `analysis_chat` | 回答当前研究结果相关问题 |
@@ -318,3 +319,240 @@ npm run build
 - 数据库级外键约束和完整的迁移框架。
 
 因此，该仓库适合作为受控 Demo 和流程验证环境。若用于生产，首先应补齐身份权限、持久化迁移、集中可观测性、敏感信息治理和高可用部署。
+
+```mermaid
+flowchart TD
+    U["用户<br/>录制一条语音"]
+
+    subgraph FE["① Frontend / Next.js :3000"]
+        F1["浏览器录音<br/>生成 WebM"]
+        F2["上传音频"]
+        F3["等待转写结果"]
+        F4["展示转写文字"]
+        F5["用户确认/修改文字"]
+        F6["展示 AI 回复"]
+    end
+
+    subgraph BE["② Backend / FastAPI :8000"]
+        B1["Intake API<br/>接收音频"]
+        B2["校验并保存音频任务"]
+        B3["把转写任务提交给 Celery"]
+        B4["接收确认后的文字"]
+        B5["IntakeRunner"]
+        B6["IntakeAgent<br/>理解用户消息"]
+        B7["完整性 / 字段状态检查"]
+        B8{"是否需要身份查询"}
+        B9["生成回复 / 追问"]
+        B10["最终确认后<br/>创建 ResearchTask"]
+    end
+
+    subgraph REDIS["③ Redis"]
+        R1["保存 Celery 任务消息"]
+        R2["等待 Worker 消费"]
+    end
+
+    subgraph WORKER["④ Celery Worker"]
+        W1["取得音频转写任务"]
+        W2["调用本地 Whisper"]
+        W3["得到转写文本"]
+
+        W4["取得 ResearchTask"]
+        W5["ResearchPipeline"]
+        W6["Agent Loop"]
+    end
+
+    subgraph MCP["⑤ MCP Server :8001"]
+        M1["find_entity_candidates<br/>查询内部人物/企业"]
+        M2["search_projects<br/>查询内部项目"]
+    end
+
+    subgraph PG["⑥ PostgreSQL :5432"]
+        P1["保存会话 / 音频任务 / 状态"]
+        P2["读取客户、联系人等内部数据"]
+        P3["保存 ResearchTask / 结果 / 报告"]
+        P4["读取内部项目数据"]
+    end
+
+    U --> F1 --> F2 --> B1
+    B1 --> B2
+    B2 --> P1
+    B2 --> B3
+
+    B3 --> R1 --> R2
+    R2 --> W1
+    W1 --> W2 --> W3
+    W3 --> P1
+
+    F3 --> B1
+    B1 --> P1
+    P1 --> F4
+
+    F4 --> F5
+    F5 --> B4
+    B4 --> B5
+    B5 --> B6
+    B6 --> B7
+
+    B7 --> B8
+
+    B8 -->|"需要"| M1
+    M1 --> P2
+    P2 --> M1
+    M1 --> B9
+
+    B8 -->|"不需要"| B9
+
+    B9 --> P1
+    B9 --> F6
+
+    B10 --> P3
+    B10 --> R1
+
+    R2 --> W4
+    W4 --> W5 --> W6
+
+    W6 -->|"内部搜索"| M2
+    M2 --> P4
+    P4 --> M2
+    M2 --> W6
+
+    W6 --> P3
+```
+```mermaid
+flowchart TD
+    U["用户输入文字"]
+
+    subgraph FE["① Frontend / Next.js :3000"]
+        F1["输入文字"]
+        F2["发送消息"]
+        F3["展示 AI 回复 / 候选卡片"]
+        F4["用户继续补充或确认"]
+        F5["点击立即分析"]
+        F6["展示分析进度与报告"]
+    end
+
+    subgraph BE["② Backend / FastAPI :8000"]
+        B1["Intake API<br/>接收文字消息"]
+        B2["IntakeRunner<br/>单轮信息采集编排"]
+        B3["IntakeAgent<br/>理解消息并更新结构化 Context"]
+        B4["完整性 / 字段状态检查"]
+        B5{"是否需要身份查询"}
+        B6{"是否存在身份歧义"}
+        B7["生成追问 / 回复"]
+        B8["生成最终确认摘要"]
+        B9["用户确认后进入 READY"]
+        B10["创建 ResearchTask"]
+        B11["把研究任务提交给 Celery"]
+        B12["Task API<br/>读取进度与报告"]
+    end
+
+    subgraph REDIS["③ Redis"]
+        R1["Celery 任务队列"]
+    end
+
+    subgraph WORKER["④ Celery Worker"]
+        W1["取得 ResearchTask"]
+        W2["ResearchPipeline"]
+        W3["公开搜索与证据分流"]
+        W4["内部项目查询"]
+        W6["ProjectRanker"]
+        W7["ResourceAssociationBuilder"]
+        W8["final_synthesis"]
+        W9["ReportRenderer"]
+    end
+
+    subgraph MCP["⑤ MCP Server :8001"]
+        M1["find_entity_candidates<br/>查询内部人物 / 企业"]
+        M2["search_projects<br/>查询内部项目"]
+    end
+
+    subgraph PG["⑥ PostgreSQL :5432"]
+        P1["保存 IntakeSession / Context"]
+        P2["读取客户 / 联系人数据"]
+        P3["保存 ResearchTask / ExecutionEvent"]
+        P4["读取内部项目数据"]
+        P5["保存分析结果 / 报告"]
+    end
+
+    %% =========================
+    %% 信息采集阶段
+    %% =========================
+
+    U --> F1 --> F2
+    F2 --> B1
+
+    B1 --> B2
+    B2 --> B3
+    B3 --> P1
+    B3 --> B4
+
+    B4 --> B5
+
+    B5 -->|"需要身份解析"| M1
+    M1 --> P2
+    P2 --> M1
+    M1 --> B6
+
+    B5 -->|"不需要"| B7
+
+    B6 -->|"有歧义"| B7
+    B6 -->|"身份明确"| B4
+
+    B7 --> P1
+    B7 --> F3
+
+    F3 --> F4
+    F4 -->|"继续补充"| B1
+    F4 -->|"确认候选"| B1
+
+    %% =========================
+    %% 最终确认阶段
+    %% =========================
+
+    B4 -->|"信息足够"| B8
+    B8 --> F3
+
+    F4 -->|"确认最终摘要"| B9
+    B9 --> P1
+
+    %% =========================
+    %% 启动正式分析
+    %% =========================
+
+    F5 --> B10
+    B10 --> P3
+    B10 --> B11
+
+    B11 --> R1
+    R1 --> W1
+
+    %% =========================
+    %% 固定研究流水线
+    %% =========================
+
+    W1 --> W2
+    W2 --> W3
+    W3 --> PUB["Tavily<br/>公开网页搜索 / 正文抓取"]
+    PUB --> W4
+    W4 --> M2
+    M2 --> P4
+    P4 --> M2
+    M2 --> W6
+
+    %% =========================
+    %% 后处理与报告
+    %% =========================
+
+    W6 --> W7
+    W7 --> W8
+    W8 --> W9
+    W9 --> P5
+
+    %% =========================
+    %% 前端读取结果
+    %% =========================
+
+    P3 --> B12
+    P5 --> B12
+    B12 --> F6
+```

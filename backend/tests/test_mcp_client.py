@@ -3,8 +3,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-import app.services.mcp_client as mcp_module
-from app.services.mcp_client import ProjectMcpClient
+import app.services.integrations.mcp_client as mcp_module
+from app.services.integrations.mcp_client import ProjectMcpClient
 
 
 class FakeTransport:

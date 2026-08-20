@@ -16,11 +16,11 @@ from app.schemas.task import (
     WebSearchPlan,
     WebSearchQuery,
 )
-from app.services.entity_resolver import EntityResolver, InsufficientContextError
-from app.services.extractor import RuleExtractor
-from app.services.llm_client import LLMCallFailed, StructuredLLM
+from app.services.intake.entity_resolver import EntityResolver, InsufficientContextError
+from app.services.research.extractor import RuleExtractor
+from app.services.integrations.llm_client import LLMCallFailed, StructuredLLM
 from app.tasks.pipeline import ResearchPipeline
-from app.services.report_renderer import ReportRenderer
+from app.services.reporting.report_renderer import ReportRenderer
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -75,7 +75,7 @@ def test_llm_client_uses_chat_completions_with_pydantic_schema() -> None:
     fake = FakeChatCompletions(expected.model_dump_json())
     service.client = SimpleNamespace(chat=SimpleNamespace(completions=fake))
 
-    result = service.parse("task-1", "agent_turn", {"name": "王传福"}, WebSearchPlan)
+    result = service.parse("task-1", "evidence_verify", {"name": "王传福"}, WebSearchPlan)
 
     assert result.queries[0].query == "王传福 比亚迪"
     assert fake.kwargs["model"] == "MiniMax-M3"
@@ -98,7 +98,7 @@ def test_llm_client_rejects_invalid_chat_completion_json() -> None:
     service.client = SimpleNamespace(chat=SimpleNamespace(completions=fake))
 
     with pytest.raises(LLMCallFailed, match="调用失败"):
-        service.parse("task-1", "agent_turn", {"name": "王传福"}, WebSearchPlan)
+        service.parse("task-1", "evidence_verify", {"name": "王传福"}, WebSearchPlan)
 
 
 def test_llm_client_keeps_responses_mode_available() -> None:
@@ -112,7 +112,7 @@ def test_llm_client_keeps_responses_mode_available() -> None:
     fake = FakeResponses()
     service.client = SimpleNamespace(responses=fake)
 
-    result = service.parse("task-1", "agent_turn", {"name": "王传福"}, WebSearchPlan)
+    result = service.parse("task-1", "evidence_verify", {"name": "王传福"}, WebSearchPlan)
 
     assert result.queries[0].query == "王传福 比亚迪"
     assert fake.kwargs["reasoning"] == {"effort": "xhigh"}
@@ -421,11 +421,7 @@ def test_v05_pipeline_completes_with_all_llm_nodes_degraded() -> None:
     pipeline.run(task.id)
 
     assert task.status == "COMPLETED", getattr(task, "error_message", None)
-    assert set(task.degraded_nodes) == {
-        "agent_turn",
-        "web_search",
-        "final_synthesis",
-    }
+    assert set(task.degraded_nodes) == {"web_search", "final_synthesis"}
     assert "P001" in task.detailed_report_markdown
     assert "和谁见面：王传福" in task.action_brief_markdown
     assert "ACTIVE" not in task.detailed_report_markdown

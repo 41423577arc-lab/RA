@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from app.schemas.task import ExtractedInfo, Person, WebPage
-from app.services.extractor import RuleExtractor
+from app.services.research.extractor import RuleExtractor
 
 
 SEED_DIR = Path(__file__).resolve().parents[2] / "seed"

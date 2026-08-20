@@ -5,7 +5,7 @@ from pathlib import Path
 
 from sqlalchemy import create_engine, text
 
-from app.services.text_vectorizer import vectorize_texts
+from app.services.research.text_vectorizer import vectorize_texts
 
 
 ROOT = Path(__file__).resolve().parent

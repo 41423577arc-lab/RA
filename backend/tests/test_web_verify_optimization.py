@@ -7,7 +7,7 @@ from app.schemas.task import (
     WebPage,
     WebSearchQuery,
 )
-from app.services.agent_nodes import (
+from app.services.research.agent_nodes import (
     AgentNodes,
     build_web_verification_candidates,
     materialize_web_verifications,

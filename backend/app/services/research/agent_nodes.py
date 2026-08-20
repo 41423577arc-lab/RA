@@ -1,9 +1,6 @@
 import re
 from app.schemas.task import (
     ActionBrief,
-    AgentAction,
-    AgentContext,
-    AgentTurnDecision,
     AssociationAnalysis,
     ConfirmedContext,
     EntityMention,
@@ -24,21 +21,12 @@ from app.schemas.task import (
     WebSearchQuery,
     WebVerification,
 )
-from app.services.llm_client import StructuredLLM
+from app.services.integrations.llm_client import StructuredLLM
 
 
 class AgentNodes:
     def __init__(self, llm: StructuredLLM):
         self.llm = llm
-
-    def agent_turn(self, task_id: str, context: AgentContext) -> AgentAction:
-        decision = self.llm.parse(
-            task_id,
-            "agent_turn",
-            {"context": context.model_dump(mode="json")},
-            AgentTurnDecision,
-        )
-        return decision.action
 
     def evidence_verify(
         self, task_id: str, candidates: list[WebEvidenceCandidate]
@@ -63,7 +51,7 @@ class AgentNodes:
         ranked_projects: list[tuple[ProjectResult, ProjectRanking]],
         association: AssociationAnalysis,
     ) -> GeneratedReportContent:
-        from app.services.final_synthesis import build_final_synthesis_input
+        from app.services.research.final_synthesis import build_final_synthesis_input
 
         return self.llm.parse(
             task_id,

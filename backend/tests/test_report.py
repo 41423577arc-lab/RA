@@ -14,13 +14,13 @@ from app.schemas.task import (
     ProjectResult,
     PublicClaim,
 )
-from app.services.agent_nodes import (
+from app.services.research.agent_nodes import (
     build_person_identity_summaries,
     complete_report_content,
     fallback_report_content,
     validate_report_content,
 )
-from app.services.report_renderer import ReportRenderer
+from app.services.reporting.report_renderer import ReportRenderer
 
 
 ROOT = Path(__file__).resolve().parents[2]

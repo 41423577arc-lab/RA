@@ -1,5 +1,4 @@
 from datetime import date
-from types import SimpleNamespace
 
 from app.schemas.task import (
     ConfirmedContext,
@@ -8,10 +7,8 @@ from app.schemas.task import (
     SearchResult,
     WebPage,
 )
-from app.services.agent_context import AgentContextBuilder
-from app.services.agent_loop import AgentLoopRunner
-from app.services.agent_nodes import fallback_project_query, fallback_web_plan
-from app.services.agent_tools import AgentToolExecutor, _expand_project_plan
+from app.services.research.agent_nodes import fallback_project_query, fallback_web_plan
+from app.services.research.agent_tools import ResearchToolExecutor, _expand_project_plan
 
 
 RAW_WEB_MARKER = "RAW_WEB_BODY_MUST_NOT_ENTER_CONTEXT"
@@ -81,14 +78,6 @@ class InternalProjects:
         return [project, project.model_copy(update={"project_name": "重复项目"}), {"bad": 1}]
 
 
-class EventRecorder:
-    def __init__(self):
-        self.events = []
-
-    def log_execution_event(self, scope_id, **values):
-        self.events.append({"scope_id": scope_id, **values})
-
-
 def _confirmed_context():
     return ConfirmedContext(
         intents=["MEETING_PREPARATION", "INTERNAL_PROJECT_QUERY"],
@@ -126,43 +115,27 @@ def _project(project_id, description):
     )
 
 
-def _task():
-    return SimpleNamespace(
-        id="task-tools",
-        input_text="准备会面",
-        confirmation_request=None,
-        ranked_internal_results=[],
-        association_analysis=None,
-    )
-
-
-def test_public_tool_uses_rule_plan_and_builds_bounded_observation():
+def test_public_tool_uses_rule_plan_and_returns_bounded_results():
     public = PublicSearch()
-    executor = AgentToolExecutor(public, InternalProjects())
-    context = AgentContextBuilder().build(
-        "PUBLIC_RESEARCH", _task(), _confirmed_context(), [], [], []
-    )
+    executor = ResearchToolExecutor(public, InternalProjects())
 
-    result = executor.execute("task-tools", "SEARCH_PUBLIC", context)
+    result = executor.search_public("task-tools", _confirmed_context())
 
     plan = fallback_web_plan(_confirmed_context())
     assert public.queries == [item.query for item in plan.queries]
     assert len(public.extract_input) == 1
     assert public.extract_input[0].url == "https://example.com/leader"
     assert len(public.extract_input[0].content) == 1_000
-    assert result.observation.status == "SUCCESS"
-    assert result.observation.result_refs == ["WEB_RESULT:W001"]
-    assert RAW_WEB_MARKER not in result.observation.model_dump_json()
+    assert result.web_search_status == "SUCCESS"
+    assert [item.web_result_id for item in result.search_results] == ["W001"]
+    assert RAW_WEB_MARKER not in "".join(item.content for item in result.search_results)
 
 
 def test_internal_tool_preserves_mcp_contract_and_normalizes_projects():
     internal = InternalProjects()
-    executor = AgentToolExecutor(PublicSearch(), internal)
-    context = AgentContextBuilder().build(
-        "PROJECT_RESEARCH", _task(), _confirmed_context(), [], [], []
-    )
+    executor = ResearchToolExecutor(PublicSearch(), internal)
 
-    result = executor.execute("task-tools", "SEARCH_INTERNAL", context)
+    result = executor.search_internal("task-tools", _confirmed_context())
 
     plan = _expand_project_plan(fallback_project_query(_confirmed_context()))
     assert internal.calls == [
@@ -172,59 +145,6 @@ def test_internal_tool_preserves_mcp_contract_and_normalizes_projects():
             [*plan.project_names, *plan.business_terms],
         )
     ]
-    assert result.observation.project_ids == ["P001"]
     assert len(result.project_results) == 1
     assert len(result.project_results[0].project_aliases) == 10
     assert len(result.project_results[0].description) == 1_000
-
-
-def test_runner_rebuilds_context_from_observations_after_each_tool():
-    public = PublicSearch()
-    internal = InternalProjects()
-    recorder = EventRecorder()
-    contexts = []
-    actions = iter(["SEARCH_PUBLIC", "SEARCH_INTERNAL", "SYNTHESIZE"])
-
-    def agent_turn(_task_id, context):
-        contexts.append(context)
-        return next(actions)
-
-    runner = AgentLoopRunner(
-        AgentContextBuilder(),
-        recorder,
-        agent_turn,
-        AgentToolExecutor(public, internal),
-    )
-    result = runner.run(
-        "PUBLIC_RESEARCH",
-        _task(),
-        _confirmed_context(),
-        evidence=[],
-        project_results=[],
-        recent_messages=[],
-    )
-
-    assert result.phase == "DONE"
-    assert [context.phase for context in contexts] == [
-        "PUBLIC_RESEARCH",
-        "PROJECT_RESEARCH",
-        "SYNTHESIS",
-    ]
-    assert contexts[0].observations == []
-    assert [item.action for item in contexts[1].observations] == ["SEARCH_PUBLIC"]
-    assert [item.action for item in contexts[2].observations] == [
-        "SEARCH_PUBLIC",
-        "SEARCH_INTERNAL",
-    ]
-    assert [item.project_id for item in contexts[2].project_results] == ["P001"]
-    serialized_contexts = "".join(item.model_dump_json() for item in contexts)
-    assert RAW_WEB_MARKER not in serialized_contexts
-    assert RAW_MCP_MARKER not in serialized_contexts
-    observation_events = [
-        item for item in recorder.events if item["event_type"] == "AGENT_OBSERVATION"
-    ]
-    assert len(observation_events) == 2
-    assert all(
-        item["payload"]["plan_source"] == "DETERMINISTIC_RULE"
-        for item in observation_events
-    )

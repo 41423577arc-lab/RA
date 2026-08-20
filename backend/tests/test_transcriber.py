@@ -1,4 +1,4 @@
-from app.services.transcriber import normalize_transcript
+from app.services.integrations.transcriber import normalize_transcript
 
 
 def test_normalizes_whisper_traditional_chinese_output() -> None:

@@ -1,7 +1,7 @@
 from datetime import date
 
 from app.schemas.task import ConfirmedContext, ConfirmedEntity, ProjectResult
-from app.services.project_ranker import ProjectRanker
+from app.services.research.project_ranker import ProjectRanker
 
 
 REFERENCE_DATE = date(2026, 8, 14)

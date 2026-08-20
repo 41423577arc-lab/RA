@@ -3,7 +3,7 @@ import re
 from datetime import date, datetime
 
 from app.schemas.task import ConfirmedContext, ProjectRanking, ProjectResult
-from app.services.agent_nodes import organization_aliases
+from app.services.research.agent_nodes import organization_aliases
 
 
 MATCH_TYPE_WEIGHTS = {

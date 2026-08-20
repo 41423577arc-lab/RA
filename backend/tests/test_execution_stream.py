@@ -9,7 +9,7 @@ import app.api.tasks as task_api
 from app.database import SessionLocal, TaskRepository
 from app.main import app
 from app.models.database import ExecutionEvent, ResearchTask
-from app.services.execution_stream import (
+from app.services.infrastructure.execution_stream import (
     encode_sse,
     map_execution_event,
     stream_execution_events,
@@ -163,7 +163,7 @@ async def test_stream_polls_for_events_created_after_connection() -> None:
         TaskRepository(session).log_execution_event(
             task_id,
             event_type="AGENT_ACTION",
-            node_name="agent_loop",
+            node_name="intake_identity_loop",
             status="SEARCH_INTERNAL",
             title="Agent action",
             detail="Search internal projects",

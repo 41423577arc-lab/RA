@@ -8,7 +8,7 @@ from app.schemas.task import (
     ProjectResult,
     PublicClaim,
 )
-from app.services.agent_nodes import (
+from app.services.research.agent_nodes import (
     build_person_identity_summaries,
     businessize_text,
     validate_report_content,

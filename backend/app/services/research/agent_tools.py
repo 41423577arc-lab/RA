@@ -1,25 +1,25 @@
 import asyncio
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from app.schemas.task import (
-    AgentAction,
-    AgentContext,
-    Observation,
+    ConfirmedContext,
     ProjectResult,
+    PublicClaim,
     SearchResult,
     WebPage,
     WebSearchQuery,
+    WebVerification,
 )
-from app.services.agent_loop import ToolExecutionResult
-from app.services.agent_nodes import (
+from app.services.research.agent_nodes import (
     fallback_project_query,
     fallback_web_plan,
     organization_aliases,
 )
-from app.services.evidence_verify import EvidenceProcessingResult
+from app.services.research.evidence_verify import EvidenceProcessingResult
 
 
 PUBLIC_RESULT_LIMIT = 10
@@ -60,7 +60,20 @@ class EvidenceProcessor(Protocol):
     ) -> EvidenceProcessingResult: ...
 
 
-class AgentToolExecutor:
+@dataclass(frozen=True)
+class ResearchToolResult:
+    search_results: tuple[SearchResult, ...] = ()
+    web_pages: tuple[WebPage, ...] = ()
+    web_verifications: tuple[WebVerification, ...] = ()
+    public_claims: tuple[PublicClaim, ...] = ()
+    project_results: tuple[ProjectResult, ...] = ()
+    degraded_nodes: tuple[str, ...] = ()
+    web_search_status: str = "SKIPPED"
+    web_fetch_status: str = "SKIPPED"
+    internal_search_status: str = "SKIPPED"
+
+
+class ResearchToolExecutor:
     def __init__(
         self,
         public_search: PublicSearchClient,
@@ -74,26 +87,12 @@ class AgentToolExecutor:
         self.state_recorder = state_recorder
         self.evidence_processor = evidence_processor
 
-    def execute(
+    def search_public(
         self,
         task_id: str,
-        action: AgentAction,
-        context: AgentContext,
-    ) -> ToolExecutionResult:
-        if action == "SEARCH_PUBLIC":
-            return self._search_public(task_id, context)
-        if action == "SEARCH_INTERNAL":
-            return self._search_internal(task_id, context)
-        raise ValueError(f"Action {action} does not execute a tool")
-
-    def _search_public(
-        self,
-        task_id: str,
-        context: AgentContext,
-    ) -> ToolExecutionResult:
-        if context.confirmed_context is None:
-            return _failed_observation(context, "SEARCH_PUBLIC", "缺少已确认上下文")
-        plan = fallback_web_plan(context.confirmed_context)
+        context: ConfirmedContext,
+    ) -> ResearchToolResult:
+        plan = fallback_web_plan(context)
         self._record(
             task_id,
             event_type="RULE_GENERATION",
@@ -146,11 +145,7 @@ class AgentToolExecutor:
                 web_search_status="FAILED",
                 web_fetch_status="SKIPPED",
             )
-            failed = _failed_observation(
-                context, "SEARCH_PUBLIC", f"公开搜索失败（{type(exc).__name__}）"
-            )
-            return failed.__class__(
-                observation=failed.observation,
+            return ResearchToolResult(
                 degraded_nodes=("web_search",),
                 web_search_status="FAILED",
                 web_fetch_status="SKIPPED",
@@ -243,7 +238,7 @@ class AgentToolExecutor:
             evidence_result = self.evidence_processor.process(
                 task_id,
                 pages,
-                context.confirmed_context,
+                context,
                 plan.queries,
             )
         degraded = list(evidence_result.degraded_nodes)
@@ -262,23 +257,7 @@ class AgentToolExecutor:
             ],
         )
 
-        status = "SUCCESS" if results else "EMPTY"
-        summary = (
-            f"公开搜索得到 {len(results)} 条去重候选，形成 {len(pages)} 个页面，"
-            f"核验得到 {len(evidence_result.claims)} 条公开证据。"
-        )
-        return ToolExecutionResult(
-            observation=Observation(
-                phase=context.phase,
-                action="SEARCH_PUBLIC",
-                status=status,
-                summary=summary[:2_000],
-                result_refs=[f"WEB_RESULT:{item.web_result_id}" for item in results],
-                evidence_refs=[
-                    f"WEB:{item.web_result_id}:{item.evidence_id}"
-                    for item in evidence_result.claims
-                ],
-            ),
+        return ResearchToolResult(
             search_results=tuple(results),
             web_pages=tuple(pages),
             web_verifications=evidence_result.verifications,
@@ -288,14 +267,12 @@ class AgentToolExecutor:
             web_fetch_status=fetch_status,
         )
 
-    def _search_internal(
+    def search_internal(
         self,
         task_id: str,
-        context: AgentContext,
-    ) -> ToolExecutionResult:
-        if context.confirmed_context is None:
-            return _failed_observation(context, "SEARCH_INTERNAL", "缺少已确认上下文")
-        plan = _expand_project_plan(fallback_project_query(context.confirmed_context))
+        context: ConfirmedContext,
+    ) -> ResearchToolResult:
+        plan = _expand_project_plan(fallback_project_query(context))
         keywords = _unique([*plan.project_names, *plan.business_terms])
         arguments = {
             "person_names": plan.person_names,
@@ -353,11 +330,7 @@ class AgentToolExecutor:
                 internal_results=[],
                 internal_search_status="FAILED",
             )
-            failed = _failed_observation(
-                context, "SEARCH_INTERNAL", f"内部项目搜索失败（{type(exc).__name__}）"
-            )
-            return failed.__class__(
-                observation=failed.observation,
+            return ResearchToolResult(
                 degraded_nodes=("internal_search",),
                 internal_search_status="FAILED",
             )
@@ -381,15 +354,7 @@ class AgentToolExecutor:
             internal_results=[item.model_dump(mode="json") for item in projects],
             internal_search_status="SUCCESS",
         )
-        return ToolExecutionResult(
-            observation=Observation(
-                phase=context.phase,
-                action="SEARCH_INTERNAL",
-                status=status,
-                summary=summary[:2_000],
-                result_refs=[f"PROJECT:{item.project_id}" for item in projects],
-                project_ids=[item.project_id for item in projects],
-            ),
+        return ResearchToolResult(
             project_results=tuple(projects),
             internal_search_status="SUCCESS",
         )
@@ -547,21 +512,6 @@ def _canonical_url(value: str) -> str | None:
     )
     path = parts.path.rstrip("/") or "/"
     return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, query, ""))
-
-
-def _failed_observation(
-    context: AgentContext,
-    action: AgentAction,
-    summary: str,
-) -> ToolExecutionResult:
-    return ToolExecutionResult(
-        observation=Observation(
-            phase=context.phase,
-            action=action,
-            status="FAILED",
-            summary=summary[:2_000],
-        )
-    )
 
 
 def _unique(values) -> list[str]:

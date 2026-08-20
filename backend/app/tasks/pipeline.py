@@ -12,33 +12,30 @@ from app.schemas.task import (
     ProjectResult,
     PublicClaim,
     SearchResult,
-    TaskChatMessage,
     WebPage,
     WebVerification,
 )
-from app.services.agent_nodes import (
+from app.services.research.agent_nodes import (
     AgentNodes,
     complete_report_content,
     fallback_report_content,
     fallback_understanding,
 )
-from app.services.agent_context import AgentContextBuilder
-from app.services.agent_loop import AgentLoopRunner
-from app.services.agent_tools import AgentToolExecutor
-from app.services.evidence_verify import AgentEvidenceProcessor
-from app.services.final_synthesis import (
+from app.services.research.agent_tools import ResearchToolExecutor
+from app.services.research.evidence_verify import AgentEvidenceProcessor
+from app.services.research.final_synthesis import (
     ordered_ranked_projects,
     validate_final_synthesis,
 )
-from app.services.entity_resolver import EntityResolver
-from app.services.extractor import RuleExtractor
-from app.services.llm_client import StructuredLLM
-from app.services.mcp_client import ProjectMcpClient
-from app.services.project_ranker import ProjectRanker
-from app.services.report_renderer import ReportRenderer
-from app.services.resource_association import ResourceAssociationBuilder
-from app.services.tavily_client import TavilyClient
-from app.services.transcriber import LocalWhisperTranscriber
+from app.services.intake.entity_resolver import EntityResolver
+from app.services.research.extractor import RuleExtractor
+from app.services.integrations.llm_client import StructuredLLM
+from app.services.integrations.mcp_client import ProjectMcpClient
+from app.services.research.project_ranker import ProjectRanker
+from app.services.reporting.report_renderer import ReportRenderer
+from app.services.research.resource_association import ResourceAssociationBuilder
+from app.services.integrations.tavily_client import TavilyClient
+from app.services.integrations.transcriber import LocalWhisperTranscriber
 from app.tasks.celery_app import celery_app
 
 
@@ -81,9 +78,6 @@ class ResearchPipeline:
         entity_resolver: EntityResolver | None = None,
         project_ranker: ProjectRanker | None = None,
         association_builder: ResourceAssociationBuilder | None = None,
-        agent_max_loops: int | None = None,
-        agent_max_tool_calls: int | None = None,
-        agent_max_repeated_actions: int | None = None,
     ):
         self.repository = repository
         self.transcriber = transcriber
@@ -95,18 +89,11 @@ class ResearchPipeline:
         self.entity_resolver = entity_resolver or EntityResolver()
         self.project_ranker = project_ranker or ProjectRanker()
         self.association_builder = association_builder or ResourceAssociationBuilder()
-        self.agent_max_loops = agent_max_loops or settings.agent_max_loops
-        self.agent_max_tool_calls = (
-            agent_max_tool_calls or settings.agent_max_tool_calls
-        )
-        self.agent_max_repeated_actions = (
-            agent_max_repeated_actions or settings.agent_max_repeated_actions
-        )
 
     def run(self, task_id: str) -> None:
-        self._run_agent(task_id)
+        self._run_pipeline(task_id)
 
-    def _run_agent(self, task_id: str) -> None:
+    def _run_pipeline(self, task_id: str) -> None:
         task = self.repository.get(task_id)
         if task is None:
             raise KeyError(f"Task {task_id} not found")
@@ -184,55 +171,44 @@ class ResearchPipeline:
                 getattr(task, "input_snapshot", None)
             )
             evidence_processor = AgentEvidenceProcessor(self.agents, self.repository)
-            tool_executor = AgentToolExecutor(
+            tool_executor = ResearchToolExecutor(
                 self.web,
                 self.projects,
                 state_recorder=self.repository,
                 evidence_processor=evidence_processor,
             )
-            runner = AgentLoopRunner(
-                AgentContextBuilder(),
-                self.repository,
-                self.agents.agent_turn,
-                tool_executor,
-                max_loops=self.agent_max_loops,
-                max_tool_calls=self.agent_max_tool_calls,
-                max_repeated_actions=self.agent_max_repeated_actions,
-                checkpoint=lambda: self._checkpoint(task_id),
-            )
-            loop_result = runner.run(
-                "PUBLIC_RESEARCH",
-                task,
-                context,
-                intake_claims,
-                [],
-                recent_chat_messages(getattr(task, "input_snapshot", None)),
-            )
-            for node_name in loop_result.degraded_nodes:
+            public_result = tool_executor.search_public(task_id, context)
+            for node_name in public_result.degraded_nodes:
                 if node_name not in degraded:
                     degraded.append(node_name)
 
-            claims = merge_public_claims(intake_claims, list(loop_result.public_claims))
-            project_results = list(loop_result.project_results)
+            self._checkpoint(task_id)
+            internal_result = tool_executor.search_internal(task_id, context)
+            for node_name in internal_result.degraded_nodes:
+                if node_name not in degraded:
+                    degraded.append(node_name)
+
+            claims = merge_public_claims(intake_claims, list(public_result.public_claims))
+            project_results = list(internal_result.project_results)
             self.repository.update(
                 task_id,
                 web_results=[
-                    item.model_dump(mode="json") for item in loop_result.search_results
+                    item.model_dump(mode="json") for item in public_result.search_results
                 ],
                 web_pages=[
-                    item.model_dump(mode="json") for item in loop_result.web_pages
+                    item.model_dump(mode="json") for item in public_result.web_pages
                 ],
                 verified_web_results=[
                     item.model_dump(mode="json")
-                    for item in loop_result.web_verifications
+                    for item in public_result.web_verifications
                 ],
                 public_claims=[item.model_dump(mode="json") for item in claims],
                 internal_results=[
                     item.model_dump(mode="json") for item in project_results
                 ],
-                web_search_status=loop_result.web_search_status,
-                web_fetch_status=loop_result.web_fetch_status,
-                internal_search_status=loop_result.internal_search_status,
+                web_search_status=public_result.web_search_status,
+                web_fetch_status=public_result.web_fetch_status,
+                internal_search_status=internal_result.internal_search_status,
             )
 
             self._checkpoint(task_id)
@@ -353,9 +329,9 @@ class ResearchPipeline:
                 report_content,
                 claims,
                 project_results,
-                loop_result.web_search_status,
-                loop_result.web_fetch_status,
-                loop_result.internal_search_status,
+                public_result.web_search_status,
+                public_result.web_fetch_status,
+                internal_result.internal_search_status,
             )
             self._checkpoint(task_id)
             self.repository.update(
@@ -614,18 +590,6 @@ def identity_claims_from_intake_snapshot(snapshot: dict | None) -> list[PublicCl
             )
         )
     return claims
-
-
-def recent_chat_messages(snapshot: dict | None) -> list[TaskChatMessage]:
-    messages = []
-    for raw in (snapshot or {}).get("analysis_chat_messages", []):
-        try:
-            messages.append(TaskChatMessage.model_validate(raw))
-        except (TypeError, ValueError):
-            continue
-    return messages
-
-
 
 
 @celery_app.task(name="run_research_pipeline")

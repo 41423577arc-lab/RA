@@ -1,7 +1,7 @@
 import pytest
 
-import app.services.tavily_client as tavily_module
-from app.services.tavily_client import TavilyClient
+import app.services.integrations.tavily_client as tavily_module
+from app.services.integrations.tavily_client import TavilyClient
 
 
 class FakeResponse:

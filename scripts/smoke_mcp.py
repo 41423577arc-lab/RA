@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from app.services.mcp_client import ProjectMcpClient  # noqa: E402
+from app.services.integrations.mcp_client import ProjectMcpClient  # noqa: E402
 
 
 async def main() -> None:

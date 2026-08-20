@@ -1,10 +1,24 @@
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, model_validator
 
 from app.schemas.task import ConfirmationRequest
+
+
+IntakeContextFieldStatus = Literal[
+    "MISSING", "CANDIDATE", "AMBIGUOUS", "CONFIRMED", "NOT_REQUIRED"
+]
+LegacyIntakeFieldStatus = Literal[
+    "NEEDS_COMPLETION",
+    "STANDARD_COMPLETE",
+    "USER_CONFIRMED",
+    "NOT_PROVIDED",
+]
+IntakeContextNextAction = Literal[
+    "SEARCH_INTERNAL", "SEARCH_PUBLIC", "ASK_USER", "READY"
+]
 
 
 class IntakeMessage(BaseModel):
@@ -34,6 +48,21 @@ class IntakeEntityResolution(BaseModel):
     evidence_quote: str | None = None
 
 
+class IntakeToolAttempt(BaseModel):
+    action: Literal["SEARCH_INTERNAL", "SEARCH_PUBLIC"]
+    target_fields: list[str] = Field(default_factory=list, max_length=20)
+    query: str = Field(min_length=1, max_length=500)
+    technical_status: Literal["SUCCESS", "FAILED"]
+    information_status: Literal["RESOLVED", "PARTIAL", "NO_RESULT"]
+    observation: str = Field(default="", max_length=4_000)
+
+
+class IntakeResolutionResult(BaseModel):
+    status: Literal["RESOLVED", "PARTIAL", "UNRESOLVED"]
+    updated_fields: list[str] = Field(default_factory=list, max_length=20)
+    summary: str = Field(default="", max_length=2_000)
+
+
 class IntakeStructuredContext(BaseModel):
     people: list[str] = Field(default_factory=list, max_length=20)
     people_details: list["IntakePersonCandidate"] = Field(default_factory=list, max_length=20)
@@ -47,6 +76,12 @@ class IntakeStructuredContext(BaseModel):
     entity_assessments: list["IntakeEntityAssessment"] = Field(default_factory=list, max_length=40)
     entity_resolutions: list[IntakeEntityResolution] = Field(default_factory=list, max_length=40)
     field_states: dict[str, "IntakeFieldState"] = Field(default_factory=dict)
+    target_fields: list[str] = Field(default_factory=list, max_length=20)
+    next_action: IntakeContextNextAction | None = None
+    success_criteria: list[str] = Field(default_factory=list, max_length=20)
+    resolution_result: IntakeResolutionResult | None = None
+    user_question: str | None = Field(default=None, min_length=1, max_length=1_000)
+    tool_attempts: list[IntakeToolAttempt] = Field(default_factory=list, max_length=20)
     final_confirmation: "IntakeFinalConfirmation | None" = None
 
 
@@ -64,14 +99,10 @@ class IntakeEntityAssessment(BaseModel):
 
 
 class IntakeFieldState(BaseModel):
-    status: Literal[
-        "MISSING",
-        "NEEDS_COMPLETION",
-        "STANDARD_COMPLETE",
-        "USER_CONFIRMED",
-        "NOT_PROVIDED",
-    ]
+    status: IntakeContextFieldStatus | LegacyIntakeFieldStatus
     required: bool
+    value: Any | None = None
+    source: str | None = None
     reason: str = ""
 
 

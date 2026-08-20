@@ -10,9 +10,9 @@ from app.schemas.intake import (
     IntakeStructuredContext,
 )
 from app.schemas.task import CandidateOption, ConfirmationItem, ConfirmationRequest
-from app.services.mcp_client import ProjectMcpClient
-from app.services.entity_resolver import EntityResolver
-from app.services.tavily_client import TavilyClient
+from app.services.integrations.mcp_client import ProjectMcpClient
+from app.services.intake.entity_resolver import EntityResolver
+from app.services.integrations.tavily_client import TavilyClient
 
 
 class IntakeEntityCandidateService:
@@ -50,6 +50,8 @@ class IntakeEntityCandidateService:
         context: IntakeStructuredContext,
         version: int,
         source_text: str | None = None,
+        *,
+        raise_on_error: bool = False,
     ) -> tuple[list[dict], ConfirmationRequest | None]:
         if not context.people and not context.organizations:
             return [], None
@@ -97,6 +99,8 @@ class IntakeEntityCandidateService:
                 self.projects.find_entity_candidates(person, organization)
             )
         except Exception:
+            if raise_on_error:
+                raise
             internal = []
 
         pending: list[tuple[str, str, list[CandidateOption]]] = []
@@ -136,6 +140,8 @@ class IntakeEntityCandidateService:
         external_normalizer: Callable[
             [list[dict], list[dict]], ExternalIdentityNormalizationResult
         ],
+        *,
+        raise_on_error: bool = False,
     ) -> ConfirmationRequest:
         external_pending = [
             item for item in confirmation.items if len(item.candidates) != 1
@@ -145,7 +151,9 @@ class IntakeEntityCandidateService:
         person = context.people[0] if context.people else None
         organization = context.organizations[0] if context.organizations else None
         as_of_date = self.today_provider()
-        pages = self._external_pages(person, organization, as_of_date)
+        pages = self._external_pages(
+            person, organization, as_of_date, raise_on_error=raise_on_error
+        )
         normalized_external: list[tuple[str, CandidateOption]] = []
         if pages:
             try:
@@ -164,6 +172,8 @@ class IntakeEntityCandidateService:
                     normalized, pages, as_of_date
                 )
             except Exception:
+                if raise_on_error:
+                    raise
                 normalized_external = []
         items: list[ConfirmationItem] = []
         for item in confirmation.items:
@@ -251,6 +261,8 @@ class IntakeEntityCandidateService:
         person: str | None,
         organization: str | None,
         as_of_date: date,
+        *,
+        raise_on_error: bool = False,
     ):
         try:
             search_identity = getattr(self.web, "search_identity", None)
@@ -278,6 +290,8 @@ class IntakeEntityCandidateService:
                 return asyncio.run(extract_identity(results))
             return asyncio.run(self.web.extract(results))
         except Exception:
+            if raise_on_error:
+                raise
             return []
 
     @staticmethod

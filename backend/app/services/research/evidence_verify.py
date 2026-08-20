@@ -12,7 +12,7 @@ from app.schemas.task import (
     WebSearchQuery,
     WebVerification,
 )
-from app.services.agent_nodes import (
+from app.services.research.agent_nodes import (
     build_web_verification_candidates,
     claims_from_verifications,
     materialize_web_verifications,
@@ -151,7 +151,7 @@ class AgentEvidenceProcessor:
                     node_name="evidence_verify",
                     status="DEGRADED",
                     title="公开证据模型核验已降级",
-                    detail="歧义候选保持未核验，Agent Loop 继续。",
+                    detail="歧义候选保持未核验，研究流水线继续。",
                     payload={
                         "error_type": type(exc).__name__,
                         "ambiguous_candidate_ids": [

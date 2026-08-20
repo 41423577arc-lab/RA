@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING
 from app.schemas.task import TaskChatResult
 
 if TYPE_CHECKING:
-    from app.services.llm_client import StructuredLLM
+    from app.services.integrations.llm_client import StructuredLLM
 
 
 STATUS_SUMMARIES = {

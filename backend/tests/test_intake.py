@@ -25,10 +25,10 @@ from app.schemas.task import (
     SearchResult,
     WebPage,
 )
-from app.services.intake_completeness import is_intake_ready
-from app.services.intake_entity_candidates import IntakeEntityCandidateService
-from app.services.intake_agent import IntakeAgent
-from app.services.llm_client import LLMUnavailable
+from app.services.intake.intake_completeness import is_intake_ready
+from app.services.intake.intake_entity_candidates import IntakeEntityCandidateService
+from app.services.intake.intake_agent import IntakeAgent
+from app.services.integrations.llm_client import LLMUnavailable
 from app.tasks.pipeline import context_from_intake_snapshot
 
 
@@ -1134,6 +1134,18 @@ class RecordingLlm:
                 missing_information=[],
                 next_action="PROPOSE_READY",
             )
+        if node_name == "intake_identity_initialize":
+            context = IntakeStructuredContext.model_validate(payload["extracted_context"])
+            return context.model_copy(
+                update={
+                    "target_fields": ["people", "organizations"],
+                    "next_action": "SEARCH_INTERNAL",
+                    "success_criteria": ["找到唯一标准身份"],
+                }
+            )
+        if node_name == "intake_identity_update":
+            context = IntakeStructuredContext.model_validate(payload["old_context"])
+            return context.model_copy(update={"next_action": "ASK_USER"})
         return IntakeFollowupResult(assistant_reply="请确认身份候选。")
 
 
@@ -1145,6 +1157,15 @@ def test_controlled_intake_agent_has_dedicated_readiness_step() -> None:
     )
 
     decision = agent.respond(request)
+    initialized = agent.initialize_context(request, decision.structured_context)
+    updated = agent.update_context(
+        request,
+        initialized,
+        tool_observation={
+            "technical_status": "SUCCESS",
+            "information_status": "PARTIAL",
+        },
+    )
     follow_up = agent.follow_up(
         request,
         decision,
@@ -1163,8 +1184,17 @@ def test_controlled_intake_agent_has_dedicated_readiness_step() -> None:
     )
 
     assert follow_up.assistant_reply == "请确认身份候选。"
+    assert initialized.next_action == "SEARCH_INTERNAL"
+    assert updated.next_action == "ASK_USER"
     assert readiness.next_action == "PROPOSE_READY"
-    assert llm.nodes == ["intake_chat", "intake_followup", "intake_readiness"]
+    assert llm.nodes == [
+        "intake_chat",
+        "intake_identity_initialize",
+        "intake_identity_update",
+        "intake_followup",
+        "intake_readiness",
+    ]
+    assert llm.payloads[2]["previous_success_criteria"] == ["找到唯一标准身份"]
     assert llm.payloads[0]["default_requester_context"]["organization"] == (
         "澄岳产业发展有限公司"
     )

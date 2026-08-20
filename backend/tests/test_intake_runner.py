@@ -5,8 +5,8 @@ import pytest
 
 from app.models.database import IntakeSession
 from app.schemas.intake import IntakeChatRequest
-from app.services.intake_runner import IntakeChatConflict, IntakeRunner
-from app.services.llm_client import LLMCallFailed
+from app.services.intake.intake_runner import IntakeChatConflict, IntakeRunner
+from app.services.integrations.llm_client import LLMCallFailed
 
 
 class RecordingRepository:

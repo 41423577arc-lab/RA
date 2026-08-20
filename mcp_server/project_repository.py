@@ -18,7 +18,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from app.schemas.task import ProjectResult
-from app.services.text_vectorizer import vectorize_text
+from app.services.research.text_vectorizer import vectorize_text
 
 
 class Base(DeclarativeBase):

@@ -11,16 +11,18 @@ from app.schemas.intake import (
     IntakeFinalConfirmationResult,
     IntakeStructuredContext,
 )
-from app.services.intake_agent import IntakeAgent
-from app.services.intake_completeness import required_missing_information
-from app.services.intake_defaults import with_default_requester_context
-from app.services.intake_entity_candidates import IntakeEntityCandidateService
-from app.services.intake_field_state import (
+from app.schemas.task import ConfirmationRequest
+from app.services.intake.intake_agent import IntakeAgent
+from app.services.intake.intake_completeness import required_missing_information
+from app.services.intake.intake_defaults import with_default_requester_context
+from app.services.intake.intake_entity_candidates import IntakeEntityCandidateService
+from app.services.intake.intake_field_state import (
     derive_field_states,
     fallback_confirmation_question,
     fields_ready_for_confirmation,
 )
-from app.services.llm_client import LLMCallFailed, LLMUnavailable
+from app.services.intake.intake_identity_loop import IntakeIdentityLoop
+from app.services.integrations.llm_client import LLMCallFailed, LLMUnavailable
 from app.tasks.pipeline import infer_event_type
 
 
@@ -178,10 +180,19 @@ def prepare_final_confirmation(
 ) -> tuple[dict, IntakeFinalConfirmation | None]:
     if not context.get("event_type"):
         context = {**context, "event_type": infer_event_type(analysis_input)}
-    context = with_field_states(context)
     structured = IntakeStructuredContext.model_validate(context)
-    if not fields_ready_for_confirmation(structured.field_states):
+    gate_states = derive_field_states(structured)
+    if not fields_ready_for_confirmation(gate_states):
         return context, None
+    if structured.next_action is None:
+        context = {
+            **context,
+            "field_states": {
+                name: state.model_dump(mode="json")
+                for name, state in gate_states.items()
+            },
+        }
+        structured = IntakeStructuredContext.model_validate(context)
     fallback = IntakeFinalConfirmationResult(
         question=fallback_confirmation_question(structured)
     )
@@ -279,11 +290,74 @@ class IntakeRunner:
             if intake_session
             else []
         )
+        identity_loop_used = False
+
+        if (
+            self.settings.intake_entity_resolution_enabled
+            and self.settings.intake_react_enabled
+            and ready
+            and (result.structured_context.people or result.structured_context.organizations)
+            and callable(getattr(self.agent, "initialize_context", None))
+            and callable(getattr(self.agent, "update_context", None))
+        ):
+            if intake_session is None:
+                intake_session = self.repository.add(
+                    IntakeSession(
+                        id=session_id,
+                        status="COLLECTING",
+                        messages=incoming_messages,
+                        structured_context=stored_context,
+                        missing_information=result.missing_information,
+                        confirmation_request=None,
+                        analysis_input=result.analysis_input,
+                        ready_to_analyze=False,
+                        version=0,
+                    )
+                )
+            loop_result = self._run_identity_loop(
+                request,
+                result.structured_context,
+                intake_session,
+                next_version,
+                source,
+            )
+            identity_loop_used = True
+            resolutions = align_resolution_relationships(
+                list(loop_result.resolutions), loop_result.context
+            )
+            stored_context = standardized_context(
+                with_default_requester_context(
+                    loop_result.context.model_dump(mode="json")
+                ),
+                resolutions,
+            )
+            confirmation_request = (
+                loop_result.confirmation.model_dump(mode="json")
+                if loop_result.confirmation
+                else None
+            )
+            ready = (
+                loop_result.stop_reason == "READY"
+                and bool(
+                    stored_context.get("people")
+                    or stored_context.get("organizations")
+                )
+                and has_resolved_entities(stored_context)
+            )
+            if ready:
+                result.assistant_reply = "关键人身份已经标准化，可以继续确认本次分析信息。"
+                result.missing_information = []
+            else:
+                result.assistant_reply = loop_result.context.user_question or (
+                    "请确认目标人物或企业的完整名称、职位或所属关系。"
+                )
+                result.missing_information = ["人物或企业身份确认"]
 
         if (
             self.settings.intake_entity_resolution_enabled
             and ready
             and (result.structured_context.people or result.structured_context.organizations)
+            and not identity_loop_used
         ):
             targets = {
                 *result.structured_context.people,
@@ -411,7 +485,8 @@ class IntakeRunner:
             stored_context.get("entity_resolutions", []),
         )
         stored_context["final_confirmation"] = None
-        stored_context = with_field_states(stored_context)
+        if not identity_loop_used:
+            stored_context = with_field_states(stored_context)
         final_confirmation = None
         identities_ready = (
             not self.settings.intake_entity_resolution_enabled
@@ -465,6 +540,101 @@ class IntakeRunner:
         )
         return intake_session
 
+    def _run_identity_loop(
+        self,
+        request: IntakeChatRequest,
+        extracted_context: IntakeStructuredContext,
+        intake_session: IntakeSession | None,
+        version: int,
+        source: str,
+    ):
+        session_id = str(request.session_id)
+        previous_context = (
+            IntakeStructuredContext.model_validate(
+                intake_session.structured_context or {}
+            )
+            if intake_session
+            else None
+        )
+        apply_automatic = getattr(
+            self.entity_candidates, "apply_automatic_candidates", None
+        )
+        threshold = getattr(self.settings, "llm_web_identity_threshold", 0.8)
+
+        def lookup_internal(context: IntakeStructuredContext):
+            resolutions, confirmation = self._lookup_internal(
+                session_id, context, version, source, raise_on_error=True
+            )
+            if callable(apply_automatic):
+                return apply_automatic(resolutions, confirmation, threshold)
+            return resolutions, confirmation
+
+        def lookup_public(
+            context: IntakeStructuredContext, confirmation
+        ):
+            external_normalizer = getattr(
+                self.agent, "normalize_external_identity", None
+            )
+            if not callable(external_normalizer):
+                raise RuntimeError("Intake Agent 不支持公网身份候选标准化")
+            updated_confirmation = self._lookup_external(
+                request,
+                session_id,
+                context,
+                confirmation,
+                external_normalizer,
+                raise_on_error=True,
+            )
+            if callable(apply_automatic):
+                resolutions, updated_confirmation = apply_automatic(
+                    [], updated_confirmation, threshold
+                )
+            else:
+                resolutions = []
+            self._record_external_result(
+                session_id, resolutions, updated_confirmation
+            )
+            return resolutions, updated_confirmation
+
+        def checkpoint(
+            context: IntakeStructuredContext, confirmation
+        ) -> None:
+            if intake_session is None:
+                return
+            self.repository.update(
+                session_id,
+                structured_context=with_default_requester_context(
+                    context.model_dump(mode="json")
+                ),
+                confirmation_request=confirmation.model_dump(mode="json")
+                if confirmation
+                else None,
+            )
+
+        loop = IntakeIdentityLoop(
+            self.agent,
+            self.repository,
+            session_id,
+            max_loops=getattr(self.settings, "agent_max_loops", 8),
+            max_tool_calls=getattr(self.settings, "agent_max_tool_calls", 4),
+            max_repeated_actions=getattr(
+                self.settings, "agent_max_repeated_actions", 2
+            ),
+        )
+        return loop.run(
+            request,
+            extracted_context,
+            previous_context,
+            ConfirmationRequest.model_validate(intake_session.confirmation_request)
+            if intake_session and intake_session.confirmation_request
+            else None,
+            lookup_internal=lookup_internal,
+            lookup_public=lookup_public,
+            hard_gate=lambda context: bool(context.people or context.organizations)
+            and has_resolved_entities(context.model_dump(mode="json")),
+            checkpoint=checkpoint,
+        )
+
     @staticmethod
     def _fallback_result(request: IntakeChatRequest) -> IntakeChatResult:
         user_text = "\n".join(
@@ -477,7 +647,9 @@ class IntakeRunner:
             missing_information=["人物、企业或项目", "希望分析或推动的事项"],
         )
 
-    def _lookup_internal(self, session_id, context, version, source):
+    def _lookup_internal(
+        self, session_id, context, version, source, *, raise_on_error=False
+    ):
         lookup_internal = getattr(self.entity_candidates, "lookup_internal", None)
         if not callable(lookup_internal):
             return self.entity_candidates.resolve(context, version, source)
@@ -502,7 +674,13 @@ class IntakeRunner:
             "正在查询内部身份候选",
             tool_name="lookup_internal_identity",
         )
-        resolutions, confirmation = lookup_internal(context, version, source)
+        resolutions, confirmation = (
+            lookup_internal(
+                context, version, source, raise_on_error=True
+            )
+            if raise_on_error
+            else lookup_internal(context, version, source)
+        )
         self.repository.log_execution_event(
             session_id,
             event_type="TOOL_RESPONSE",
@@ -560,6 +738,8 @@ class IntakeRunner:
         context,
         confirmation,
         external_normalizer,
+        *,
+        raise_on_error=False,
     ):
         person = context.people[0] if context.people else None
         organization = context.organizations[0] if context.organizations else None
@@ -589,10 +769,23 @@ class IntakeRunner:
             "正在联网补全关键人身份",
             tool_name="search_key_person_identity_web",
         )
-        confirmation = self.entity_candidates.search_key_person_identity_web(
-            context,
-            confirmation,
-            lambda mentions, pages: external_normalizer(request, mentions, pages),
+
+        def normalize(mentions, pages):
+            return external_normalizer(request, mentions, pages)
+
+        confirmation = (
+            self.entity_candidates.search_key_person_identity_web(
+                context,
+                confirmation,
+                normalize,
+                raise_on_error=True,
+            )
+            if raise_on_error
+            else self.entity_candidates.search_key_person_identity_web(
+                context,
+                confirmation,
+                normalize,
+            )
         )
         return confirmation
 

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import numpy as np
 
-from app.services.text_vectorizer import vectorize_text, vectorize_texts
+from app.services.research.text_vectorizer import vectorize_text, vectorize_texts
 
 
 def main() -> None:

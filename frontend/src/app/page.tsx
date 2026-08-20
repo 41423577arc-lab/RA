@@ -225,18 +225,16 @@ const ACTION_LABELS: Record<string, string> = {
   FINISH: "结束当前任务"
 };
 const DEBUG_CODE_PATHS: Record<string, string> = {
-  agent_loop: "backend/app/services/agent_loop.py::AgentLoopRunner.run",
-  agent_turn: "backend/app/services/agent_nodes.py::AgentNodes.agent_turn",
-  SEARCH_PUBLIC: "backend/app/services/agent_tools.py::AgentToolExecutor._search_public",
-  SEARCH_INTERNAL: "backend/app/services/agent_tools.py::AgentToolExecutor._search_internal",
-  tavily_search: "backend/app/services/tavily_client.py::TavilyClient.search",
-  tavily_extract: "backend/app/services/tavily_client.py::TavilyClient.extract",
-  "mcp.search_projects": "backend/app/services/mcp_client.py::ProjectMcpClient.search_projects",
-  evidence_verify: "backend/app/services/evidence_verify.py::AgentEvidenceProcessor.process",
-  deterministic_project_ranker: "backend/app/services/project_ranker.py::ProjectRanker.rank",
-  resource_association_builder: "backend/app/services/resource_association.py::ResourceAssociationBuilder.build",
-  final_synthesis: "backend/app/services/agent_nodes.py::AgentNodes.final_synthesis",
-  research_pipeline: "backend/app/tasks/pipeline.py::ResearchPipeline._run_agent"
+  SEARCH_PUBLIC: "backend/app/services/research/agent_tools.py::ResearchToolExecutor.search_public",
+  SEARCH_INTERNAL: "backend/app/services/research/agent_tools.py::ResearchToolExecutor.search_internal",
+  tavily_search: "backend/app/services/integrations/tavily_client.py::TavilyClient.search",
+  tavily_extract: "backend/app/services/integrations/tavily_client.py::TavilyClient.extract",
+  "mcp.search_projects": "backend/app/services/integrations/mcp_client.py::ProjectMcpClient.search_projects",
+  evidence_verify: "backend/app/services/research/evidence_verify.py::AgentEvidenceProcessor.process",
+  deterministic_project_ranker: "backend/app/services/research/project_ranker.py::ProjectRanker.rank",
+  resource_association_builder: "backend/app/services/research/resource_association.py::ResourceAssociationBuilder.build",
+  final_synthesis: "backend/app/services/research/agent_nodes.py::AgentNodes.final_synthesis",
+  research_pipeline: "backend/app/tasks/pipeline.py::ResearchPipeline._run_pipeline"
 };
 const STATUS_LABELS: Record<string, string> = {
   PENDING: "任务已创建",

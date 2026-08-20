@@ -7,8 +7,8 @@ from app.schemas.intake import (
     IntakeReadinessResult,
     IntakeStructuredContext,
 )
-from app.services.intake_defaults import DEFAULT_REQUESTER_CONTEXT
-from app.services.llm_client import StructuredLLM
+from app.services.intake.intake_defaults import DEFAULT_REQUESTER_CONTEXT
+from app.services.integrations.llm_client import StructuredLLM
 
 
 class IntakeAgent:
@@ -24,6 +24,48 @@ class IntakeAgent:
                 "default_requester_context": DEFAULT_REQUESTER_CONTEXT,
             },
             IntakeChatResult,
+        )
+
+    def initialize_context(
+        self,
+        request: IntakeChatRequest,
+        extracted_context: IntakeStructuredContext,
+    ) -> IntakeStructuredContext:
+        return self.llm.parse(
+            str(request.session_id),
+            "intake_identity_initialize",
+            {
+                "messages": [message.model_dump() for message in request.messages],
+                "latest_user_reply": self._latest_user_reply(request),
+                "extracted_context": extracted_context.model_dump(mode="json"),
+                "default_requester_context": DEFAULT_REQUESTER_CONTEXT,
+            },
+            IntakeStructuredContext,
+        )
+
+    def update_context(
+        self,
+        request: IntakeChatRequest,
+        old_context: IntakeStructuredContext,
+        *,
+        extracted_context: IntakeStructuredContext | None = None,
+        tool_observation: dict | None = None,
+    ) -> IntakeStructuredContext:
+        return self.llm.parse(
+            str(request.session_id),
+            "intake_identity_update",
+            {
+                "messages": [message.model_dump() for message in request.messages],
+                "latest_user_reply": self._latest_user_reply(request),
+                "old_context": old_context.model_dump(mode="json"),
+                "extracted_context": extracted_context.model_dump(mode="json")
+                if extracted_context
+                else None,
+                "tool_observation": tool_observation,
+                "previous_success_criteria": old_context.success_criteria,
+                "default_requester_context": DEFAULT_REQUESTER_CONTEXT,
+            },
+            IntakeStructuredContext,
         )
 
     def follow_up(
@@ -95,4 +137,15 @@ class IntakeAgent:
                 "default_requester_context": DEFAULT_REQUESTER_CONTEXT,
             },
             IntakeFinalConfirmationResult,
+        )
+
+    @staticmethod
+    def _latest_user_reply(request: IntakeChatRequest) -> str:
+        return next(
+            (
+                message.content
+                for message in reversed(request.messages)
+                if message.role == "user"
+            ),
+            "",
         )

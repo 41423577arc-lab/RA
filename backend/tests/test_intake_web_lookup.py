@@ -2,14 +2,14 @@ from datetime import date
 
 import pytest
 
-import app.services.tavily_client as tavily_module
+import app.services.integrations.tavily_client as tavily_module
 from app.schemas.intake import (
     ExternalIdentityNormalizationResult,
     IntakeStructuredContext,
 )
 from app.schemas.task import ConfirmationItem, ConfirmationRequest, SearchResult, WebPage
-from app.services.intake_entity_candidates import IntakeEntityCandidateService
-from app.services.tavily_client import TavilyClient
+from app.services.intake.intake_entity_candidates import IntakeEntityCandidateService
+from app.services.integrations.tavily_client import TavilyClient
 
 
 class NoInternalCandidates:

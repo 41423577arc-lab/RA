@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from app.services.analysis_chat import (
+from app.services.reporting.analysis_chat import (
     build_task_chat_context,
     fallback_task_chat_reply,
 )

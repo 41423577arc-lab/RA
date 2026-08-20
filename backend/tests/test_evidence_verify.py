@@ -6,13 +6,13 @@ from app.schemas.task import (
     ConfirmedEntity,
     WebEvidenceCandidate,
 )
-from app.services.entity_resolver import EntityResolver
-from app.services.evidence_verify import (
+from app.services.intake.entity_resolver import EntityResolver
+from app.services.research.evidence_verify import (
     materialize_routed_web_verifications,
     route_web_evidence_candidates,
 )
-from app.services.extractor import RuleExtractor
-from app.services.report_renderer import ReportRenderer
+from app.services.research.extractor import RuleExtractor
+from app.services.reporting.report_renderer import ReportRenderer
 from app.tasks.pipeline import ResearchPipeline
 
 
