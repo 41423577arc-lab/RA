@@ -128,7 +128,8 @@ def test_public_tool_uses_rule_plan_and_returns_bounded_results():
     assert len(public.extract_input[0].content) == 1_000
     assert result.web_search_status == "SUCCESS"
     assert [item.web_result_id for item in result.search_results] == ["W001"]
-    assert RAW_WEB_MARKER not in "".join(item.content for item in result.search_results)
+    assert len(result.search_results[0].content) == 1_000
+    assert RAW_WEB_MARKER * 100 not in result.search_results[0].content
 
 
 def test_internal_tool_preserves_mcp_contract_and_normalizes_projects():

@@ -5,7 +5,7 @@ import pytest
 
 from app.models.database import IntakeSession
 from app.schemas.intake import IntakeChatRequest
-from app.services.intake.intake_runner import IntakeChatConflict, IntakeRunner
+from app.services.intake.runner import IntakeChatConflict, IntakeRunner
 from app.services.integrations.llm_client import LLMCallFailed
 
 

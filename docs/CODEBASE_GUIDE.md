@@ -141,25 +141,25 @@ Agent Loop 默认从 `PUBLIC_RESEARCH` 开始，最多 8 轮、4 次工具调用
 | `backend/app/main.py` | FastAPI 应用、生命周期、CORS、路由注册 |
 | `backend/app/api/intake.py` | Intake、音频、身份确认、摘要确认和开始分析接口 |
 | `backend/app/api/tasks.py` | 兼容任务入口、任务查询、日志、SSE、取消和问答接口 |
-| `backend/app/services/intake/intake_runner.py` | Intake 一轮对话的状态编排 |
-| `backend/app/services/intake/intake_agent.py` | Intake 结构化 LLM 节点 |
-| `backend/app/services/intake/intake_identity_loop.py` | Intake 身份确认 Agent Loop |
-| `backend/app/services/intake/intake_completeness.py` | 必要字段完整性判断 |
-| `backend/app/services/intake/intake_entity_candidates.py` | 内部与外部身份候选、证据校验 |
-| `backend/app/services/intake/intake_activity.py` | 进程内 Intake 活动状态存储 |
+| `backend/app/services/intake/runner.py` | Intake 一轮对话的状态编排 |
+| `backend/app/services/intake/agent.py` | Intake 结构化 LLM 节点 |
+| `backend/app/services/intake/identity_loop.py` | Intake 身份确认 Agent Loop |
+| `backend/app/services/intake/completeness.py` | 必要字段完整性判断 |
+| `backend/app/services/intake/entity_candidates.py` | 内部与外部身份候选、证据校验 |
+| `backend/app/services/intake/activity.py` | 进程内 Intake 活动状态存储 |
 | `backend/app/tasks/pipeline.py` | 研究任务总编排、取消检查和失败处理 |
 | `backend/app/services/research/agent_tools.py` | Tavily 与 MCP 工具执行及结果标准化 |
 | `backend/app/services/research/evidence_verify.py` | 公开证据规则分流与模型复核 |
 | `backend/app/services/research/project_ranker.py` | 内部项目确定性评分与排序 |
 | `backend/app/services/research/resource_association.py` | 项目、资源、风险和行动关联分析 |
 | `backend/app/services/research/final_synthesis.py` | 最终综合输入构造与输出校验 |
-| `backend/app/services/reporting/report_renderer.py` | Jinja2 报告渲染 |
+| `backend/app/services/reporting/renderer.py` | Jinja2 报告渲染 |
 | `backend/app/database.py` | 表初始化、轻量迁移和 Repository |
 | `backend/app/models/database.py` | 应用状态 ORM 模型 |
 | `mcp_server/server.py` | 四个内部只读 MCP 工具 |
 | `mcp_server/project_repository.py` | 内部实体与项目数据库查询 |
 
-建议的后端阅读顺序：`api/intake.py` -> `intake/intake_runner.py` -> `intake/intake_identity_loop.py` -> `api/tasks.py` -> `tasks/pipeline.py` -> `research/agent_tools.py`。
+建议的后端阅读顺序：`api/intake.py` -> `intake/runner.py` -> `intake/identity_loop.py` -> `api/tasks.py` -> `tasks/pipeline.py` -> `research/agent_tools.py`。
 
 ## 6. LLM 节点与降级
 

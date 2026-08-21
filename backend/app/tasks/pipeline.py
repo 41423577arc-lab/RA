@@ -32,7 +32,7 @@ from app.services.research.extractor import RuleExtractor
 from app.services.integrations.llm_client import StructuredLLM
 from app.services.integrations.mcp_client import ProjectMcpClient
 from app.services.research.project_ranker import ProjectRanker
-from app.services.reporting.report_renderer import ReportRenderer
+from app.services.reporting.renderer import ReportRenderer
 from app.services.research.resource_association import ResourceAssociationBuilder
 from app.services.integrations.tavily_client import TavilyClient
 from app.services.integrations.transcriber import LocalWhisperTranscriber

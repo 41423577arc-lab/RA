@@ -25,9 +25,9 @@ from app.schemas.task import (
     SearchResult,
     WebPage,
 )
-from app.services.intake.intake_completeness import is_intake_ready
-from app.services.intake.intake_entity_candidates import IntakeEntityCandidateService
-from app.services.intake.intake_agent import IntakeAgent
+from app.services.intake.completeness import is_intake_ready
+from app.services.intake.entity_candidates import IntakeEntityCandidateService
+from app.services.intake.agent import IntakeAgent
 from app.services.integrations.llm_client import LLMUnavailable
 from app.tasks.pipeline import context_from_intake_snapshot
 

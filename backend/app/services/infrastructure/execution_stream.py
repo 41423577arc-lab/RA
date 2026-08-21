@@ -10,7 +10,7 @@ from app.database import SessionLocal, TaskRepository
 from app.models.database import ExecutionEvent, ResearchTask
 from app.schemas.task import StreamExecutionEvent
 
-
+#任务终态集合
 TERMINAL_TASK_STATUSES = {"COMPLETED", "FAILED", "CANCELLED", "NEEDS_CONFIRMATION"}
 StreamEventType = Literal[
     "PHASE_CHANGED",

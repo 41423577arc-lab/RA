@@ -12,16 +12,16 @@ from app.schemas.intake import (
     IntakeStructuredContext,
 )
 from app.schemas.task import ConfirmationRequest
-from app.services.intake.intake_agent import IntakeAgent
-from app.services.intake.intake_completeness import required_missing_information
-from app.services.intake.intake_defaults import with_default_requester_context
-from app.services.intake.intake_entity_candidates import IntakeEntityCandidateService
-from app.services.intake.intake_field_state import (
+from app.services.intake.agent import IntakeAgent
+from app.services.intake.completeness import required_missing_information
+from app.services.intake.defaults import with_default_requester_context
+from app.services.intake.entity_candidates import IntakeEntityCandidateService
+from app.services.intake.field_state import (
     derive_field_states,
     fallback_confirmation_question,
     fields_ready_for_confirmation,
 )
-from app.services.intake.intake_identity_loop import IntakeIdentityLoop
+from app.services.intake.identity_loop import IntakeIdentityLoop
 from app.services.integrations.llm_client import LLMCallFailed, LLMUnavailable
 from app.tasks.pipeline import infer_event_type
 

@@ -7,7 +7,7 @@ from app.schemas.intake import (
     IntakeReadinessResult,
     IntakeStructuredContext,
 )
-from app.services.intake.intake_defaults import DEFAULT_REQUESTER_CONTEXT
+from app.services.intake.defaults import DEFAULT_REQUESTER_CONTEXT
 from app.services.integrations.llm_client import StructuredLLM
 
 

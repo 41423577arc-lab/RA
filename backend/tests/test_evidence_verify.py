@@ -12,7 +12,7 @@ from app.services.research.evidence_verify import (
     route_web_evidence_candidates,
 )
 from app.services.research.extractor import RuleExtractor
-from app.services.reporting.report_renderer import ReportRenderer
+from app.services.reporting.renderer import ReportRenderer
 from app.tasks.pipeline import ResearchPipeline
 
 

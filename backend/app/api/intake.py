@@ -23,21 +23,21 @@ from app.schemas.intake import (
 )
 from app.schemas.task import TaskCreated
 from app.schemas.task import ConfirmationPayload
-from app.services.intake.intake_activity import intake_activity
-from app.services.intake.intake_agent import IntakeAgent
-from app.services.intake.intake_completeness import (
+from app.services.intake.activity import intake_activity
+from app.services.intake.agent import IntakeAgent
+from app.services.intake.completeness import (
     is_intake_ready,
     required_missing_information,
 )
-from app.services.intake.intake_entity_candidates import (
+from app.services.intake.entity_candidates import (
     IntakeEntityCandidateService,
     user_provided_entity_resolutions,
 )
-from app.services.intake.intake_defaults import with_default_requester_context
+from app.services.intake.defaults import with_default_requester_context
 from app.services.integrations.llm_client import StructuredLLM
 from app.services.integrations.mcp_client import ProjectMcpClient
 from app.services.integrations.tavily_client import TavilyClient
-from app.services.intake.intake_runner import (
+from app.services.intake.runner import (
     IntakeAudioJobNotFound,
     IntakeAudioJobNotReviewable,
     IntakeChatConflict,

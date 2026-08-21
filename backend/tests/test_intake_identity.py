@@ -18,13 +18,13 @@ from app.schemas.task import (
     WebPage,
 )
 from app.services.intake.entity_resolver import EntityResolver
-from app.services.intake.intake_completeness import is_intake_ready
-from app.services.intake.intake_field_state import (
+from app.services.intake.completeness import is_intake_ready
+from app.services.intake.field_state import (
     derive_field_states,
     fallback_confirmation_question,
     fields_ready_for_confirmation,
 )
-from app.services.intake.intake_identity_loop import IntakeIdentityLoop
+from app.services.intake.identity_loop import IntakeIdentityLoop
 
 
 def _understanding(*, people=None, organizations=None) -> IntentUnderstanding:

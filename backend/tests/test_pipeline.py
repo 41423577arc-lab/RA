@@ -11,7 +11,7 @@ from app.schemas.task import (
 )
 from app.services.research.extractor import RuleExtractor
 from app.services.intake.entity_resolver import EntityResolver
-from app.services.reporting.report_renderer import ReportRenderer
+from app.services.reporting.renderer import ReportRenderer
 from app.tasks.pipeline import (
     ResearchPipeline,
     context_from_intake_snapshot,

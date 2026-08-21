@@ -19,9 +19,9 @@ The task prompt assigns exactly one role. Stay within that role's owned files.
 
 Owns identity extraction, normalization, completeness, and deterministic identity matching:
 
-- `backend/app/services/intake_agent.py`
-- `backend/app/services/intake_completeness.py`
-- `backend/app/services/entity_resolver.py`
+- `backend/app/services/intake/agent.py`
+- `backend/app/services/intake/completeness.py`
+- `backend/app/services/intake/entity_resolver.py`
 - `backend/prompts/intake_chat_v1.txt`
 - `backend/prompts/intake_followup_v1.txt`
 - `backend/prompts/intake_identity_normalize_v1.txt`
@@ -33,8 +33,8 @@ Do not change Tavily orchestration, research pipeline behavior, or frontend pres
 
 Owns key-person identity lookup, Tavily access, candidate evidence validation, and lookup failure behavior:
 
-- `backend/app/services/intake_entity_candidates.py`
-- `backend/app/services/tavily_client.py`
+- `backend/app/services/intake/entity_candidates.py`
+- `backend/app/services/integrations/tavily_client.py`
 - New focused tests in `backend/tests/test_intake_web_lookup.py`
 
 Preserve these invariants: internal lookup runs first; web lookup is limited to unresolved identity completion; accepted external candidates must be supported by exact source-page evidence.
@@ -43,7 +43,7 @@ Preserve these invariants: internal lookup runs first; web lookup is limited to 
 
 Owns intake activity storage, polling, progress presentation, and intake interaction UI:
 
-- `backend/app/services/intake_activity.py`
+- `backend/app/services/intake/activity.py`
 - `frontend/src/app/page.tsx`
 - `frontend/src/app/globals.css`
 - New focused tests in `backend/tests/test_intake_activity.py`

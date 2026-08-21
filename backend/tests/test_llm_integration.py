@@ -20,7 +20,7 @@ from app.services.intake.entity_resolver import EntityResolver, InsufficientCont
 from app.services.research.extractor import RuleExtractor
 from app.services.integrations.llm_client import LLMCallFailed, StructuredLLM
 from app.tasks.pipeline import ResearchPipeline
-from app.services.reporting.report_renderer import ReportRenderer
+from app.services.reporting.renderer import ReportRenderer
 
 
 ROOT = Path(__file__).resolve().parents[2]

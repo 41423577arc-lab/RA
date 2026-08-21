@@ -20,7 +20,7 @@ from app.services.research.agent_nodes import (
     fallback_report_content,
     validate_report_content,
 )
-from app.services.reporting.report_renderer import ReportRenderer
+from app.services.reporting.renderer import ReportRenderer
 
 
 ROOT = Path(__file__).resolve().parents[2]

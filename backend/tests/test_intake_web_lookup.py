@@ -8,7 +8,7 @@ from app.schemas.intake import (
     IntakeStructuredContext,
 )
 from app.schemas.task import ConfirmationItem, ConfirmationRequest, SearchResult, WebPage
-from app.services.intake.intake_entity_candidates import IntakeEntityCandidateService
+from app.services.intake.entity_candidates import IntakeEntityCandidateService
 from app.services.integrations.tavily_client import TavilyClient
 
 
