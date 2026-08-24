@@ -19,12 +19,15 @@ The task prompt assigns exactly one role. Stay within that role's owned files.
 
 Owns identity extraction, normalization, completeness, and deterministic identity matching:
 
-- `backend/app/services/intake/agent.py`
 - `backend/app/services/intake/completeness.py`
 - `backend/app/services/intake/entity_resolver.py`
+- `backend/app/services/intake/identity_loop.py`
 - `backend/prompts/intake_chat_v1.txt`
 - `backend/prompts/intake_followup_v1.txt`
+- `backend/prompts/intake_identity_initialize_v1.txt`
 - `backend/prompts/intake_identity_normalize_v1.txt`
+- `backend/prompts/intake_identity_update_v1.txt`
+- `backend/prompts/intake_readiness_v1.txt`
 - New focused tests in `backend/tests/test_intake_identity.py`
 
 Do not change Tavily orchestration, research pipeline behavior, or frontend presentation.
@@ -38,6 +41,20 @@ Owns key-person identity lookup, Tavily access, candidate evidence validation, a
 - New focused tests in `backend/tests/test_intake_web_lookup.py`
 
 Preserve these invariants: internal lookup runs first; web lookup is limited to unresolved identity completion; accepted external candidates must be supported by exact source-page evidence.
+
+### Intake agent orchestration
+
+Owns the runtime-only Intake Agent state wrapper, turn validation, state reduction, structured internal query execution, decision-loop orchestration, and the legacy-to-V2 feature switch:
+
+- `backend/app/services/intake/agent_loop.py`
+- `backend/app/services/intake/state_reducer.py`
+- `backend/app/services/intake/query_executor.py`
+- `backend/app/services/intake/runner.py`
+- `backend/prompts/intake_agent_v1.txt`
+- `backend/prompts/intake_skills/`
+- New focused tests in `backend/tests/test_intake_agent_loop.py`
+
+`IntakeStructuredContext` remains the only persisted Intake business context. Runtime `AgentState` must wrap it without duplicating or separately persisting people, organizations, resolutions, or other business facts. Do not change Tavily evidence validation, Research Pipeline behavior, new-customer persistence, or frontend presentation in this role.
 
 ### Intake activity UI
 
@@ -55,11 +72,17 @@ The frontend displays server state and must not infer identity or research outco
 Changes to these files can affect multiple functional areas and require explicit scope review before editing:
 
 - `backend/app/api/intake.py`
+- `backend/app/config.py`
 - `backend/app/schemas/intake.py`
+- `backend/app/services/intake/agent.py`
+- `backend/app/services/integrations/llm_client.py`
+- `backend/app/services/integrations/mcp_client.py`
 - `backend/app/tasks/pipeline.py`
 - `backend/app/models/database.py`
 - `backend/app/database.py`
 - `backend/tests/test_intake.py`
+- `mcp_server/server.py`
+- `mcp_server/project_repository.py`
 - Project-wide configuration, dependency, Docker, and documentation files
 
 For cross-module changes, report a compact contract proposal before editing: affected file, new or changed field/function, compatibility impact, and required tests. Apply the wiring on `main` only after the scope is understood.
