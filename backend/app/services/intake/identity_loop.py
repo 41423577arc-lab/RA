@@ -1,10 +1,11 @@
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, Protocol, cast
+from typing import Literal, Protocol
 
 from app.schemas.intake import (
+    IntakeAction,
     IntakeChatRequest,
-    IntakeContextNextAction,
+    IntakeEntityResolution,
     IntakeResolutionResult,
     IntakeStructuredContext,
     IntakeToolAttempt,
@@ -20,6 +21,13 @@ IntakeLoopStopReason = Literal[
     "MAX_TOOL_CALLS",
     "REPEATED_ACTION",
 ]
+OPTIONAL_NON_IDENTITY_FIELDS = {
+    "event_time",
+    "event_location",
+    "projects",
+    "business_directions",
+    "focus_questions",
+}
 InternalLookup = Callable[
     [IntakeStructuredContext], tuple[list[dict], ConfirmationRequest | None]
 ]
@@ -52,19 +60,18 @@ class IntakeContextAgent(Protocol):
 @dataclass(frozen=True)
 class IntakeIdentityLoopResult:
     context: IntakeStructuredContext
-    resolutions: tuple[dict, ...]
+    resolutions: tuple[IntakeEntityResolution, ...]
     confirmation: ConfirmationRequest | None
     stop_reason: IntakeLoopStopReason
     tool_calls: int
 
 
 class IntakeActionValidator:
-    allowed_actions = {"SEARCH_INTERNAL", "SEARCH_PUBLIC", "ASK_USER", "READY"}
-
-    def validate(self, requested_action: object) -> IntakeContextNextAction:
-        if isinstance(requested_action, str) and requested_action in self.allowed_actions:
-            return cast(IntakeContextNextAction, requested_action)
-        return "ASK_USER"
+    def validate(self, requested_action: object) -> IntakeAction:
+        try:
+            return IntakeStructuredContext(next_action=requested_action).next_action or "ASK_USER"
+        except (TypeError, ValueError):
+            return "ASK_USER"
 
 
 class IntakeIdentityLoop:
@@ -131,6 +138,7 @@ class IntakeIdentityLoop:
                 )
 
             if action == "READY":
+                context = self._ready_context(context)
                 return self._finish(
                     context,
                     resolutions,
@@ -167,15 +175,19 @@ class IntakeIdentityLoop:
             query = self._controlled_query(context)
             technical_status: Literal["SUCCESS", "FAILED"] = "SUCCESS"
             error: str | None = None
-            additions: list[dict] = []
+            additions: list[IntakeEntityResolution] = []
             try:
                 if action == "SEARCH_INTERNAL":
-                    additions, confirmation = lookup_internal(context)
+                    raw_additions, confirmation = lookup_internal(context)
                 else:
                     if confirmation is None:
                         raise ValueError("公网身份查询缺少内部候选 Observation")
-                    additions, confirmation = lookup_public(context, confirmation)
+                    raw_additions, confirmation = lookup_public(context, confirmation)
+                additions = [
+                    IntakeEntityResolution.model_validate(item) for item in raw_additions
+                ]
             except Exception as exc:
+                additions = []
                 technical_status = "FAILED"
                 error = f"{type(exc).__name__}: {exc}"[:1_000]
 
@@ -205,12 +217,13 @@ class IntakeIdentityLoop:
                 "query": query,
                 "technical_status": technical_status,
                 "information_status": information_status,
-                "resolutions": additions,
+                "resolutions": [item.model_dump(mode="json") for item in additions],
                 "confirmation": confirmation.model_dump(mode="json")
                 if confirmation
                 else None,
                 "error": error,
                 "success_criteria": previous_criteria,
+                "resolution_sources": self._resolution_source_counts(additions),
             }
             self._record_observation(iteration, observation)
             controlled_context = context
@@ -290,7 +303,7 @@ class IntakeIdentityLoop:
             )
         except Exception:
             if observation["information_status"] == "RESOLVED":
-                action: IntakeContextNextAction = "READY"
+                action: IntakeAction = "READY"
             elif observation["action"] == "SEARCH_INTERNAL":
                 action = "SEARCH_PUBLIC"
             else:
@@ -302,11 +315,11 @@ class IntakeIdentityLoop:
         context: IntakeStructuredContext,
         *,
         controlled_context: IntakeStructuredContext | None = None,
-        resolutions: list[dict],
+        resolutions: list[IntakeEntityResolution],
         tool_attempts: list[IntakeToolAttempt],
     ) -> IntakeStructuredContext:
         data = context.model_dump(mode="json")
-        data["entity_resolutions"] = resolutions
+        data["entity_resolutions"] = [item.model_dump(mode="json") for item in resolutions]
         data["tool_attempts"] = [item.model_dump(mode="json") for item in tool_attempts]
         if controlled_context is not None:
             data["final_confirmation"] = (
@@ -327,11 +340,11 @@ class IntakeIdentityLoop:
 
     @staticmethod
     def _apply_hard_constraints(
-        action: IntakeContextNextAction,
+        action: IntakeAction,
         context: IntakeStructuredContext,
         confirmation: ConfirmationRequest | None,
         hard_gate: Callable[[IntakeStructuredContext], bool],
-    ) -> IntakeContextNextAction:
+    ) -> IntakeAction:
         current_query = IntakeIdentityLoop._controlled_query(context)
         attempts = {
             item.action
@@ -345,6 +358,15 @@ class IntakeIdentityLoop:
             and item.technical_status == "SUCCESS"
             and item.information_status == "NO_RESULT"
         }
+        if action == "ASK_USER" and IntakeIdentityLoop._asks_only_optional_fields(
+            context
+        ):
+            if hard_gate(context):
+                return "READY"
+            if "SEARCH_INTERNAL" not in attempts:
+                return "SEARCH_INTERNAL"
+            if confirmation is not None and "SEARCH_PUBLIC" not in attempts:
+                return "SEARCH_PUBLIC"
         if action == "READY" and not hard_gate(context):
             if "SEARCH_INTERNAL" not in attempts:
                 return "SEARCH_INTERNAL"
@@ -367,7 +389,7 @@ class IntakeIdentityLoop:
 
     @staticmethod
     def _information_status(
-        additions: list[dict], confirmation: ConfirmationRequest | None
+        additions: list[IntakeEntityResolution], confirmation: ConfirmationRequest | None
     ) -> Literal["RESOLVED", "PARTIAL", "NO_RESULT"]:
         if additions and confirmation is None:
             return "RESOLVED"
@@ -397,39 +419,79 @@ class IntakeIdentityLoop:
 
     @staticmethod
     def _observation_summary(
-        additions: list[dict], confirmation: ConfirmationRequest | None
+        additions: list[IntakeEntityResolution], confirmation: ConfirmationRequest | None
     ) -> str:
+        sources = IntakeIdentityLoop._resolution_source_counts(additions)
         pending = len(confirmation.items) if confirmation else 0
         candidates = sum(
             len(item.candidates) for item in confirmation.items
         ) if confirmation else 0
-        return f"新增确认身份 {len(additions)} 个，待确认 {pending} 项，候选 {candidates} 个。"
+        return (
+            f"用户明确提供身份 {sources['USER_INPUT']} 个，"
+            f"内部确认身份 {sources['INTERNAL']} 个，"
+            f"公网证据确认身份 {sources['EXTERNAL']} 个，"
+            f"待确认 {pending} 项，候选 {candidates} 个。"
+        )
 
     @staticmethod
-    def _merge_resolutions(existing: list, additions: list[dict]) -> list[dict]:
-        merged = {}
-        for item in existing:
-            value = item if isinstance(item, dict) else item.model_dump(mode="json")
-            merged[(value.get("entity_type"), value.get("mention"))] = value
+    def _resolution_source_counts(
+        additions: list[IntakeEntityResolution],
+    ) -> dict[str, int]:
+        counts = {"USER_INPUT": 0, "INTERNAL": 0, "EXTERNAL": 0, "OTHER": 0}
         for item in additions:
-            merged[(item.get("entity_type"), item.get("mention"))] = item
+            if item.confirmed_by in {"USER_INPUT", "USER"}:
+                counts["USER_INPUT"] += 1
+            elif item.confirmed_by == "INTERNAL":
+                counts["INTERNAL"] += 1
+            elif item.confirmed_by == "EXTERNAL_AUTO":
+                counts["EXTERNAL"] += 1
+            else:
+                counts["OTHER"] += 1
+        return counts
+
+    @staticmethod
+    def _asks_only_optional_fields(context: IntakeStructuredContext) -> bool:
+        return bool(context.target_fields) and set(context.target_fields).issubset(
+            OPTIONAL_NON_IDENTITY_FIELDS
+        )
+
+    @staticmethod
+    def _merge_resolutions(
+        existing: list[IntakeEntityResolution], additions: list[dict]
+    ) -> list[IntakeEntityResolution]:
+        merged: dict[tuple[str, str], IntakeEntityResolution] = {}
+        for item in [*existing, *additions]:
+            value = IntakeEntityResolution.model_validate(item)
+            merged[(value.entity_type, value.mention)] = value
         return list(merged.values())
 
     @staticmethod
     def _waiting_context(
         context: IntakeStructuredContext, fallback_question: str | None = None
     ) -> IntakeStructuredContext:
-        question = context.user_question or fallback_question or (
-            "请确认目标人物或企业的完整名称、职位或所属关系。"
+        default_question = "请确认目标人物或企业的完整名称、职位或所属关系。"
+        includes_optional_fields = bool(
+            set(context.target_fields) & OPTIONAL_NON_IDENTITY_FIELDS
+        )
+        question = (
+            fallback_question
+            or (None if includes_optional_fields else context.user_question)
+            or default_question
         )
         return context.model_copy(
             update={"next_action": "ASK_USER", "user_question": question}
         )
 
+    @staticmethod
+    def _ready_context(context: IntakeStructuredContext) -> IntakeStructuredContext:
+        return context.model_copy(
+            update={"next_action": "READY", "target_fields": [], "user_question": None}
+        )
+
     def _finish(
         self,
         context: IntakeStructuredContext,
-        resolutions: list[dict],
+        resolutions: list[IntakeEntityResolution],
         confirmation: ConfirmationRequest | None,
         reason: IntakeLoopStopReason,
         tool_calls: int,
@@ -465,7 +527,7 @@ class IntakeIdentityLoop:
         self,
         iteration: int,
         requested_action: object,
-        action: IntakeContextNextAction,
+        action: IntakeAction,
     ) -> None:
         self._log(
             event_type="AGENT_ACTION",

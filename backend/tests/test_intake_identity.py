@@ -1,13 +1,24 @@
+from typing import get_args
+
+import pytest
+from pydantic import ValidationError
+
 from app.schemas.intake import (
+    IntakeAction,
     IntakeChatRequest,
     IntakeChatResult,
     IntakeEntityAssessment,
     IntakeEntityResolution,
+    IntakeEntityType,
     IntakeFieldState,
+    IntakeFollowupResult,
     IntakePersonCandidate,
+    IntakeQuestionKind,
+    IntakeReadinessResult,
     IntakeResolutionResult,
     IntakeStructuredContext,
     IntakeToolAttempt,
+    IntakeToolAction,
 )
 from app.schemas.task import (
     CandidateOption,
@@ -413,6 +424,60 @@ def test_identity_context_schema_expresses_initialization_to_ready_flow() -> Non
     assert all(state.status == "CONFIRMED" for state in ready.field_states.values())
 
 
+def test_intake_contract_has_one_canonical_action_set_and_reserved_types() -> None:
+    actions = set(get_args(IntakeAction))
+    tool_actions = set(get_args(IntakeToolAction))
+    assert actions == {
+        "SEARCH_INTERNAL",
+        "SEARCH_PUBLIC",
+        "ASK_USER",
+        "READY",
+    }
+    assert tool_actions == {"SEARCH_INTERNAL", "SEARCH_PUBLIC"}
+    assert tool_actions < actions
+    tool_action_schema = IntakeToolAttempt.model_json_schema()["properties"]["action"]
+    assert set(tool_action_schema["enum"]) == tool_actions
+    assert set(get_args(IntakeEntityType)) == {"ORGANIZATION", "PERSON"}
+    assert set(get_args(IntakeQuestionKind)) == {
+        "GENERAL",
+        "CONFIRM_CANDIDATE",
+        "CONFIRM_NEW_ENTITY",
+    }
+
+
+def test_legacy_intake_actions_are_normalized_at_schema_boundary() -> None:
+    chat = IntakeChatResult(
+        assistant_reply="已记录。",
+        analysis_input="拜访示例科技。",
+        ready_to_analyze=False,
+        next_action="LOOKUP_INTERNAL",
+    )
+    followup = IntakeFollowupResult(
+        assistant_reply="正在联网补全。", next_action="SEARCH_EXTERNAL"
+    )
+    confirmation = IntakeFollowupResult(
+        assistant_reply="请确认候选。", next_action="REQUEST_CONFIRMATION"
+    )
+    readiness = IntakeReadinessResult(
+        assistant_reply="可以开始分析。",
+        ready_to_analyze=True,
+        next_action="PROPOSE_READY",
+    )
+
+    assert chat.next_action == "SEARCH_INTERNAL"
+    assert followup.next_action == "SEARCH_PUBLIC"
+    assert confirmation.next_action == "ASK_USER"
+    assert readiness.next_action == "READY"
+
+    with pytest.raises(ValidationError):
+        IntakeChatResult(
+            assistant_reply="已记录。",
+            analysis_input="拜访示例科技。",
+            ready_to_analyze=False,
+            next_action="CREATE_CUSTOMER",
+        )
+
+
 class _IdentityLoopAgent:
     def initialize_context(self, _request, extracted_context):
         return extracted_context.model_copy(
@@ -649,6 +714,156 @@ def test_intake_identity_loop_hard_gate_verifies_clear_identity() -> None:
     assert result.stop_reason == "READY"
     assert result.tool_calls == 1
     assert result.context.tool_attempts[0].information_status == "RESOLVED"
+
+
+def test_identity_loop_does_not_wait_for_optional_time_or_location() -> None:
+    class OptionalQuestionAgent(_IdentityLoopAgent):
+        def initialize_context(self, _request, extracted_context):
+            return extracted_context.model_copy(
+                update={
+                    "next_action": "ASK_USER",
+                    "target_fields": ["event_time", "event_location"],
+                    "user_question": "请问具体时间和地点？",
+                }
+            )
+
+    request = IntakeChatRequest(
+        messages=[
+            {
+                "role": "user",
+                "content": "我要见示例科技有限公司的王伟，讨论合作机会。",
+            }
+        ]
+    )
+    resolutions = [
+        IntakeEntityResolution(
+            entity_type="PERSON",
+            mention="王伟",
+            canonical_name="王伟",
+            organization="示例科技有限公司",
+            confirmed_by="USER_INPUT",
+        ),
+        IntakeEntityResolution(
+            entity_type="ORGANIZATION",
+            mention="示例科技有限公司",
+            canonical_name="示例科技有限公司",
+            confirmed_by="USER_INPUT",
+        ),
+    ]
+    context = IntakeStructuredContext(
+        people=["王伟"],
+        organizations=["示例科技有限公司"],
+        target_fields=["event_time", "event_location"],
+        entity_resolutions=resolutions,
+    )
+
+    result = IntakeIdentityLoop(
+        OptionalQuestionAgent(), _EventRecorder(), str(request.session_id)
+    ).run(
+        request,
+        context,
+        None,
+        lookup_internal=lambda _context: ([], None),
+        lookup_public=lambda _context, confirmation: ([], confirmation),
+        hard_gate=_identity_hard_gate,
+    )
+
+    assert result.stop_reason == "READY"
+    assert result.tool_calls == 0
+    assert result.context.next_action == "READY"
+    assert result.context.target_fields == []
+    assert result.context.user_question is None
+
+
+def test_identity_loop_removes_optional_fields_from_identity_question() -> None:
+    class MixedQuestionAgent(_IdentityLoopAgent):
+        def initialize_context(self, _request, extracted_context):
+            return extracted_context.model_copy(
+                update={
+                    "next_action": "ASK_USER",
+                    "target_fields": ["person_name", "event_time", "event_location"],
+                    "user_question": "请提供完整姓名、时间和地点。",
+                }
+            )
+
+    request = IntakeChatRequest(
+        messages=[
+            {
+                "role": "user",
+                "content": "我要见示例科技有限公司的王某某，讨论合作机会。",
+            }
+        ]
+    )
+
+    result = IntakeIdentityLoop(
+        MixedQuestionAgent(), _EventRecorder(), str(request.session_id)
+    ).run(
+        request,
+        IntakeStructuredContext(
+            people=["王某某"], organizations=["示例科技有限公司"]
+        ),
+        None,
+        lookup_internal=lambda _context: ([], None),
+        lookup_public=lambda _context, confirmation: ([], confirmation),
+        hard_gate=_identity_hard_gate,
+    )
+
+    assert result.stop_reason == "WAITING_USER"
+    assert result.context.user_question == (
+        "请确认目标人物或企业的完整名称、职位或所属关系。"
+    )
+    assert "时间" not in result.context.user_question
+    assert "地点" not in result.context.user_question
+
+
+def test_identity_loop_observation_distinguishes_resolution_sources() -> None:
+    request = IntakeChatRequest(
+        messages=[{"role": "user", "content": "我要见示例科技有限公司的王伟"}]
+    )
+    resolutions = [
+        IntakeEntityResolution(
+            entity_type="PERSON",
+            mention="王伟",
+            canonical_name="王伟",
+            organization="示例科技有限公司",
+            confirmed_by="USER_INPUT",
+        ).model_dump(mode="json"),
+        IntakeEntityResolution(
+            entity_type="ORGANIZATION",
+            mention="示例科技有限公司",
+            canonical_name="示例科技有限公司",
+            confirmed_by="INTERNAL",
+        ).model_dump(mode="json"),
+    ]
+    recorder = _EventRecorder()
+
+    result = IntakeIdentityLoop(
+        _IdentityLoopAgent(), recorder, str(request.session_id)
+    ).run(
+        request,
+        IntakeStructuredContext(
+            people=["王伟"], organizations=["示例科技有限公司"]
+        ),
+        None,
+        lookup_internal=lambda _context: (resolutions, None),
+        lookup_public=lambda _context, confirmation: ([], confirmation),
+        hard_gate=_identity_hard_gate,
+    )
+
+    attempt = result.context.tool_attempts[0]
+    assert "用户明确提供身份 1 个" in attempt.observation
+    assert "内部确认身份 1 个" in attempt.observation
+    observation_event = next(
+        values
+        for _scope_id, values in recorder.events
+        if values["event_type"] == "AGENT_OBSERVATION"
+    )
+    assert observation_event["payload"]["observation"]["resolution_sources"] == {
+        "USER_INPUT": 1,
+        "INTERNAL": 1,
+        "EXTERNAL": 0,
+        "OTHER": 0,
+    }
 
 
 def test_intake_identity_loop_separates_tool_failure_from_information_result() -> None:

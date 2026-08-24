@@ -310,7 +310,7 @@ def test_get_repairs_existing_complete_session_to_ready() -> None:
     assert restored.json()["status"] == "READY"
     assert restored.json()["ready_to_analyze"] is True
     assert restored.json()["missing_information"] == []
-    assert restored.json()["next_action"] == "PROPOSE_READY"
+    assert restored.json()["next_action"] == "READY"
     with SessionLocal() as session:
         repaired = session.get(IntakeSession, session_id)
         assert repaired.structured_context["requester_context"]["organization"] == (
@@ -1186,7 +1186,7 @@ def test_controlled_intake_agent_has_dedicated_readiness_step() -> None:
     assert follow_up.assistant_reply == "请确认身份候选。"
     assert initialized.next_action == "SEARCH_INTERNAL"
     assert updated.next_action == "ASK_USER"
-    assert readiness.next_action == "PROPOSE_READY"
+    assert readiness.next_action == "READY"
     assert llm.nodes == [
         "intake_chat",
         "intake_identity_initialize",

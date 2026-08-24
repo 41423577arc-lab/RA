@@ -95,7 +95,7 @@ def _chat_response(intake_session: IntakeSession) -> IntakeChatResponse:
         ready_to_analyze=intake_session.ready_to_analyze,
         missing_information=intake_session.missing_information or [],
         structured_context=structured_context,
-        next_action="PROPOSE_READY"
+        next_action="READY"
         if intake_session.status == "READY"
         else "ASK_USER",
         confirmation_request=intake_session.confirmation_request,

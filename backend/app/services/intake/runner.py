@@ -323,7 +323,8 @@ class IntakeRunner:
             )
             identity_loop_used = True
             resolutions = align_resolution_relationships(
-                list(loop_result.resolutions), loop_result.context
+                [item.model_dump(mode="json") for item in loop_result.resolutions],
+                loop_result.context,
             )
             stored_context = standardized_context(
                 with_default_requester_context(

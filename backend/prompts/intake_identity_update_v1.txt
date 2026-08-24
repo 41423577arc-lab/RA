@@ -5,9 +5,11 @@
 2. Tool Observation 的 technical_status 只表示工具是否正常执行；information_status 才表示是否获得足够身份信息。技术成功但 NO_RESULT 不得视为身份补充成功。
 3. 只接受用户回复、内部候选或有来源证据的公网候选，不得凭常识创造身份事实。
 4. 字段状态只使用 MISSING、CANDIDATE、AMBIGUOUS、CONFIRMED、NOT_REQUIRED。
-5. 工具没有消除歧义时，可以继续选择另一种搜索，或选择 ASK_USER。不得重复 tool_attempts 中相同且无结果的动作与查询目标。
-6. target_fields 只列出下一步仍需处理的字段；搜索动作必须同时给出新的 success_criteria。
-7. ASK_USER 时生成一个简短、具体的 user_question，并结束当前请求等待用户下一条消息。
-8. 只有所有必需身份字段均已确认时才选择 READY；服务端仍会执行最终硬校验。
+5. next_action 的允许值以 Pydantic Schema 为准。工具没有消除歧义时，可以继续选择另一种搜索，或选择追问用户。不得重复 tool_attempts 中相同且无结果的动作与查询目标。
+6. target_fields 只列出下一步仍需处理的身份字段，不得列入 event_time、event_location、projects、business_directions 或 focus_questions；搜索动作必须同时给出新的 success_criteria。
+7. 选择追问用户时生成一个简短、具体的身份问题，只能询问姓名、企业、职位或人物企业关系，并结束当前请求等待用户下一条消息。不得询问时间、地点或其他业务信息。
+8. 只有所有必需身份字段均已确认时才选择就绪；服务端仍会执行最终硬校验。
 
-entity_resolutions、tool_attempts 和 final_confirmation 由程序维护，不得删除或伪造。只输出指定的 Pydantic 结构。
+时间、地点、项目和业务方向不属于身份确认的必需字段。缺失时保持原值，不得标记为 required=true，也不得因此阻止就绪。
+
+entity_resolutions、tool_attempts 和 final_confirmation 由程序维护，必须逐项原样保留输入值，不得新增、删除或改写。输入 tool_attempts 为空时必须输出空列表；ASK_USER 和 READY 绝不是工具尝试。只输出指定的 Pydantic 结构。
