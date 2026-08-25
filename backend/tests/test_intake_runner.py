@@ -4,7 +4,13 @@ from uuid import uuid4
 import pytest
 
 from app.models.database import IntakeSession
-from app.schemas.intake import IntakeChatRequest
+from app.schemas.intake import (
+    IntakeChatRequest,
+    IntakeChatResult,
+    IntakeEntityResolution,
+    IntakeStructuredContext,
+)
+from app.services.intake.identity_loop import IntakeIdentityLoopResult
 from app.services.intake.runner import IntakeChatConflict, IntakeRunner
 from app.services.integrations.llm_client import LLMCallFailed
 
@@ -57,6 +63,28 @@ class MustNotRunAgent:
         raise AssertionError("A replay must not invoke the model")
 
 
+class StructuredAgent:
+    def respond(self, _request):
+        context = IntakeStructuredContext(
+            people=["刘希川"],
+            organizations=["中国建筑第二工程局有限公司"],
+            next_action="READY",
+        )
+        return IntakeChatResult(
+            assistant_reply="信息已记录。",
+            analysis_input="今晚和中国建筑第二工程局有限公司刘希川吃饭",
+            ready_to_analyze=True,
+            structured_context=context,
+            next_action="READY",
+        )
+
+    def initialize_context(self, *_args, **_kwargs):
+        raise AssertionError("The test replaces the identity loop")
+
+    def update_context(self, *_args, **_kwargs):
+        raise AssertionError("The test replaces the identity loop")
+
+
 def build_runner(repository, agent, activity):
     return IntakeRunner(
         repository=repository,
@@ -94,6 +122,137 @@ def test_runner_preserves_llm_failure_fallback_version_and_activity() -> None:
         "CHECKING_CONTEXT",
         "COMPLETED",
     ]
+
+
+def test_runner_preserves_existing_context_when_llm_fails() -> None:
+    session_id = str(uuid4())
+    existing_context = IntakeStructuredContext(
+        people=["刘希川"],
+        organizations=["中国建筑第二工程局有限公司"],
+        entity_resolutions=[
+            IntakeEntityResolution(
+                entity_type="PERSON",
+                canonical_name="刘希川",
+                mention="刘希川",
+                confirmed_by="USER_INPUT",
+            ),
+            IntakeEntityResolution(
+                entity_type="ORGANIZATION",
+                canonical_name="中国建筑第二工程局有限公司",
+                mention="中国建筑第二工程局有限公司",
+                confirmed_by="USER_INPUT",
+            ),
+        ],
+    )
+    previous_messages = [
+        {"role": "user", "content": "今晚和中国建筑第二工程局有限公司刘希川吃饭"},
+        {"role": "assistant", "content": "信息已记录，请继续。"},
+    ]
+    intake_session = IntakeSession(
+        id=session_id,
+        status="COLLECTING",
+        messages=previous_messages,
+        structured_context=existing_context.model_dump(mode="json"),
+        missing_information=[],
+        analysis_input="今晚和中国建筑第二工程局有限公司刘希川吃饭",
+        ready_to_analyze=False,
+        version=2,
+    )
+    repository = RecordingRepository(intake_session)
+    activity = RecordingActivity()
+    request = IntakeChatRequest(
+        session_id=session_id,
+        messages=[*previous_messages, {"role": "user", "content": "请继续处理"}],
+    )
+
+    result = build_runner(repository, FailingAgent(), activity).run_chat(request)
+
+    restored = IntakeStructuredContext.model_validate(result.structured_context)
+    assert restored.people == ["刘希川"]
+    assert restored.organizations == ["中国建筑第二工程局有限公司"]
+    assert {item.canonical_name for item in restored.entity_resolutions} == {
+        "刘希川",
+        "中国建筑第二工程局有限公司",
+    }
+    assert result.version == 3
+    assert activity.events[-1][1] == "COMPLETED"
+    assert activity.events[-1][3]["active"] is False
+
+
+def test_runner_marks_activity_failed_when_identity_loop_raises() -> None:
+    activity = RecordingActivity()
+    runner = build_runner(RecordingRepository(), StructuredAgent(), activity)
+
+    def fail_loop(*_args, **_kwargs):
+        raise RuntimeError("unexpected loop failure")
+
+    runner._run_identity_loop = fail_loop
+    request = IntakeChatRequest(
+        session_id=uuid4(),
+        messages=[
+            {
+                "role": "user",
+                "content": "今晚和中国建筑第二工程局有限公司刘希川吃饭",
+            }
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected loop failure"):
+        runner.run_chat(request)
+
+    assert [event[1] for event in activity.events] == [
+        "THINKING",
+        "CHECKING_CONTEXT",
+        "FAILED",
+    ]
+    assert activity.events[-1][3]["active"] is False
+
+
+def test_runner_serializes_typed_loop_resolutions_at_json_boundary() -> None:
+    repository = RecordingRepository()
+    activity = RecordingActivity()
+    agent = StructuredAgent()
+    runner = build_runner(repository, agent, activity)
+    context = agent.respond(None).structured_context
+    resolutions = (
+        IntakeEntityResolution(
+            entity_type="PERSON",
+            canonical_name="刘希川",
+            mention="刘希川",
+            organization="中国建筑第二工程局有限公司",
+            confirmed_by="USER_INPUT",
+        ),
+        IntakeEntityResolution(
+            entity_type="ORGANIZATION",
+            canonical_name="中国建筑第二工程局有限公司",
+            mention="中国建筑第二工程局有限公司",
+            confirmed_by="USER_INPUT",
+        ),
+    )
+    runner._run_identity_loop = lambda *_args, **_kwargs: IntakeIdentityLoopResult(
+        context=context,
+        resolutions=resolutions,
+        confirmation=None,
+        stop_reason="READY",
+        tool_calls=0,
+    )
+    request = IntakeChatRequest(
+        session_id=uuid4(),
+        messages=[
+            {
+                "role": "user",
+                "content": "今晚和中国建筑第二工程局有限公司刘希川吃饭",
+            }
+        ],
+    )
+
+    result = runner.run_chat(request)
+
+    assert result.status == "AWAITING_FINAL_CONFIRMATION"
+    assert all(
+        isinstance(item, dict)
+        for item in result.structured_context["entity_resolutions"]
+    )
 
 
 def test_runner_replays_duplicate_without_model_or_version_change() -> None:

@@ -241,6 +241,19 @@ class IntakeRunner:
     def run_chat(self, request: IntakeChatRequest) -> IntakeSession:
         session_id = str(request.session_id)
         self.activity.update(session_id, "THINKING", "大模型正在理解当前对话")
+        try:
+            return self._run_chat(request)
+        except Exception:
+            self.activity.update(
+                session_id,
+                "FAILED",
+                "本轮对话处理失败，请稍后重试。",
+                active=False,
+            )
+            raise
+
+    def _run_chat(self, request: IntakeChatRequest) -> IntakeSession:
+        session_id = str(request.session_id)
         intake_session = self.repository.get(session_id)
         incoming_messages = [message.model_dump() for message in request.messages]
 
@@ -271,7 +284,17 @@ class IntakeRunner:
         try:
             result = self.agent.respond(request)
         except (LLMUnavailable, LLMCallFailed):
-            result = self._fallback_result(request)
+            result = self._fallback_result(
+                request,
+                previous_context=IntakeStructuredContext.model_validate(
+                    intake_session.structured_context or {}
+                )
+                if intake_session
+                else None,
+                previous_analysis_input=intake_session.analysis_input
+                if intake_session
+                else None,
+            )
 
         self.activity.update(session_id, "CHECKING_CONTEXT", "正在检查关键人信息")
         source = "\n".join(
@@ -637,15 +660,27 @@ class IntakeRunner:
         )
 
     @staticmethod
-    def _fallback_result(request: IntakeChatRequest) -> IntakeChatResult:
+    def _fallback_result(
+        request: IntakeChatRequest,
+        *,
+        previous_context: IntakeStructuredContext | None = None,
+        previous_analysis_input: str | None = None,
+    ) -> IntakeChatResult:
         user_text = "\n".join(
             message.content for message in request.messages if message.role == "user"
         ).strip()
         return IntakeChatResult(
             assistant_reply="信息采集助手暂时不可用。请补充涉及的人物或企业，以及希望分析的事项。",
-            analysis_input=(user_text or "请补充本次分析信息。")[-10_000:],
+            analysis_input=(
+                previous_analysis_input or user_text or "请补充本次分析信息。"
+            )[-10_000:],
             ready_to_analyze=False,
             missing_information=["人物、企业或项目", "希望分析或推动的事项"],
+            structured_context=(
+                previous_context.model_copy(deep=True)
+                if previous_context is not None
+                else IntakeStructuredContext()
+            ),
         )
 
     def _lookup_internal(

@@ -113,6 +113,7 @@ class IntakeIdentityLoop:
         resolutions = list(context.entity_resolutions)
         confirmation = previous_confirmation
         tool_calls = 0
+        turn_tool_actions: set[IntakeAction] = set()
         guard = RepeatedActionGuard(self.max_repeated_actions)
 
         self._checkpoint(checkpoint, context, confirmation)
@@ -120,7 +121,11 @@ class IntakeIdentityLoop:
             requested_action = context.next_action
             action = self.validator.validate(requested_action)
             action = self._apply_hard_constraints(
-                action, context, confirmation, hard_gate
+                action,
+                context,
+                confirmation,
+                hard_gate,
+                turn_tool_actions=turn_tool_actions,
             )
             self._record_action(iteration, requested_action, action)
 
@@ -171,6 +176,7 @@ class IntakeIdentityLoop:
                 )
 
             tool_calls += 1
+            turn_tool_actions.add(action)
             previous_criteria = list(context.success_criteria)
             query = self._controlled_query(context)
             technical_status: Literal["SUCCESS", "FAILED"] = "SUCCESS"
@@ -178,14 +184,21 @@ class IntakeIdentityLoop:
             additions: list[IntakeEntityResolution] = []
             try:
                 if action == "SEARCH_INTERNAL":
-                    raw_additions, confirmation = lookup_internal(context)
+                    raw_additions, observed_confirmation = lookup_internal(context)
                 else:
                     if confirmation is None:
                         raise ValueError("公网身份查询缺少内部候选 Observation")
-                    raw_additions, confirmation = lookup_public(context, confirmation)
+                    raw_additions, observed_confirmation = lookup_public(
+                        context, confirmation
+                    )
                 additions = [
                     IntakeEntityResolution.model_validate(item) for item in raw_additions
                 ]
+                confirmation = self._merge_confirmation(
+                    confirmation,
+                    observed_confirmation,
+                    additions,
+                )
             except Exception as exc:
                 additions = []
                 technical_status = "FAILED"
@@ -322,6 +335,15 @@ class IntakeIdentityLoop:
         data["entity_resolutions"] = [item.model_dump(mode="json") for item in resolutions]
         data["tool_attempts"] = [item.model_dump(mode="json") for item in tool_attempts]
         if controlled_context is not None:
+            controlled_data = controlled_context.model_dump(mode="json")
+            for field in (
+                "people",
+                "people_details",
+                "organizations",
+                "entity_assessments",
+            ):
+                if not data.get(field) and controlled_data.get(field):
+                    data[field] = controlled_data[field]
             data["final_confirmation"] = (
                 controlled_context.final_confirmation.model_dump(mode="json")
                 if controlled_context.final_confirmation
@@ -344,7 +366,10 @@ class IntakeIdentityLoop:
         context: IntakeStructuredContext,
         confirmation: ConfirmationRequest | None,
         hard_gate: Callable[[IntakeStructuredContext], bool],
+        *,
+        turn_tool_actions: set[IntakeAction] | None = None,
     ) -> IntakeAction:
+        turn_tool_actions = turn_tool_actions or set()
         current_query = IntakeIdentityLoop._controlled_query(context)
         attempts = {
             item.action
@@ -358,6 +383,15 @@ class IntakeIdentityLoop:
             and item.technical_status == "SUCCESS"
             and item.information_status == "NO_RESULT"
         }
+        if action == "SEARCH_INTERNAL" and "SEARCH_INTERNAL" in turn_tool_actions:
+            needs_public_search = confirmation is not None and any(
+                len(item.candidates) != 1 for item in confirmation.items
+            )
+            if needs_public_search and "SEARCH_PUBLIC" not in turn_tool_actions:
+                return "SEARCH_PUBLIC"
+            return "READY" if hard_gate(context) else "ASK_USER"
+        if action == "SEARCH_PUBLIC" and "SEARCH_PUBLIC" in turn_tool_actions:
+            return "READY" if hard_gate(context) else "ASK_USER"
         if action == "ASK_USER" and IntakeIdentityLoop._asks_only_optional_fields(
             context
         ):
@@ -373,6 +407,13 @@ class IntakeIdentityLoop:
             if confirmation is not None and "SEARCH_PUBLIC" not in attempts:
                 return "SEARCH_PUBLIC"
             return "ASK_USER"
+        if action == "SEARCH_INTERNAL" and "SEARCH_INTERNAL" in attempts:
+            needs_public_search = confirmation is not None and any(
+                len(item.candidates) != 1 for item in confirmation.items
+            )
+            if needs_public_search and "SEARCH_PUBLIC" not in attempts:
+                return "SEARCH_PUBLIC"
+            return "READY" if hard_gate(context) else "ASK_USER"
         if action == "SEARCH_PUBLIC" and "SEARCH_INTERNAL" not in attempts:
             return "SEARCH_INTERNAL"
         if action == "SEARCH_PUBLIC" and confirmation is None:
@@ -464,6 +505,28 @@ class IntakeIdentityLoop:
             value = IntakeEntityResolution.model_validate(item)
             merged[(value.entity_type, value.mention)] = value
         return list(merged.values())
+
+    @staticmethod
+    def _merge_confirmation(
+        existing: ConfirmationRequest | None,
+        observed: ConfirmationRequest | None,
+        additions: list[IntakeEntityResolution],
+    ) -> ConfirmationRequest | None:
+        resolved = {(item.entity_type, item.mention) for item in additions}
+        items = {}
+        for request in (existing, observed):
+            if request is None:
+                continue
+            for item in request.items:
+                key = (item.entity_type, item.mention)
+                if key not in resolved:
+                    items[key] = item
+        if not items:
+            return None
+        source = observed or existing
+        if source is None:
+            return None
+        return ConfirmationRequest(version=source.version, items=list(items.values()))
 
     @staticmethod
     def _waiting_context(

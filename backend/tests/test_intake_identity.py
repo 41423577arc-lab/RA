@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import get_args
 
 import pytest
@@ -445,6 +446,21 @@ def test_intake_contract_has_one_canonical_action_set_and_reserved_types() -> No
     }
 
 
+def test_intake_prompts_do_not_reintroduce_legacy_actions() -> None:
+    prompt_dir = Path(__file__).parents[1] / "prompts"
+    forbidden = {
+        "LOOKUP_INTERNAL",
+        "PROPOSE_READY",
+        "SEARCH_EXTERNAL",
+        "REQUEST_CONFIRMATION",
+    }
+
+    for prompt_path in prompt_dir.glob("intake*_v1.txt"):
+        content = prompt_path.read_text(encoding="utf-8")
+        for action in forbidden:
+            assert action not in content, f"{prompt_path.name}: {action}"
+
+
 def test_legacy_intake_actions_are_normalized_at_schema_boundary() -> None:
     chat = IntakeChatResult(
         assistant_reply="已记录。",
@@ -658,6 +674,118 @@ def test_intake_identity_loop_resumes_after_internal_public_and_user_reply() -> 
     assert resumed.tool_calls == 1
     assert resumed.context.next_action == "READY"
     assert len(resumed.context.entity_resolutions) == 2
+
+
+def test_identity_loop_keeps_single_internal_candidate_for_user_confirmation() -> None:
+    class DroppingIdentityAgent:
+        def initialize_context(self, _request, extracted_context):
+            return extracted_context.model_copy(
+                update={
+                    "target_fields": ["organization_full_name"],
+                    "next_action": "SEARCH_INTERNAL",
+                    "success_criteria": ["确认中建二局的企业全称"],
+                }
+            )
+
+        def update_context(
+            self,
+            _request,
+            old_context,
+            *,
+            extracted_context=None,
+            tool_observation=None,
+        ):
+            assert tool_observation is not None
+            return old_context.model_copy(
+                update={
+                    "people": [],
+                    "people_details": [],
+                    "organizations": [],
+                    "next_action": "SEARCH_INTERNAL",
+                }
+            )
+
+    request = IntakeChatRequest(
+        messages=[{"role": "user", "content": "今晚和中建二局刘希川吃饭"}]
+    )
+    candidate = CandidateOption(
+        candidate_id="internal:customer:C024",
+        entity_type="ORGANIZATION",
+        canonical_name="中建二局安装工程有限公司",
+        reason="内部客户库命中一个候选",
+        confidence=0.75,
+    )
+    confirmation = ConfirmationRequest(
+        version=1,
+        items=[
+            ConfirmationItem(
+                mention="中建二局",
+                entity_type="ORGANIZATION",
+                candidates=[candidate],
+            )
+        ],
+    )
+    person_resolution = IntakeEntityResolution(
+        entity_type="PERSON",
+        canonical_name="刘希川",
+        mention="刘希川",
+        organization="中建二局",
+        confirmed_by="USER_INPUT",
+    ).model_dump(mode="json")
+    internal_calls = 0
+
+    def lookup_internal(_context):
+        nonlocal internal_calls
+        internal_calls += 1
+        return [person_resolution], confirmation
+
+    result = IntakeIdentityLoop(
+        DroppingIdentityAgent(), _EventRecorder(), str(request.session_id)
+    ).run(
+        request,
+        IntakeStructuredContext(
+            people=["刘希川"],
+            people_details=[
+                IntakePersonCandidate(name="刘希川", organization="中建二局")
+            ],
+            organizations=["中建二局"],
+        ),
+        None,
+        lookup_internal=lookup_internal,
+        lookup_public=lambda _context, current: ([], current),
+        hard_gate=_identity_hard_gate,
+    )
+
+    assert internal_calls == 1
+    assert result.stop_reason == "WAITING_USER"
+    assert result.confirmation == confirmation
+    assert result.context.people == ["刘希川"]
+    assert result.context.organizations == ["中建二局"]
+    assert result.context.people_details[0].organization == "中建二局"
+    assert [attempt.query for attempt in result.context.tool_attempts] == [
+        "人物:刘希川；企业:中建二局"
+    ]
+
+
+def test_identity_loop_empty_result_does_not_clear_pending_confirmation() -> None:
+    confirmation = ConfirmationRequest(
+        version=3,
+        items=[
+            ConfirmationItem(
+                mention="中建二局",
+                entity_type="ORGANIZATION",
+                candidates=[],
+            )
+        ],
+    )
+
+    merged = IntakeIdentityLoop._merge_confirmation(
+        confirmation,
+        None,
+        [],
+    )
+
+    assert merged == confirmation
 
 
 def test_intake_identity_loop_hard_gate_verifies_clear_identity() -> None:
