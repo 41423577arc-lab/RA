@@ -94,6 +94,7 @@ class IntakeQueryExecutor:
                 pending,
                 self.automatic_threshold,
             )
+
             typed_resolutions = [
                 IntakeEntityResolution.model_validate(item)
                 for item in resolutions[: plan.result_limit]
@@ -129,6 +130,13 @@ class IntakeQueryExecutor:
                 information_status="NO_RESULT",
                 error=f"{type(exc).__name__}: {exc}"[:1_000],
             )
+
+    def controlled_query(
+        self,
+        plan: QueryPlan,
+        context: IntakeStructuredContext,
+    ) -> str:
+        return self._executed_query(self._controlled_context(plan, context))
 
     @staticmethod
     def _controlled_context(

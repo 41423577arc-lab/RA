@@ -11,6 +11,7 @@ from app.services.intake.agent_loop import (
     AgentState,
     AgentTurn,
     IntakeContextPatch,
+    MechanicalIntakeAgentLoop,
     QueryPlan,
     ToolObservation,
 )
@@ -69,7 +70,7 @@ def test_context_patch_uses_canonical_context_field_validation() -> None:
     patch = IntakeContextPatch(
         updates={
             "organizations": ["中国建筑第二工程局有限公司"],
-            "next_action": "ASK_USER",
+            "target_fields": ["organization_full_name"],
         }
     )
 
@@ -351,3 +352,204 @@ def test_query_executor_calls_existing_public_candidate_service() -> None:
     assert observation.technical_status == "SUCCESS"
     assert observation.information_status == "NO_RESULT"
     assert observation.confirmation == confirmation
+
+
+class _DecisionProvider:
+    def __init__(self, turns=None, error: Exception | None = None):
+        self.turns = list(turns or [])
+        self.error = error
+        self.states = []
+
+    def decide(self, state):
+        self.states.append(state)
+        if self.error:
+            raise self.error
+        return self.turns.pop(0)
+
+
+def _agent_turn(action, *, question=None) -> AgentTurn:
+    if action == "ASK_USER":
+        return AgentTurn(
+            skill="identity_resolution",
+            next_action=action,
+            user_message=question or "请确认目标人物和企业。",
+            reason="仍需用户确认",
+        )
+    if action == "READY":
+        return AgentTurn(
+            skill="intake_readiness",
+            next_action=action,
+            reason="身份信息已经完整",
+        )
+    return AgentTurn(
+        skill="internal_lookup"
+        if action == "SEARCH_INTERNAL"
+        else "public_lookup",
+        next_action=action,
+        query_plan=_query_plan(action),
+        reason="需要继续查询身份",
+    )
+
+
+def _mechanical_loop(provider, backend, **limits) -> MechanicalIntakeAgentLoop:
+    return MechanicalIntakeAgentLoop(
+        provider,
+        IntakeQueryExecutor(backend),
+        IntakeStateReducer,
+        **limits,
+    )
+
+
+def test_mechanical_loop_runs_internal_public_then_waits_for_user() -> None:
+    confirmation = ConfirmationRequest(
+        version=1,
+        items=[
+            ConfirmationItem(
+                mention="刘希川",
+                entity_type="PERSON",
+                candidates=[],
+            )
+        ],
+    )
+    provider = _DecisionProvider(
+        [
+            _agent_turn("SEARCH_INTERNAL"),
+            _agent_turn("SEARCH_PUBLIC"),
+            _agent_turn("ASK_USER"),
+        ]
+    )
+    backend = _CandidateBackend(
+        internal_result=([], confirmation),
+        public_result=confirmation,
+    )
+    checkpoints = []
+
+    result = _mechanical_loop(provider, backend).run(
+        _context(),
+        version=1,
+        source_text="今晚和中建二局刘希川吃饭",
+        hard_gate=lambda _context: False,
+        external_normalizer=lambda *_: None,
+        checkpoint=lambda context, pending: checkpoints.append((context, pending)),
+    )
+
+    assert result.stop_reason == "WAITING_USER"
+    assert result.tool_calls == 2
+    assert [item.action for item in result.state.context.tool_attempts[-2:]] == [
+        "SEARCH_INTERNAL",
+        "SEARCH_PUBLIC",
+    ]
+    assert result.state.context.user_question == "请确认目标人物和企业。"
+    assert result.confirmation == confirmation
+    assert len(checkpoints) == 4
+
+
+def test_mechanical_loop_python_hard_gate_can_promote_ask_user_to_ready() -> None:
+    context = _context().model_copy(
+        update={
+            "entity_resolutions": [
+                *_context().entity_resolutions,
+                IntakeEntityResolution(
+                    entity_type="ORGANIZATION",
+                    canonical_name="中建二局",
+                    mention="中建二局",
+                    confirmed_by="USER_INPUT",
+                ),
+            ]
+        }
+    )
+    provider = _DecisionProvider([_agent_turn("ASK_USER")])
+
+    result = _mechanical_loop(provider, _CandidateBackend()).run(
+        context,
+        version=1,
+        source_text=None,
+        hard_gate=lambda value: len(value.entity_resolutions) == 2,
+    )
+
+    assert result.stop_reason == "READY"
+    assert result.tool_calls == 0
+    assert result.state.context.next_action == "READY"
+
+
+def test_mechanical_loop_rejects_model_ready_before_hard_gate() -> None:
+    provider = _DecisionProvider(
+        [_agent_turn("READY"), _agent_turn("ASK_USER")]
+    )
+
+    result = _mechanical_loop(provider, _CandidateBackend()).run(
+        _context().model_copy(update={"tool_attempts": []}),
+        version=1,
+        source_text=None,
+        hard_gate=lambda _context: False,
+    )
+
+    assert result.stop_reason == "WAITING_USER"
+    assert result.tool_calls == 1
+    assert result.state.context.tool_attempts[-1].action == "SEARCH_INTERNAL"
+
+
+def test_mechanical_loop_stops_duplicate_controlled_query() -> None:
+    provider = _DecisionProvider(
+        [_agent_turn("SEARCH_INTERNAL"), _agent_turn("SEARCH_INTERNAL")]
+    )
+
+    result = _mechanical_loop(provider, _CandidateBackend()).run(
+        _context(),
+        version=1,
+        source_text=None,
+        hard_gate=lambda _context: False,
+    )
+
+    assert result.stop_reason == "REPEATED_ACTION"
+    assert result.tool_calls == 1
+    assert "相同身份查询" in result.state.context.user_question
+
+
+def test_mechanical_loop_preserves_context_when_model_fails() -> None:
+    context = _context()
+    provider = _DecisionProvider(error=RuntimeError("模型输出校验失败"))
+
+    result = _mechanical_loop(provider, _CandidateBackend()).run(
+        context,
+        version=1,
+        source_text=None,
+        hard_gate=lambda _context: False,
+    )
+
+    assert result.stop_reason == "WAITING_USER"
+    assert result.state.context.people == context.people
+    assert result.state.context.organizations == context.organizations
+    assert result.state.context.entity_resolutions == context.entity_resolutions
+    assert result.state.llm_turn_count == 1
+
+
+def test_mechanical_loop_enforces_tool_limit() -> None:
+    confirmation = ConfirmationRequest(
+        version=1,
+        items=[
+            ConfirmationItem(
+                mention="刘希川",
+                entity_type="PERSON",
+                candidates=[],
+            )
+        ],
+    )
+    provider = _DecisionProvider(
+        [_agent_turn("SEARCH_INTERNAL"), _agent_turn("SEARCH_PUBLIC")]
+    )
+    backend = _CandidateBackend(
+        internal_result=([], confirmation),
+        public_result=confirmation,
+    )
+
+    result = _mechanical_loop(provider, backend, max_tool_calls=1).run(
+        _context(),
+        version=1,
+        source_text=None,
+        hard_gate=lambda _context: False,
+        external_normalizer=lambda *_: None,
+    )
+
+    assert result.stop_reason == "MAX_TOOL_CALLS"
+    assert result.tool_calls == 1
