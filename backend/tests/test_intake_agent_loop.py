@@ -6,6 +6,7 @@ from app.schemas.intake import (
     IntakeStructuredContext,
     IntakeToolAttempt,
 )
+from app.schemas.task import CandidateOption, ConfirmationItem, ConfirmationRequest
 from app.services.intake.agent_loop import (
     AgentState,
     AgentTurn,
@@ -13,6 +14,7 @@ from app.services.intake.agent_loop import (
     QueryPlan,
     ToolObservation,
 )
+from app.services.intake.query_executor import IntakeQueryExecutor
 from app.services.intake.state_reducer import IntakeStateReducer
 
 
@@ -182,3 +184,170 @@ def test_query_plan_contains_semantic_targets_but_no_executable_query() -> None:
     assert plan.action == "SEARCH_INTERNAL"
     assert "query" not in QueryPlan.model_fields
     assert "sql" not in QueryPlan.model_fields
+
+
+class _CandidateBackend:
+    def __init__(
+        self,
+        *,
+        internal_result=([], None),
+        public_result=None,
+        error: Exception | None = None,
+    ):
+        self.internal_result = internal_result
+        self.public_result = public_result
+        self.error = error
+        self.contexts = []
+
+    def lookup_internal(
+        self,
+        context,
+        _version,
+        _source_text,
+        *,
+        raise_on_error,
+    ):
+        assert raise_on_error is True
+        self.contexts.append(context)
+        if self.error:
+            raise self.error
+        return self.internal_result
+
+    def search_key_person_identity_web(
+        self,
+        context,
+        _confirmation,
+        _normalizer,
+        *,
+        raise_on_error,
+    ):
+        assert raise_on_error is True
+        self.contexts.append(context)
+        if self.error:
+            raise self.error
+        return self.public_result
+
+    @staticmethod
+    def apply_automatic_candidates(resolutions, confirmation, _threshold):
+        return resolutions, confirmation
+
+
+def _query_plan(action="SEARCH_INTERNAL") -> QueryPlan:
+    return QueryPlan(
+        action=action,
+        target_fields=["person_organization"],
+        person_mentions=["刘希川"],
+        organization_mentions=["中建二局"],
+    )
+
+
+def test_query_executor_uses_only_names_already_in_context() -> None:
+    backend = _CandidateBackend()
+    plan = QueryPlan(
+        action="SEARCH_INTERNAL",
+        target_fields=["person_organization"],
+        person_mentions=["模型虚构的人名"],
+        organization_mentions=["模型虚构的企业"],
+    )
+
+    observation = IntakeQueryExecutor(backend).execute(
+        plan,
+        _context(),
+        version=1,
+        source_text="今晚和中建二局刘希川吃饭",
+    )
+
+    assert backend.contexts[0].people == ["刘希川"]
+    assert backend.contexts[0].organizations == ["中建二局"]
+    assert observation.executed_query == "人物:刘希川；企业:中建二局"
+
+
+def test_query_executor_returns_typed_partial_observation() -> None:
+    candidate = CandidateOption(
+        candidate_id="internal:customer:C024",
+        entity_type="ORGANIZATION",
+        canonical_name="中建二局安装工程有限公司",
+        reason="内部客户候选",
+        confidence=0.8,
+    )
+    confirmation = ConfirmationRequest(
+        version=1,
+        items=[
+            ConfirmationItem(
+                mention="中建二局",
+                entity_type="ORGANIZATION",
+                candidates=[candidate],
+            )
+        ],
+    )
+    backend = _CandidateBackend(internal_result=([], confirmation))
+
+    observation = IntakeQueryExecutor(backend).execute(
+        _query_plan(),
+        _context(),
+        version=1,
+    )
+
+    assert observation.technical_status == "SUCCESS"
+    assert observation.information_status == "PARTIAL"
+    assert observation.confirmation.items[0].candidates[0] == candidate
+
+
+def test_query_executor_distinguishes_empty_result_from_tool_failure() -> None:
+    empty = IntakeQueryExecutor(_CandidateBackend()).execute(
+        _query_plan(),
+        _context(),
+        version=1,
+    )
+    failed = IntakeQueryExecutor(
+        _CandidateBackend(error=TimeoutError("MCP 请求超时"))
+    ).execute(
+        _query_plan(),
+        _context(),
+        version=1,
+    )
+
+    assert empty.technical_status == "SUCCESS"
+    assert empty.information_status == "NO_RESULT"
+    assert empty.error is None
+    assert failed.technical_status == "FAILED"
+    assert failed.information_status == "NO_RESULT"
+    assert "MCP 请求超时" in failed.error
+
+
+def test_query_executor_public_search_requires_prior_confirmation() -> None:
+    observation = IntakeQueryExecutor(_CandidateBackend()).execute(
+        _query_plan("SEARCH_PUBLIC"),
+        _context(),
+        version=1,
+    )
+
+    assert observation.technical_status == "FAILED"
+    assert "缺少内部候选" in observation.error
+
+
+def test_query_executor_calls_existing_public_candidate_service() -> None:
+    confirmation = ConfirmationRequest(
+        version=2,
+        items=[
+            ConfirmationItem(
+                mention="刘希川",
+                entity_type="PERSON",
+                candidates=[],
+            )
+        ],
+    )
+    backend = _CandidateBackend(public_result=confirmation)
+
+    observation = IntakeQueryExecutor(backend).execute(
+        _query_plan("SEARCH_PUBLIC"),
+        _context(),
+        version=2,
+        confirmation=confirmation,
+        external_normalizer=lambda *_: None,
+    )
+
+    assert len(backend.contexts) == 1
+    assert observation.technical_status == "SUCCESS"
+    assert observation.information_status == "NO_RESULT"
+    assert observation.confirmation == confirmation
