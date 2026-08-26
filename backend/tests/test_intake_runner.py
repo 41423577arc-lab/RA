@@ -10,6 +10,8 @@ from app.schemas.intake import (
     IntakeEntityResolution,
     IntakeStructuredContext,
 )
+from app.schemas.task import CandidateOption, ConfirmationItem, ConfirmationRequest
+from app.services.intake.agent_loop import AgentTurn, IntakeContextPatch, QueryPlan
 from app.services.intake.identity_loop import IntakeIdentityLoopResult
 from app.services.intake.runner import IntakeChatConflict, IntakeRunner
 from app.services.integrations.llm_client import LLMCallFailed
@@ -85,17 +87,21 @@ class StructuredAgent:
         raise AssertionError("The test replaces the identity loop")
 
 
-def build_runner(repository, agent, activity):
+def build_runner(repository, agent, activity, *, v2_enabled=False, candidates=None):
     return IntakeRunner(
         repository=repository,
         session=SimpleNamespace(get=lambda *_: None, commit=lambda: None),
         agent=agent,
-        entity_candidates=SimpleNamespace(),
+        entity_candidates=candidates or SimpleNamespace(),
         activity=activity,
         settings=SimpleNamespace(
             intake_entity_resolution_enabled=True,
             intake_react_enabled=True,
+            intake_agent_v2_enabled=v2_enabled,
             llm_web_identity_threshold=0.8,
+            agent_max_loops=8,
+            agent_max_tool_calls=4,
+            agent_max_repeated_actions=2,
         ),
     )
 
@@ -306,3 +312,117 @@ def test_runner_rejects_message_prefix_conflict_before_model_call() -> None:
         build_runner(repository, MustNotRunAgent(), RecordingActivity()).run_chat(
             request
         )
+
+
+class V2RecordingRepository(RecordingRepository):
+    def __init__(self, intake_session=None):
+        super().__init__(intake_session)
+        self.execution_events = []
+
+    def log_execution_event(self, session_id, **values):
+        self.execution_events.append((session_id, values))
+
+
+class V2CandidateAgent:
+    def __init__(self):
+        self.turns = 0
+
+    def respond(self, _request):
+        raise AssertionError("V2 不应再调用旧 intake_chat 节点")
+
+    def decide_turn(self, _request, _state):
+        self.turns += 1
+        if self.turns == 1:
+            return AgentTurn(
+                context_patch=IntakeContextPatch(
+                    updates={
+                        "people": ["刘希川"],
+                        "organizations": ["中建二局"],
+                        "target_fields": ["organization_full_name"],
+                    }
+                ),
+                skill="internal_lookup",
+                next_action="SEARCH_INTERNAL",
+                query_plan=QueryPlan(
+                    action="SEARCH_INTERNAL",
+                    target_fields=["organization_full_name"],
+                    person_mentions=["刘希川"],
+                    organization_mentions=["中建二局"],
+                ),
+                reason="先查询内部身份候选",
+            )
+        return AgentTurn(
+            skill="identity_resolution",
+            next_action="ASK_USER",
+            user_message="请确认中建二局对应的企业全称。",
+            reason="内部候选需要用户确认",
+        )
+
+
+class V2Candidates:
+    def lookup_internal(
+        self,
+        _context,
+        version,
+        _source,
+        *,
+        raise_on_error=False,
+    ):
+        assert raise_on_error is True
+        candidate = CandidateOption(
+            candidate_id="internal:customer:C024",
+            entity_type="ORGANIZATION",
+            canonical_name="中建二局安装工程有限公司",
+            reason="内部客户候选",
+            confidence=0.8,
+        )
+        return [], ConfirmationRequest(
+            version=version,
+            items=[
+                ConfirmationItem(
+                    mention="中建二局",
+                    entity_type="ORGANIZATION",
+                    candidates=[candidate],
+                )
+            ],
+        )
+
+    @staticmethod
+    def apply_automatic_candidates(resolutions, confirmation, _threshold):
+        return resolutions, confirmation
+
+
+def test_runner_v2_loop_returns_candidate_confirmation_and_checkpoints() -> None:
+    repository = V2RecordingRepository()
+    activity = RecordingActivity()
+    agent = V2CandidateAgent()
+    request = IntakeChatRequest(
+        session_id=uuid4(),
+        messages=[{"role": "user", "content": "今晚和中建二局刘希川吃饭"}],
+    )
+
+    result = build_runner(
+        repository,
+        agent,
+        activity,
+        v2_enabled=True,
+        candidates=V2Candidates(),
+    ).run_chat(request)
+
+    assert result.status == "NEEDS_CONFIRMATION"
+    assert result.confirmation_request["items"][0]["candidates"][0][
+        "canonical_name"
+    ] == "中建二局安装工程有限公司"
+    assert result.structured_context["people"] == ["刘希川"]
+    assert result.structured_context["organizations"] == ["中建二局"]
+    assert result.structured_context["tool_attempts"][0]["action"] == (
+        "SEARCH_INTERNAL"
+    )
+    assert result.structured_context["entity_resolutions"] == []
+    assert result.structured_context["next_action"] == "ASK_USER"
+    assert any(repository.updated)
+    event_types = [item[1]["event_type"] for item in repository.execution_events]
+    assert "AGENT_ACTION" in event_types
+    assert "AGENT_OBSERVATION" in event_types
+    assert activity.events[-1][1] == "COMPLETED"
+    assert activity.events[-1][3]["active"] is False

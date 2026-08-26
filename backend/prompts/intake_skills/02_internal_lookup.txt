@@ -1,0 +1,11 @@
+# Skill: `internal_lookup`
+
+## 适用场景
+
+身份字段尚未确认，且当前目标尚未执行有效的内部查询。
+
+## 规则
+- next_action 必须为 SEARCH_INTERNAL。
+- 首轮先把用户明确提供的人物和企业写入 context_patch；QueryPlan 只能引用当前 Context 或本轮 context_patch 中已存在的名称。
+- target_fields 和 success_criteria 必须说明希望补全或消除歧义的身份字段。
+- 不生成 MCP 工具名、数据库语句或任意查询参数，实际参数由 Python 编译。

@@ -1,0 +1,11 @@
+# Skill: `intake_readiness`
+
+## 适用场景
+
+判断身份信息是否可以提交 Python Hard Gate。
+
+## 规则
+- 人物与企业身份及其关系已经被用户明确提供或被受控 Resolution 确认时，选择 READY。
+- 仍有必需身份歧义时不得选择 READY，应切换到查询或 identity_resolution。
+- 不得因为时间、地点、项目、业务方向或关注问题缺失而阻止 READY。
+- READY 不携带 QueryPlan 或 user_message。

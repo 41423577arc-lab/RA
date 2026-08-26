@@ -73,7 +73,8 @@ class IntakeQueryExecutor:
                 resolutions, pending = self.candidates.lookup_internal(
                     controlled_context,
                     version,
-                    source_text,
+                    # 显式搜索必须查询内部数据，不能被“用户已给出标准姓名”短路。
+                    None,
                     raise_on_error=True,
                 )
             else:
@@ -106,6 +107,7 @@ class IntakeQueryExecutor:
             information_status = self._information_status(
                 typed_resolutions,
                 limited_confirmation,
+                plan.target_fields,
             )
             return ToolObservation(
                 action=plan.action,
@@ -151,6 +153,9 @@ class IntakeQueryExecutor:
             plan.organization_mentions,
             context.organizations,
         )
+        # 现有候选服务是单目标查询，按白名单校验后的计划顺序执行。
+        people = people[:1]
+        organizations = organizations[:1]
         return context.model_copy(
             update={
                 "people": people,
@@ -166,12 +171,16 @@ class IntakeQueryExecutor:
     def _allowed_mentions(requested: list[str], known: list[str]) -> list[str]:
         if not requested:
             return list(known)
-        requested_keys = {IntakeQueryExecutor._normalize(item) for item in requested}
-        selected = [
-            item
-            for item in known
-            if IntakeQueryExecutor._normalize(item) in requested_keys
-        ]
+        known_by_key = {
+            IntakeQueryExecutor._normalize(item): item for item in known
+        }
+        selected = list(
+            dict.fromkeys(
+                known_by_key[key]
+                for item in requested
+                if (key := IntakeQueryExecutor._normalize(item)) in known_by_key
+            )
+        )
         return selected or list(known)
 
     @staticmethod
@@ -206,15 +215,67 @@ class IntakeQueryExecutor:
     def _information_status(
         resolutions: list[IntakeEntityResolution],
         confirmation: ConfirmationRequest | None,
+        target_fields: list[str],
     ) -> str:
-        if resolutions and confirmation is None:
+        if not target_fields:
+            if resolutions and confirmation is None:
+                return "RESOLVED"
+            if resolutions or (
+                confirmation
+                and any(item.candidates for item in confirmation.items)
+            ):
+                return "PARTIAL"
+            return "NO_RESULT"
+
+        satisfied_count = sum(
+            any(
+                IntakeQueryExecutor._resolution_satisfies_target(
+                    resolution, target_field
+                )
+                for resolution in resolutions
+            )
+            for target_field in target_fields
+        )
+        if satisfied_count == len(target_fields) and confirmation is None:
             return "RESOLVED"
-        if resolutions or (
+        if satisfied_count or (
             confirmation
             and any(item.candidates for item in confirmation.items)
         ):
             return "PARTIAL"
         return "NO_RESULT"
+
+    @staticmethod
+    def _resolution_satisfies_target(
+        resolution: IntakeEntityResolution,
+        target_field: str,
+    ) -> bool:
+        normalized = IntakeQueryExecutor._normalize(target_field)
+        organization_tokens = ("organization", "company", "企业", "公司", "单位")
+        person_tokens = ("person", "people", "name", "人物", "姓名")
+        title_tokens = ("title", "position", "role", "职位", "职务")
+
+        needs_organization = any(token in normalized for token in organization_tokens)
+        needs_person = any(token in normalized for token in person_tokens)
+        needs_title = any(token in normalized for token in title_tokens)
+        if needs_person and needs_organization:
+            return bool(
+                resolution.entity_type == "PERSON"
+                and resolution.canonical_name
+                and resolution.organization
+            )
+        if needs_organization:
+            return bool(
+                resolution.entity_type == "ORGANIZATION"
+                or resolution.organization
+            )
+        if needs_title:
+            return bool(resolution.title)
+        if needs_person:
+            return bool(
+                resolution.entity_type == "PERSON" and resolution.canonical_name
+            )
+        return bool(resolution.canonical_name)
 
     @staticmethod
     def _summary(

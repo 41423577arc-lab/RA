@@ -1,7 +1,12 @@
+import json
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
+from app.config import Settings
 from app.schemas.intake import (
+    IntakeChatRequest,
     IntakeEntityResolution,
     IntakeStructuredContext,
     IntakeToolAttempt,
@@ -15,8 +20,14 @@ from app.services.intake.agent_loop import (
     QueryPlan,
     ToolObservation,
 )
+from app.services.intake.agent import IntakeAgent
+from app.services.intake.entity_candidates import IntakeEntityCandidateService
 from app.services.intake.query_executor import IntakeQueryExecutor
 from app.services.intake.state_reducer import IntakeStateReducer
+from app.services.integrations.llm_client import StructuredLLM
+
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def _context() -> IntakeStructuredContext:
@@ -59,10 +70,10 @@ def test_agent_state_keeps_business_facts_only_in_structured_context() -> None:
 
 
 def test_context_patch_rejects_python_controlled_fields() -> None:
-    with pytest.raises(ValidationError, match="不可修改字段"):
+    with pytest.raises(ValidationError):
         IntakeContextPatch(updates={"entity_resolutions": []})
 
-    with pytest.raises(ValidationError, match="不可修改字段"):
+    with pytest.raises(ValidationError):
         IntakeContextPatch(updates={"tool_attempts": []})
 
 
@@ -77,6 +88,16 @@ def test_context_patch_uses_canonical_context_field_validation() -> None:
     assert patch.updates["organizations"] == ["中国建筑第二工程局有限公司"]
     with pytest.raises(ValidationError):
         IntakeContextPatch(updates={"organizations": "中建二局"})
+
+
+def test_context_patch_schema_exposes_typed_field_states() -> None:
+    schema = IntakeContextPatch.model_json_schema()
+
+    assert "updates" not in schema["properties"]
+    field_state_schema = schema["properties"]["field_states"]
+    assert field_state_schema["additionalProperties"]["$ref"].endswith(
+        "/IntakeFieldState"
+    )
 
 
 def test_agent_turn_requires_action_specific_payload() -> None:
@@ -121,6 +142,37 @@ def test_reducer_applies_semantic_patch_without_losing_controlled_state() -> Non
     assert reduced.llm_turn_count == 1
 
 
+def test_reducer_does_not_clear_known_facts_with_empty_model_patch() -> None:
+    state = AgentState(
+        context=_context().model_copy(
+            update={
+                "event_type": "宴请",
+                "event_time": "今晚",
+            }
+        )
+    )
+    turn = AgentTurn(
+        context_patch=IntakeContextPatch(
+            people=[],
+            organizations=[],
+            field_states={},
+            event_type=None,
+            event_time=None,
+        ),
+        skill="identity_resolution",
+        next_action="ASK_USER",
+        user_message="请确认企业全称。",
+        reason="模型没有获得新的身份事实",
+    )
+
+    reduced = IntakeStateReducer.apply_turn(state, turn)
+
+    assert reduced.context.people == ["刘希川"]
+    assert reduced.context.organizations == ["中建二局"]
+    assert reduced.context.event_type == "宴请"
+    assert reduced.context.event_time == "今晚"
+
+
 def test_reducer_records_typed_observation_without_promoting_candidate() -> None:
     state = AgentState(context=_context(), loop_count=1, llm_turn_count=1)
     observation = ToolObservation(
@@ -140,6 +192,42 @@ def test_reducer_records_typed_observation_without_promoting_candidate() -> None
     assert reduced.context.tool_attempts[-1].information_status == "PARTIAL"
     assert reduced.loop_count == 1
     assert reduced.llm_turn_count == 1
+
+
+def test_reducer_promotes_controlled_person_relationship_to_organization() -> None:
+    context = IntakeStructuredContext(people=["刘总", "刘希川"])
+    observation = ToolObservation(
+        action="SEARCH_INTERNAL",
+        target_fields=["organization"],
+        executed_query="人物:刘希川",
+        technical_status="SUCCESS",
+        information_status="RESOLVED",
+        resolutions=[
+            IntakeEntityResolution(
+                candidate_id="internal:contact:CC023",
+                entity_type="PERSON",
+                canonical_name="刘希川",
+                mention="刘希川",
+                organization="中国建筑第二工程局有限公司",
+                confirmed_by="INTERNAL",
+            )
+        ],
+        summary="内部查询已补全所属企业",
+    )
+
+    reduced = IntakeStateReducer.apply_observation(
+        AgentState(context=context), observation
+    )
+
+    assert reduced.context.people == ["刘希川"]
+    assert reduced.context.organizations == ["中国建筑第二工程局有限公司"]
+    assert {
+        (item.entity_type, item.canonical_name)
+        for item in reduced.context.entity_resolutions
+    } == {
+        ("PERSON", "刘希川"),
+        ("ORGANIZATION", "中国建筑第二工程局有限公司"),
+    }
 
 
 def test_tool_observation_distinguishes_technical_failure() -> None:
@@ -199,6 +287,7 @@ class _CandidateBackend:
         self.public_result = public_result
         self.error = error
         self.contexts = []
+        self.source_texts = []
 
     def lookup_internal(
         self,
@@ -210,6 +299,7 @@ class _CandidateBackend:
     ):
         assert raise_on_error is True
         self.contexts.append(context)
+        self.source_texts.append(_source_text)
         if self.error:
             raise self.error
         return self.internal_result
@@ -260,7 +350,103 @@ def test_query_executor_uses_only_names_already_in_context() -> None:
 
     assert backend.contexts[0].people == ["刘希川"]
     assert backend.contexts[0].organizations == ["中建二局"]
+    assert backend.source_texts == [None]
     assert observation.executed_query == "人物:刘希川；企业:中建二局"
+
+
+def test_query_executor_prioritizes_latest_planned_full_name() -> None:
+    backend = _CandidateBackend()
+    context = IntakeStructuredContext(people=["刘总", "刘希川"])
+    plan = QueryPlan(
+        action="SEARCH_INTERNAL",
+        target_fields=["identity", "organization"],
+        person_mentions=["刘希川", "刘总"],
+    )
+
+    observation = IntakeQueryExecutor(backend).execute(
+        plan,
+        context,
+        version=1,
+    )
+
+    assert backend.contexts[0].people == ["刘希川"]
+    assert observation.executed_query == "人物:刘希川"
+
+
+def test_internal_search_queries_confirmed_person_to_complete_organization() -> None:
+    class Projects:
+        def __init__(self):
+            self.calls = []
+
+        async def find_entity_candidates(self, person, organization):
+            self.calls.append((person, organization))
+            return [
+                {
+                    "candidate_id": "internal:contact:CC023",
+                    "entity_type": "PERSON",
+                    "canonical_name": "刘希川",
+                    "organization": "中国建筑第二工程局有限公司",
+                    "title": "",
+                    "source": "INTERNAL",
+                    "match_type": "EXACT",
+                }
+            ]
+
+    projects = Projects()
+    candidates = IntakeEntityCandidateService(projects, object())
+    context = IntakeStructuredContext(
+        people=["刘希川"],
+        entity_resolutions=[
+            IntakeEntityResolution(
+                entity_type="PERSON",
+                canonical_name="刘希川",
+                mention="刘希川",
+                confirmed_by="USER_INPUT",
+            )
+        ],
+    )
+    plan = QueryPlan(
+        action="SEARCH_INTERNAL",
+        target_fields=["organization"],
+        person_mentions=["刘希川"],
+    )
+
+    observation = IntakeQueryExecutor(candidates).execute(
+        plan,
+        context,
+        version=1,
+        source_text="今晚和刘希川吃饭",
+    )
+
+    assert projects.calls == [("刘希川", None)]
+    assert observation.information_status == "RESOLVED"
+    assert observation.resolutions[0].organization == "中国建筑第二工程局有限公司"
+
+
+def test_internal_search_does_not_resolve_missing_target_field() -> None:
+    existing_person = IntakeEntityResolution(
+        entity_type="PERSON",
+        canonical_name="刘希川",
+        mention="刘希川",
+        confirmed_by="USER_INPUT",
+    )
+    backend = _CandidateBackend(
+        internal_result=([existing_person.model_dump(mode="json")], None)
+    )
+    plan = QueryPlan(
+        action="SEARCH_INTERNAL",
+        target_fields=["organization"],
+        person_mentions=["刘希川"],
+    )
+
+    observation = IntakeQueryExecutor(backend).execute(
+        plan,
+        IntakeStructuredContext(people=["刘希川"]),
+        version=1,
+    )
+
+    assert observation.technical_status == "SUCCESS"
+    assert observation.information_status == "NO_RESULT"
 
 
 def test_query_executor_returns_typed_partial_observation() -> None:
@@ -472,6 +658,87 @@ def test_mechanical_loop_python_hard_gate_can_promote_ask_user_to_ready() -> Non
     assert result.state.context.next_action == "READY"
 
 
+def test_mechanical_loop_clears_stale_confirmation_after_resolution() -> None:
+    stale_confirmation = ConfirmationRequest(
+        version=1,
+        items=[
+            ConfirmationItem(
+                mention="刘总",
+                entity_type="PERSON",
+                candidates=[],
+            )
+        ],
+    )
+    resolved_person = IntakeEntityResolution(
+        candidate_id="internal:contact:CC023",
+        entity_type="PERSON",
+        canonical_name="刘希川",
+        mention="刘希川",
+        organization="中国建筑第二工程局有限公司",
+        confirmed_by="INTERNAL",
+    )
+    provider = _DecisionProvider(
+        [_agent_turn("SEARCH_INTERNAL"), _agent_turn("READY")]
+    )
+    backend = _CandidateBackend(
+        internal_result=([resolved_person.model_dump(mode="json")], None)
+    )
+
+    result = _mechanical_loop(provider, backend).run(
+        IntakeStructuredContext(people=["刘希川"]),
+        version=1,
+        source_text="今晚和刘希川吃饭",
+        hard_gate=lambda context: {
+            item.entity_type for item in context.entity_resolutions
+        }
+        == {"PERSON", "ORGANIZATION"},
+        confirmation=stale_confirmation,
+    )
+
+    assert result.stop_reason == "READY"
+    assert result.confirmation is None
+    assert result.tool_calls == 1
+
+
+def test_mechanical_loop_pending_confirmation_blocks_ready() -> None:
+    context = _context().model_copy(
+        update={
+            "entity_resolutions": [
+                *_context().entity_resolutions,
+                IntakeEntityResolution(
+                    entity_type="ORGANIZATION",
+                    canonical_name="中建二局",
+                    mention="中建二局",
+                    confirmed_by="USER_INPUT",
+                ),
+            ]
+        }
+    )
+    confirmation = ConfirmationRequest(
+        version=1,
+        items=[
+            ConfirmationItem(
+                mention="中建二局",
+                entity_type="ORGANIZATION",
+                candidates=[],
+            )
+        ],
+    )
+    provider = _DecisionProvider([_agent_turn("READY")])
+
+    result = _mechanical_loop(provider, _CandidateBackend()).run(
+        context,
+        version=1,
+        source_text=None,
+        hard_gate=lambda _context: True,
+        confirmation=confirmation,
+    )
+
+    assert result.stop_reason == "WAITING_USER"
+    assert result.state.context.next_action == "ASK_USER"
+    assert result.confirmation == confirmation
+
+
 def test_mechanical_loop_rejects_model_ready_before_hard_gate() -> None:
     provider = _DecisionProvider(
         [_agent_turn("READY"), _agent_turn("ASK_USER")]
@@ -553,3 +820,80 @@ def test_mechanical_loop_enforces_tool_limit() -> None:
 
     assert result.stop_reason == "MAX_TOOL_CALLS"
     assert result.tool_calls == 1
+
+
+def test_intake_agent_prompt_loads_trusted_skills_in_stable_order() -> None:
+    service = StructuredLLM(
+        Settings(
+            llm_enabled=False,
+            prompt_dir=ROOT / "backend/prompts",
+        )
+    )
+
+    prompt = service._system_prompt("intake_agent")
+
+    skill_names = [
+        "# Skill: `identity_resolution`",
+        "# Skill: `internal_lookup`",
+        "# Skill: `public_lookup`",
+        "# Skill: `intake_readiness`",
+    ]
+    assert all(name in prompt for name in skill_names)
+    assert [prompt.index(name) for name in skill_names] == sorted(
+        prompt.index(name) for name in skill_names
+    )
+    for legacy_action in (
+        "LOOKUP_INTERNAL",
+        "PROPOSE_READY",
+        "SEARCH_EXTERNAL",
+        "REQUEST_CONFIRMATION",
+    ):
+        assert legacy_action not in prompt
+
+
+def test_intake_agent_prompt_action_templates_are_valid_agent_turns() -> None:
+    prompt_path = ROOT / "backend/prompts/intake_agent_v1.txt"
+    lines = prompt_path.read_text(encoding="utf-8").splitlines()
+    templates = {}
+    for index, line in enumerate(lines):
+        if not line.startswith("### 模板 `"):
+            continue
+        action = line.removeprefix("### 模板 `").removesuffix("`")
+        assert lines[index + 2] == "```json"
+        assert lines[index + 4] == "```"
+        templates[action] = lines[index + 3]
+
+    assert set(templates) == {
+        "SEARCH_INTERNAL",
+        "SEARCH_PUBLIC",
+        "ASK_USER",
+        "READY",
+    }
+    for action, raw_template in templates.items():
+        assert raw_template.startswith("{")
+        assert raw_template.endswith("}")
+        parsed = AgentTurn.model_validate(json.loads(raw_template))
+        assert parsed.next_action == action
+
+
+def test_intake_agent_decide_turn_passes_runtime_state_to_llm() -> None:
+    class RecordingLLM:
+        def __init__(self):
+            self.call = None
+
+        def parse(self, *args):
+            self.call = args
+            return _agent_turn("ASK_USER")
+
+    llm = RecordingLLM()
+    request = IntakeChatRequest(
+        messages=[{"role": "user", "content": "今晚和中建二局刘希川吃饭"}]
+    )
+    state = AgentState(context=_context())
+
+    turn = IntakeAgent(llm).decide_turn(request, state)
+
+    assert turn.next_action == "ASK_USER"
+    assert llm.call[1] == "intake_agent"
+    assert llm.call[2]["state"] == state.model_dump(mode="json")
+    assert llm.call[3] is AgentTurn

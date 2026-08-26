@@ -1,13 +1,17 @@
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.schemas.intake import (
     IntakeAction,
     IntakeEntityResolution,
+    IntakeEntityAssessment,
     IntakeEntityType,
+    IntakeFieldState,
+    IntakePersonCandidate,
+    IntakeResolutionResult,
     IntakeStructuredContext,
     IntakeToolAction,
 )
@@ -24,38 +28,44 @@ IntakeSkillName = Literal[
 TechnicalStatus = Literal["SUCCESS", "FAILED"]
 InformationStatus = Literal["RESOLVED", "PARTIAL", "NO_RESULT"]
 
-_CONTROLLED_CONTEXT_FIELDS = {
-    "entity_resolutions",
-    "tool_attempts",
-    "final_confirmation",
-    "next_action",
-    "user_question",
-}
-_PATCHABLE_CONTEXT_FIELDS = (
-    set(IntakeStructuredContext.model_fields) - _CONTROLLED_CONTEXT_FIELDS
-)
-
-
 class IntakeContextPatch(BaseModel):
     """表示单次模型推理建议更新的业务字段。"""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
-    updates: dict[str, Any] = Field(default_factory=dict, max_length=30)
+    people: list[str] = Field(default_factory=list, max_length=20)
+    people_details: list[IntakePersonCandidate] = Field(
+        default_factory=list,
+        max_length=20,
+    )
+    organizations: list[str] = Field(default_factory=list, max_length=20)
+    projects: list[str] = Field(default_factory=list, max_length=20)
+    business_directions: list[str] = Field(default_factory=list, max_length=20)
+    focus_questions: list[str] = Field(default_factory=list, max_length=20)
+    event_type: Literal["宴请", "拜访", "会议", "其他"] | None = None
+    event_time: str | None = None
+    event_location: str | None = None
+    entity_assessments: list[IntakeEntityAssessment] = Field(
+        default_factory=list,
+        max_length=40,
+    )
+    field_states: dict[str, IntakeFieldState] = Field(default_factory=dict)
+    target_fields: list[str] = Field(default_factory=list, max_length=20)
+    success_criteria: list[str] = Field(default_factory=list, max_length=20)
+    resolution_result: IntakeResolutionResult | None = None
 
-    @field_validator("updates")
+    @model_validator(mode="before")
     @classmethod
-    def validate_updates(cls, updates: dict[str, Any]) -> dict[str, Any]:
-        unknown_fields = set(updates) - _PATCHABLE_CONTEXT_FIELDS
-        if unknown_fields:
-            fields = "、".join(sorted(unknown_fields))
-            raise ValueError(f"Context Patch 包含不可修改字段：{fields}")
+    def accept_legacy_updates_wrapper(cls, value):
+        if isinstance(value, dict) and set(value) == {"updates"}:
+            updates = value["updates"]
+            if isinstance(updates, dict):
+                return updates
+        return value
 
-        normalized: dict[str, Any] = {}
-        for field_name, value in updates.items():
-            context = IntakeStructuredContext.model_validate({field_name: value})
-            normalized[field_name] = getattr(context, field_name)
-        return normalized
+    @property
+    def updates(self) -> dict:
+        return self.model_dump(mode="python", exclude_unset=True)
 
 
 class QueryPlan(BaseModel):
@@ -207,6 +217,7 @@ class MechanicalIntakeAgentLoop:
         max_loops: int = 8,
         max_tool_calls: int = 4,
         max_repeated_actions: int = 2,
+        on_observation: Callable[[ToolObservation], None] | None = None,
     ):
         if max_loops < 1:
             raise ValueError("max_loops 必须大于等于 1")
@@ -218,6 +229,7 @@ class MechanicalIntakeAgentLoop:
         self.max_loops = max_loops
         self.max_tool_calls = max_tool_calls
         self.max_repeated_actions = max_repeated_actions
+        self.on_observation = on_observation
 
     def run(
         self,
@@ -275,7 +287,7 @@ class MechanicalIntakeAgentLoop:
                 )
 
             if turn.next_action == "READY":
-                if hard_gate(state.context):
+                if confirmation is None and hard_gate(state.context):
                     return self._finish(
                         state,
                         confirmation,
@@ -340,10 +352,31 @@ class MechanicalIntakeAgentLoop:
                 confirmation=confirmation,
                 external_normalizer=external_normalizer,
             )
+            if self.on_observation is not None:
+                self.on_observation(observation)
             tool_calls += 1
             state = self.reducer.apply_observation(state, observation)
             if observation.confirmation is not None:
                 confirmation = observation.confirmation
+            elif confirmation is not None and observation.resolutions:
+                # 精确 Resolution 可能只缺可选职位，仍应移除已被全名取代的旧称谓。
+                active_mentions = {
+                    *state.context.people,
+                    *state.context.organizations,
+                }
+                remaining_items = [
+                    item
+                    for item in confirmation.items
+                    if item.mention in active_mentions
+                ]
+                confirmation = (
+                    ConfirmationRequest(
+                        version=confirmation.version,
+                        items=remaining_items,
+                    )
+                    if remaining_items
+                    else None
+                )
             self._checkpoint(checkpoint, state.context, confirmation)
 
         state = self._waiting_state(
@@ -366,9 +399,10 @@ class MechanicalIntakeAgentLoop:
         hard_gate: Callable[[IntakeStructuredContext], bool],
     ) -> AgentTurn:
         attempts = {item.action for item in state.context.tool_attempts}
-        if turn.next_action == "ASK_USER" and hard_gate(state.context):
+        gate_ready = confirmation is None and hard_gate(state.context)
+        if turn.next_action == "ASK_USER" and gate_ready:
             return self._ready_turn("身份硬校验已满足")
-        if turn.next_action == "READY" and not hard_gate(state.context):
+        if turn.next_action == "READY" and not gate_ready:
             if "SEARCH_INTERNAL" not in attempts:
                 return self._search_turn("SEARCH_INTERNAL", state.context)
             if (

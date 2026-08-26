@@ -1,0 +1,12 @@
+# Skill: `public_lookup`
+
+## 适用场景
+
+内部查询已经完成，但仍存在零个或多个身份候选，需要公开证据补充。
+
+## 规则
+- next_action 必须为 SEARCH_PUBLIC。
+- 未执行内部查询时不得选择本 Skill。
+- QueryPlan 只能引用当前 Context 和内部候选 Observation 中的目标。
+- 公网候选必须由现有 Tavily 流程取得，并继续接受精确来源页证据校验。
+- 不生成 URL 或 Tavily 请求参数，实际参数由 Python 编译。

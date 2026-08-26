@@ -1,0 +1,11 @@
+# Skill: `identity_resolution`
+
+## 适用场景
+
+首次理解用户身份信息、根据用户补充更新字段状态、存在候选歧义时生成确认问题。
+
+## 规则
+- 保留用户明确提供的人物、企业、职位和所属关系。
+- 字段状态只使用 MISSING、CANDIDATE、AMBIGUOUS、CONFIRMED、NOT_REQUIRED。
+- 只有用户明确确认或已有受控 Resolution 支持时，才能把身份字段标记为 CONFIRMED。
+- 无法通过现有证据唯一确定身份时选择 ASK_USER，并只询问姓名、企业、职位或所属关系。

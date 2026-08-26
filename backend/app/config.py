@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     intake_entity_resolution_enabled: bool = True
     intake_audio_enabled: bool = True
     intake_react_enabled: bool = True
+    intake_agent_v2_enabled: bool = False
     prompt_dir: Path = Path("./backend/prompts")
     detailed_report_template: Path = Path("./backend/templates/detailed_report.md.j2")
     action_brief_template: Path = Path("./backend/templates/action_brief.md.j2")

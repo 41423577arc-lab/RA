@@ -7,6 +7,7 @@ from app.schemas.intake import (
     IntakeReadinessResult,
     IntakeStructuredContext,
 )
+from app.services.intake.agent_loop import AgentState, AgentTurn
 from app.services.intake.defaults import DEFAULT_REQUESTER_CONTEXT
 from app.services.integrations.llm_client import StructuredLLM
 
@@ -24,6 +25,23 @@ class IntakeAgent:
                 "default_requester_context": DEFAULT_REQUESTER_CONTEXT,
             },
             IntakeChatResult,
+        )
+
+    def decide_turn(
+        self,
+        request: IntakeChatRequest,
+        state: AgentState,
+    ) -> AgentTurn:
+        return self.llm.parse(
+            str(request.session_id),
+            "intake_agent",
+            {
+                "messages": [message.model_dump() for message in request.messages],
+                "state": state.model_dump(mode="json"),
+                "previous_success_criteria": state.context.success_criteria,
+                "default_requester_context": DEFAULT_REQUESTER_CONTEXT,
+            },
+            AgentTurn,
         )
 
     def initialize_context(

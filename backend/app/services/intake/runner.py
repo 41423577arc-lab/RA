@@ -13,6 +13,11 @@ from app.schemas.intake import (
 )
 from app.schemas.task import ConfirmationRequest
 from app.services.intake.agent import IntakeAgent
+from app.services.intake.agent_loop import (
+    AgentState,
+    MechanicalIntakeAgentLoop,
+    ToolObservation,
+)
 from app.services.intake.completeness import required_missing_information
 from app.services.intake.defaults import with_default_requester_context
 from app.services.intake.entity_candidates import IntakeEntityCandidateService
@@ -21,7 +26,9 @@ from app.services.intake.field_state import (
     fallback_confirmation_question,
     fields_ready_for_confirmation,
 )
-from app.services.intake.identity_loop import IntakeIdentityLoop
+from app.services.intake.identity_loop import IntakeIdentityLoop, IntakeIdentityLoopResult
+from app.services.intake.query_executor import IntakeQueryExecutor
+from app.services.intake.state_reducer import IntakeStateReducer
 from app.services.integrations.llm_client import LLMCallFailed, LLMUnavailable
 from app.tasks.pipeline import infer_event_type
 
@@ -36,6 +43,103 @@ class IntakeAudioJobNotFound(RuntimeError):
 
 class IntakeAudioJobNotReviewable(RuntimeError):
     pass
+
+
+class _RunnerDecisionProvider:
+    """把当前请求绑定到统一 Intake Agent，并记录每次决策。"""
+
+    def __init__(self, runner, request: IntakeChatRequest, session_id: str):
+        self.runner = runner
+        self.request = request
+        self.session_id = session_id
+
+    def decide(self, state: AgentState):
+        self.runner.activity.update(
+            self.session_id,
+            "THINKING",
+            "大模型正在根据当前状态选择处理 Skill",
+        )
+        turn = self.runner.agent.decide_turn(self.request, state)
+        self.runner.repository.log_execution_event(
+            self.session_id,
+            event_type="AGENT_ACTION",
+            node_name="intake_agent_loop_v2",
+            status="SUCCESS",
+            title="Intake Agent 已选择下一步动作",
+            detail=f"Skill={turn.skill}，Action={turn.next_action}。",
+            payload={"turn": turn.model_dump(mode="json")},
+        )
+        return turn
+
+
+class _RunnerCandidateBackend:
+    """让新执行器复用 Runner 已有的工具事件和 Activity 接线。"""
+
+    def __init__(
+        self,
+        runner,
+        request: IntakeChatRequest,
+        session_id: str,
+    ):
+        self.runner = runner
+        self.request = request
+        self.session_id = session_id
+        self.public_result_pending = False
+
+    def lookup_internal(
+        self,
+        context,
+        version,
+        source_text,
+        *,
+        raise_on_error=False,
+    ):
+        return self.runner._lookup_internal(
+            self.session_id,
+            context,
+            version,
+            source_text,
+            raise_on_error=raise_on_error,
+        )
+
+    def search_key_person_identity_web(
+        self,
+        context,
+        confirmation,
+        external_normalizer,
+        *,
+        raise_on_error=False,
+    ):
+        result = self.runner._lookup_external(
+            self.request,
+            self.session_id,
+            context,
+            confirmation,
+            external_normalizer,
+            raise_on_error=raise_on_error,
+        )
+        self.public_result_pending = True
+        return result
+
+    def apply_automatic_candidates(
+        self,
+        resolutions,
+        confirmation,
+        threshold=0.8,
+    ):
+        result = self.runner.entity_candidates.apply_automatic_candidates(
+            resolutions,
+            confirmation,
+            threshold,
+        )
+        if self.public_result_pending:
+            self.runner._record_external_result(
+                self.session_id,
+                result[0],
+                result[1],
+            )
+            self.public_result_pending = False
+        return result
 
 
 def has_resolved_entities(structured_context: dict) -> bool:
@@ -281,11 +385,15 @@ class IntakeRunner:
             if audio_job.status != "NEEDS_REVIEW":
                 raise IntakeAudioJobNotReviewable("音频当前不能确认转写")
 
-        try:
-            result = self.agent.respond(request)
-        except (LLMUnavailable, LLMCallFailed):
-            result = self._fallback_result(
-                request,
+        source = "\n".join(
+            message.content for message in request.messages if message.role == "user"
+        )
+        v2_capable = bool(
+            getattr(self.settings, "intake_agent_v2_enabled", False)
+        ) and callable(getattr(self.agent, "decide_turn", None))
+        if v2_capable:
+            result = self._v2_seed_result(
+                source,
                 previous_context=IntakeStructuredContext.model_validate(
                     intake_session.structured_context or {}
                 )
@@ -295,13 +403,25 @@ class IntakeRunner:
                 if intake_session
                 else None,
             )
+        else:
+            try:
+                result = self.agent.respond(request)
+            except (LLMUnavailable, LLMCallFailed):
+                result = self._fallback_result(
+                    request,
+                    previous_context=IntakeStructuredContext.model_validate(
+                        intake_session.structured_context or {}
+                    )
+                    if intake_session
+                    else None,
+                    previous_analysis_input=intake_session.analysis_input
+                    if intake_session
+                    else None,
+                )
 
         self.activity.update(session_id, "CHECKING_CONTEXT", "正在检查关键人信息")
-        source = "\n".join(
-            message.content for message in request.messages if message.role == "user"
-        )
         required_missing = required_missing_information(result, source)
-        ready = not required_missing
+        ready = v2_capable or not required_missing
         result.missing_information = required_missing
         next_version = (intake_session.version if intake_session else 0) + 1
         stored_context = with_default_requester_context(
@@ -314,14 +434,24 @@ class IntakeRunner:
             else []
         )
         identity_loop_used = False
+        legacy_capable = callable(
+            getattr(self.agent, "initialize_context", None)
+        ) and callable(getattr(self.agent, "update_context", None))
 
         if (
             self.settings.intake_entity_resolution_enabled
             and self.settings.intake_react_enabled
-            and ready
-            and (result.structured_context.people or result.structured_context.organizations)
-            and callable(getattr(self.agent, "initialize_context", None))
-            and callable(getattr(self.agent, "update_context", None))
+            and (
+                v2_capable
+                or (
+                    ready
+                    and (
+                        result.structured_context.people
+                        or result.structured_context.organizations
+                    )
+                    and legacy_capable
+                )
+            )
         ):
             if intake_session is None:
                 intake_session = self.repository.add(
@@ -572,6 +702,147 @@ class IntakeRunner:
         version: int,
         source: str,
     ):
+        if (
+            getattr(self.settings, "intake_agent_v2_enabled", False)
+            and callable(getattr(self.agent, "decide_turn", None))
+        ):
+            return self._run_agent_loop_v2(
+                request,
+                extracted_context,
+                intake_session,
+                version,
+                source,
+            )
+        return self._run_legacy_identity_loop(
+            request,
+            extracted_context,
+            intake_session,
+            version,
+            source,
+        )
+
+    def _run_agent_loop_v2(
+        self,
+        request: IntakeChatRequest,
+        extracted_context: IntakeStructuredContext,
+        intake_session: IntakeSession | None,
+        version: int,
+        source: str,
+    ) -> IntakeIdentityLoopResult:
+        session_id = str(request.session_id)
+        previous_context = (
+            IntakeStructuredContext.model_validate(
+                intake_session.structured_context or {}
+            )
+            if intake_session and intake_session.version > 0
+            else None
+        )
+        initial_context = previous_context or extracted_context.model_copy(
+            update={
+                "entity_resolutions": [],
+                "tool_attempts": [],
+                "final_confirmation": None,
+            },
+            deep=True,
+        )
+        previous_confirmation = (
+            ConfirmationRequest.model_validate(intake_session.confirmation_request)
+            if intake_session and intake_session.confirmation_request
+            else None
+        )
+
+        def checkpoint(
+            context: IntakeStructuredContext,
+            confirmation: ConfirmationRequest | None,
+        ) -> None:
+            if intake_session is None:
+                return
+            self.repository.update(
+                session_id,
+                structured_context=with_default_requester_context(
+                    context.model_dump(mode="json")
+                ),
+                confirmation_request=confirmation.model_dump(mode="json")
+                if confirmation
+                else None,
+            )
+
+        def record_observation(observation: ToolObservation) -> None:
+            self.activity.update(
+                session_id,
+                "PROCESSING_TOOL_RESULT",
+                "大模型正在根据工具结果更新身份状态",
+                tool_name=(
+                    "lookup_internal_identity"
+                    if observation.action == "SEARCH_INTERNAL"
+                    else "search_key_person_identity_web"
+                ),
+            )
+            self.repository.log_execution_event(
+                session_id,
+                event_type="AGENT_OBSERVATION",
+                node_name="intake_agent_loop_v2",
+                status=observation.technical_status,
+                title="Intake Agent 已接收工具 Observation",
+                detail=observation.error or observation.summary,
+                payload={
+                    "observation": observation.model_dump(mode="json")
+                },
+            )
+
+        candidate_backend = _RunnerCandidateBackend(self, request, session_id)
+        loop = MechanicalIntakeAgentLoop(
+            _RunnerDecisionProvider(self, request, session_id),
+            IntakeQueryExecutor(
+                candidate_backend,
+                automatic_threshold=getattr(
+                    self.settings,
+                    "llm_web_identity_threshold",
+                    0.8,
+                ),
+            ),
+            IntakeStateReducer,
+            max_loops=getattr(self.settings, "agent_max_loops", 8),
+            max_tool_calls=getattr(self.settings, "agent_max_tool_calls", 4),
+            max_repeated_actions=getattr(
+                self.settings,
+                "agent_max_repeated_actions",
+                2,
+            ),
+            on_observation=record_observation,
+        )
+        result = loop.run(
+            initial_context,
+            version=version,
+            source_text=source,
+            hard_gate=lambda context: bool(
+                context.people or context.organizations
+            )
+            and has_resolved_entities(context.model_dump(mode="json")),
+            confirmation=previous_confirmation,
+            external_normalizer=getattr(
+                self.agent,
+                "normalize_external_identity",
+                None,
+            ),
+            checkpoint=checkpoint,
+        )
+        return IntakeIdentityLoopResult(
+            context=result.state.context,
+            resolutions=tuple(result.state.context.entity_resolutions),
+            confirmation=result.confirmation,
+            stop_reason=result.stop_reason,
+            tool_calls=result.tool_calls,
+        )
+
+    def _run_legacy_identity_loop(
+        self,
+        request: IntakeChatRequest,
+        extracted_context: IntakeStructuredContext,
+        intake_session: IntakeSession | None,
+        version: int,
+        source: str,
+    ):
         session_id = str(request.session_id)
         previous_context = (
             IntakeStructuredContext.model_validate(
@@ -657,6 +928,28 @@ class IntakeRunner:
             hard_gate=lambda context: bool(context.people or context.organizations)
             and has_resolved_entities(context.model_dump(mode="json")),
             checkpoint=checkpoint,
+        )
+
+    @staticmethod
+    def _v2_seed_result(
+        source: str,
+        *,
+        previous_context: IntakeStructuredContext | None = None,
+        previous_analysis_input: str | None = None,
+    ) -> IntakeChatResult:
+        return IntakeChatResult(
+            assistant_reply="正在处理本轮信息。",
+            analysis_input=(previous_analysis_input or source or "请补充本次分析信息。")[
+                -10_000:
+            ],
+            ready_to_analyze=False,
+            missing_information=[],
+            structured_context=(
+                previous_context.model_copy(deep=True)
+                if previous_context is not None
+                else IntakeStructuredContext()
+            ),
+            next_action="ASK_USER",
         )
 
     @staticmethod
