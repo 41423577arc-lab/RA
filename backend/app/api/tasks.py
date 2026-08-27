@@ -34,6 +34,8 @@ from app.schemas.task import (
 )
 from app.services.intake.entity_resolver import EntityResolver
 from app.services.agent_config.service import AgentConfigService
+from app.services.auth import Principal, get_current_principal
+from app.services.conversations import ConversationService
 from app.services.reporting.analysis_chat import (
     AnalysisChatAgent,
     build_task_chat_context,
@@ -48,19 +50,60 @@ router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 MAX_AUDIO_BYTES = 30 * 1024 * 1024
 
 
+def _owned_task(
+    session: Session, task_id: str, principal: Principal, *, fresh: bool = False
+) -> ResearchTask | None:
+    repository = TaskRepository(session)
+    task = repository.get_fresh(task_id) if fresh else repository.get(task_id)
+    if task is None:
+        return None
+    if task.owner_id and (
+        task.owner_id != principal.user_id or task.tenant_id != principal.tenant_id
+    ):
+        return None
+    return task
+
+
 @router.post("/text", response_model=TaskCreated, status_code=status.HTTP_202_ACCEPTED)
-def create_text_task(payload: TextTaskRequest, session: Session = Depends(get_session)) -> TaskCreated:
+def create_text_task(
+    payload: TextTaskRequest,
+    principal: Principal = Depends(get_current_principal),
+    session: Session = Depends(get_session),
+) -> TaskCreated:
+    conversations = ConversationService(session)
+    conversation = conversations.create(principal, title=payload.text)
     task = TaskRepository(session).add(
-        ResearchTask(id=str(uuid4()), input_type="text", input_text=payload.text.strip())
+        ResearchTask(
+            id=str(uuid4()),
+            tenant_id=principal.tenant_id,
+            owner_id=principal.user_id,
+            conversation_id=conversation.id,
+            input_type="text",
+            input_text=payload.text.strip(),
+        )
     )
-    AgentConfigService(session, settings).ensure_task_run(task.id)
+    conversations.attach_task(conversation, task)
+    conversations.sync_messages(
+        conversation,
+        [{"role": "user", "content": payload.text.strip()}],
+        channel="intake",
+        author_id=principal.user_id,
+    )
+    AgentConfigService(session, settings).ensure_task_run(
+        task.id,
+        owner_id=principal.user_id,
+        tenant_id=principal.tenant_id,
+        conversation_id=conversation.id,
+    )
     run_research_pipeline.delay(task.id)
     return TaskCreated(task_id=UUID(task.id), input_type="text")
 
 
 @router.post("/audio", response_model=TaskCreated, status_code=status.HTTP_202_ACCEPTED)
 async def create_audio_task(
-    audio: UploadFile = File(...), session: Session = Depends(get_session)
+    audio: UploadFile = File(...),
+    principal: Principal = Depends(get_current_principal),
+    session: Session = Depends(get_session),
 ) -> TaskCreated:
     if audio.content_type != "audio/webm":
         raise HTTPException(status_code=415, detail="仅支持 audio/webm 录音")
@@ -74,17 +117,37 @@ async def create_audio_task(
     settings.audio_dir.mkdir(parents=True, exist_ok=True)
     audio_path = Path(settings.audio_dir) / f"{task_id}.webm"
     audio_path.write_bytes(content)
+    conversations = ConversationService(session)
+    conversation = conversations.create(principal, title="语音调查")
     task = TaskRepository(session).add(
-        ResearchTask(id=task_id, input_type="audio", audio_path=str(audio_path))
+        ResearchTask(
+            id=task_id,
+            tenant_id=principal.tenant_id,
+            owner_id=principal.user_id,
+            conversation_id=conversation.id,
+            input_type="audio",
+            audio_path=str(audio_path),
+        )
     )
-    AgentConfigService(session, settings).ensure_task_run(task.id)
+    conversations.attach_task(conversation, task)
+    session.commit()
+    AgentConfigService(session, settings).ensure_task_run(
+        task.id,
+        owner_id=principal.user_id,
+        tenant_id=principal.tenant_id,
+        conversation_id=conversation.id,
+    )
     run_research_pipeline.delay(task.id)
     return TaskCreated(task_id=UUID(task.id), input_type="audio")
 
 
 @router.get("/{task_id}", response_model=TaskResponse)
-def get_task(task_id: UUID, session: Session = Depends(get_session)) -> TaskResponse:
-    task = TaskRepository(session).get(str(task_id))
+def get_task(
+    task_id: UUID,
+    principal: Principal = Depends(get_current_principal),
+    session: Session = Depends(get_session),
+) -> TaskResponse:
+    task = _owned_task(session, str(task_id), principal)
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     snapshot = dict(task.input_snapshot or {})
@@ -141,10 +204,11 @@ def get_task(task_id: UUID, session: Session = Depends(get_session)) -> TaskResp
 def get_execution_log(
     task_id: UUID,
     after_sequence: int = Query(default=0, ge=0),
+    principal: Principal = Depends(get_current_principal),
     session: Session = Depends(get_session),
 ) -> ExecutionLogResponse:
     repository = TaskRepository(session)
-    task = repository.get(str(task_id))
+    task = _owned_task(session, str(task_id), principal)
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     snapshot = dict(task.input_snapshot or {})
@@ -182,9 +246,10 @@ async def stream_task_execution_events(
     task_id: UUID,
     request: Request,
     after_sequence: int = Query(default=0, ge=0),
+    principal: Principal = Depends(get_current_principal),
 ) -> StreamingResponse:
     with SessionLocal() as session:
-        if TaskRepository(session).get(str(task_id)) is None:
+        if _owned_task(session, str(task_id), principal) is None:
             raise HTTPException(status_code=404, detail="Task not found")
 
     last_event_id = request.headers.get("last-event-id")
@@ -213,10 +278,11 @@ async def stream_task_execution_events(
 def confirm_task(
     task_id: UUID,
     payload: ConfirmationPayload,
+    principal: Principal = Depends(get_current_principal),
     session: Session = Depends(get_session),
 ) -> TaskResponse:
     repository = TaskRepository(session)
-    task = repository.get(str(task_id))
+    task = _owned_task(session, str(task_id), principal)
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     if task.status != "NEEDS_CONFIRMATION":
@@ -242,13 +308,17 @@ def confirm_task(
         error_message=None,
     )
     run_research_pipeline.delay(str(task_id))
-    return get_task(task_id, session)
+    return get_task(task_id, principal, session)
 
 
 @router.post("/{task_id}/cancel", response_model=TaskResponse)
-def cancel_task(task_id: UUID, session: Session = Depends(get_session)) -> TaskResponse:
+def cancel_task(
+    task_id: UUID,
+    principal: Principal = Depends(get_current_principal),
+    session: Session = Depends(get_session),
+) -> TaskResponse:
     repository = TaskRepository(session)
-    task = repository.get(str(task_id))
+    task = _owned_task(session, str(task_id), principal)
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     if task.status in {"COMPLETED", "FAILED", "CANCELLED"}:
@@ -258,17 +328,18 @@ def cancel_task(task_id: UUID, session: Session = Depends(get_session)) -> TaskR
     agent_run = config_service.get_for_task(str(task_id))
     if agent_run is not None:
         config_service.update_run_status(agent_run, "CANCELLED")
-    return get_task(task_id, session)
+    return get_task(task_id, principal, session)
 
 
 @router.post("/{task_id}/chat", response_model=TaskChatResponse)
 def chat_with_task(
     task_id: UUID,
     payload: TaskChatRequest,
+    principal: Principal = Depends(get_current_principal),
     session: Session = Depends(get_session),
 ) -> TaskChatResponse:
     repository = TaskRepository(session)
-    task = repository.get_fresh(str(task_id))
+    task = _owned_task(session, str(task_id), principal, fresh=True)
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     snapshot = dict(task.input_snapshot or {})
@@ -279,7 +350,10 @@ def chat_with_task(
     context = build_task_chat_context(task)
     config_service = AgentConfigService(session, settings)
     agent_run = config_service.get_for_task(str(task_id)) or config_service.ensure_task_run(
-        str(task_id)
+        str(task_id),
+        owner_id=principal.user_id,
+        tenant_id=principal.tenant_id,
+        conversation_id=task.conversation_id,
     )
     try:
         result = AnalysisChatAgent(
@@ -297,6 +371,17 @@ def chat_with_task(
     ][-40:]
     snapshot["analysis_chat_messages"] = messages
     repository.update(str(task_id), input_snapshot=snapshot)
+    if task.conversation_id:
+        conversation = ConversationService(session).get_owned(
+            principal, task.conversation_id
+        )
+        if conversation is not None:
+            ConversationService(session).sync_messages(
+                conversation,
+                messages,
+                channel="analysis",
+                author_id=principal.user_id,
+            )
     return TaskChatResponse(
         task_id=task_id,
         task_status=task.status,
@@ -306,10 +391,12 @@ def chat_with_task(
 
 @router.post("/{task_id}/clear", response_model=TaskClearResponse)
 def clear_task_analysis(
-    task_id: UUID, session: Session = Depends(get_session)
+    task_id: UUID,
+    principal: Principal = Depends(get_current_principal),
+    session: Session = Depends(get_session),
 ) -> TaskClearResponse:
     repository = TaskRepository(session)
-    task = repository.get_fresh(str(task_id))
+    task = _owned_task(session, str(task_id), principal, fresh=True)
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     if task.status not in {"COMPLETED", "FAILED", "CANCELLED", "NEEDS_CONFIRMATION"}:
@@ -320,6 +407,8 @@ def clear_task_analysis(
     if task.intake_session_id:
         previous_intake_session_id = task.intake_session_id
         intake_session = session.get(IntakeSession, previous_intake_session_id)
+        if intake_session and intake_session.owner_id not in {None, principal.user_id}:
+            intake_session = None
         if intake_session and intake_session.research_task_id == task.id:
             final_confirmation = (
                 (intake_session.structured_context or {}).get("final_confirmation") or {}

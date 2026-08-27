@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     agent_trusted_model_hosts: str = ""
     agent_allow_private_mcp_urls: bool = False
     agent_trusted_mcp_hosts: str = "mcp-server"
+    auth_enabled: bool = False
+    auth_allow_registration: bool = True
+    auth_session_days: int = 14
+    auth_cookie_secure: bool = False
     intake_entity_resolution_enabled: bool = True
     intake_audio_enabled: bool = True
     intake_react_enabled: bool = True

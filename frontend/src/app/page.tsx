@@ -9,15 +9,18 @@ import {
   Eraser,
   FileText,
   Globe2,
+  History,
   LoaderCircle,
   Mic,
   MessageSquare,
   PencilLine,
   RefreshCw,
   RotateCcw,
+  LogOut,
   Search,
   Send,
-  TerminalSquare
+  TerminalSquare,
+  X
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
@@ -65,6 +68,24 @@ type ExecutionEvent = {
   created_at: string;
 };
 type StreamConnection = "CONNECTING" | "LIVE" | "RECONNECTING" | "STOPPED";
+type CurrentUser = {
+  auth_enabled: boolean;
+  registration_enabled: boolean;
+  user_id?: string;
+  email?: string;
+  display_name?: string;
+  role?: string;
+};
+type ConversationSummary = {
+  id: string;
+  title: string;
+  status: string;
+  intake_session_id?: string;
+  latest_task_id?: string;
+  task_status?: string;
+  last_message?: string;
+  updated_at: string;
+};
 
 type Person = { name?: string; organization?: string; title?: string };
 type EntityMention = {
@@ -183,6 +204,9 @@ const INITIAL_MESSAGE: ChatMessage = {
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 const DEBUG_EXECUTION_DEFAULT = process.env.NEXT_PUBLIC_DEBUG_EXECUTION === "true";
 const INTAKE_SESSION_STORAGE_KEY = "resource-agent-intake-session-id";
+const TASK_STORAGE_KEY = "resource-agent-task-id";
+const apiFetch = (input: RequestInfo | URL, init?: RequestInit) =>
+  fetch(input, { ...init, credentials: "include" });
 const IDLE_ACTIVITY: IntakeActivity = {
   phase: "IDLE",
   detail: "大模型待命",
@@ -466,6 +490,16 @@ function safeReportUrl(url: string) {
 }
 
 export default function Home() {
+  const [authReady, setAuthReady] = useState(false);
+  const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
+  const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authDisplayName, setAuthDisplayName] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([INITIAL_MESSAGE]);
   const [chatInput, setChatInput] = useState("");
   const [chatSessionId, setChatSessionId] = useState<string | null>(null);
@@ -505,18 +539,46 @@ export default function Home() {
     );
   }, []);
 
+  useEffect(() => {
+    apiFetch(`${API_BASE}/api/v1/auth/me`)
+      .then(async (response) => {
+        if (!response.ok) throw new Error("登录状态获取失败");
+        return (await response.json()) as CurrentUser;
+      })
+      .then(setCurrentUser)
+      .catch(() => setCurrentUser({ auth_enabled: true, registration_enabled: true }))
+      .finally(() => setAuthReady(true));
+  }, []);
+
+  const authenticated = Boolean(
+    currentUser && (!currentUser.auth_enabled || currentUser.user_id)
+  );
+
+  const refreshConversations = useCallback(async () => {
+    const response = await apiFetch(`${API_BASE}/api/v1/conversations`);
+    if (!response.ok) return;
+    setConversations((await response.json()) as ConversationSummary[]);
+  }, []);
+
+  useEffect(() => {
+    if (!authReady || !authenticated) return;
+    void refreshConversations();
+  }, [authReady, authenticated, refreshConversations]);
+
   const fetchTask = useCallback(async (taskId: string) => {
-    const response = await fetch(`${API_BASE}/api/v1/tasks/${taskId}`);
+    const response = await apiFetch(`${API_BASE}/api/v1/tasks/${taskId}`);
     if (!response.ok) throw new Error("任务状态获取失败");
     const nextTask = (await response.json()) as Task;
     setTask(nextTask);
+    window.localStorage.setItem(TASK_STORAGE_KEY, nextTask.task_id);
     return nextTask;
   }, []);
 
   useEffect(() => {
+    if (!authReady || !authenticated) return;
     const sessionId = window.localStorage.getItem(INTAKE_SESSION_STORAGE_KEY);
     if (!sessionId) return;
-    fetch(`${API_BASE}/api/v1/intake/${sessionId}`)
+    apiFetch(`${API_BASE}/api/v1/intake/${sessionId}`)
       .then(async (response) => {
         if (!response.ok) {
           window.localStorage.removeItem(INTAKE_SESSION_STORAGE_KEY);
@@ -543,12 +605,20 @@ export default function Home() {
         }
       })
       .catch(() => window.localStorage.removeItem(INTAKE_SESSION_STORAGE_KEY));
-  }, [fetchTask]);
+  }, [authReady, authenticated, fetchTask]);
+
+  useEffect(() => {
+    if (!authReady || !authenticated) return;
+    if (window.localStorage.getItem(INTAKE_SESSION_STORAGE_KEY)) return;
+    const taskId = window.localStorage.getItem(TASK_STORAGE_KEY);
+    if (!taskId) return;
+    void fetchTask(taskId).catch(() => window.localStorage.removeItem(TASK_STORAGE_KEY));
+  }, [authReady, authenticated, fetchTask]);
 
   useEffect(() => {
     if (!chatSessionId || !audioJob || !new Set(["QUEUED", "TRANSCRIBING"]).has(audioJob.status)) return;
     const interval = window.setInterval(() => {
-      fetch(`${API_BASE}/api/v1/intake/${chatSessionId}/audio/${audioJob.job_id}`)
+      apiFetch(`${API_BASE}/api/v1/intake/${chatSessionId}/audio/${audioJob.job_id}`)
         .then(async (response) => {
           if (!response.ok) throw new Error("音频状态获取失败");
           return (await response.json()) as IntakeAudioJob;
@@ -574,7 +644,8 @@ export default function Home() {
     eventSourceRef.current?.close();
     setStreamConnection("CONNECTING");
     const source = new EventSource(
-      `${API_BASE}/api/v1/tasks/${taskId}/events?after_sequence=${executionCursorRef.current}`
+      `${API_BASE}/api/v1/tasks/${taskId}/events?after_sequence=${executionCursorRef.current}`,
+      { withCredentials: true }
     );
     eventSourceRef.current = source;
 
@@ -640,7 +711,7 @@ export default function Home() {
     if (!chatSessionId || (!isChatting && !isSubmitting)) return;
     let cancelled = false;
     const fetchActivity = async () => {
-      const response = await fetch(`${API_BASE}/api/v1/intake/${chatSessionId}/activity`);
+      const response = await apiFetch(`${API_BASE}/api/v1/intake/${chatSessionId}/activity`);
       if (!response.ok) return;
       const activity = (await response.json()) as IntakeActivity;
       if (!cancelled) setIntakeActivity(activity);
@@ -673,7 +744,7 @@ export default function Home() {
       sequence: 0
     });
     try {
-      const response = await fetch(`${API_BASE}/api/v1/intake/chat`, {
+      const response = await apiFetch(`${API_BASE}/api/v1/intake/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -734,7 +805,7 @@ export default function Home() {
     setError("");
     setIsSubmitting(true);
     try {
-      const response = await fetch(`${API_BASE}/api/v1/intake/${chatSessionId}/start-analysis`, {
+      const response = await apiFetch(`${API_BASE}/api/v1/intake/${chatSessionId}/start-analysis`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ expected_version: chatSessionVersion })
@@ -746,7 +817,9 @@ export default function Home() {
       setTaskView("activity");
       setAnalysisChatMessages([]);
       setAnalysisChatInput("");
-      setTask(await response.json());
+      const nextTask = (await response.json()) as Task;
+      setTask(nextTask);
+      window.localStorage.setItem(TASK_STORAGE_KEY, nextTask.task_id);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "任务创建失败");
     } finally {
@@ -760,7 +833,7 @@ export default function Home() {
     setIsSubmitting(true);
     setError("");
     try {
-      const response = await fetch(`${API_BASE}/api/v1/tasks/${task.task_id}/cancel`, {
+      const response = await apiFetch(`${API_BASE}/api/v1/tasks/${task.task_id}/cancel`, {
         method: "POST"
       });
       const payload = await response.json().catch(() => ({}));
@@ -779,7 +852,7 @@ export default function Home() {
     setIsSubmitting(true);
     setError("");
     try {
-      const response = await fetch(`${API_BASE}/api/v1/tasks/${task.task_id}/clear`, {
+      const response = await apiFetch(`${API_BASE}/api/v1/tasks/${task.task_id}/clear`, {
         method: "POST"
       });
       const payload = await response.json().catch(() => ({}));
@@ -789,6 +862,7 @@ export default function Home() {
         setReadyToAnalyze(Boolean(payload.ready_to_analyze));
       }
       setTask(null);
+      window.localStorage.removeItem(TASK_STORAGE_KEY);
       setExecutionEvents([]);
       executionCursorRef.current = 0;
       executionTaskRef.current = null;
@@ -813,7 +887,7 @@ export default function Home() {
     setIsAnalysisChatting(true);
     setError("");
     try {
-      const response = await fetch(`${API_BASE}/api/v1/tasks/${task.task_id}/chat`, {
+      const response = await apiFetch(`${API_BASE}/api/v1/tasks/${task.task_id}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message })
@@ -848,6 +922,7 @@ export default function Home() {
     setChatSessionId(null);
     setChatSessionVersion(null);
     window.localStorage.removeItem(INTAKE_SESSION_STORAGE_KEY);
+    window.localStorage.removeItem(TASK_STORAGE_KEY);
     setAnalysisInput("");
     setReadyToAnalyze(false);
     setMissingInformation([]);
@@ -879,7 +954,7 @@ export default function Home() {
     setIsSubmitting(true);
     setError("");
     try {
-      const response = await fetch(`${API_BASE}/api/v1/tasks/${task.task_id}/confirm`, {
+      const response = await apiFetch(`${API_BASE}/api/v1/tasks/${task.task_id}/confirm`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -915,7 +990,7 @@ export default function Home() {
     setIsSubmitting(true);
     setError("");
     try {
-      const response = await fetch(`${API_BASE}/api/v1/intake/${chatSessionId}/confirm`, {
+      const response = await apiFetch(`${API_BASE}/api/v1/intake/${chatSessionId}/confirm`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -951,7 +1026,7 @@ export default function Home() {
     setIsSubmitting(true);
     setError("");
     try {
-      const response = await fetch(`${API_BASE}/api/v1/intake/${chatSessionId}/confirm-summary`, {
+      const response = await apiFetch(`${API_BASE}/api/v1/intake/${chatSessionId}/confirm-summary`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ expected_version: finalConfirmation.version })
@@ -990,7 +1065,7 @@ export default function Home() {
     const form = new FormData();
     form.append("audio", file, file.name || "recording.webm");
     try {
-      const response = await fetch(`${API_BASE}/api/v1/intake/${sessionId}/audio`, {
+      const response = await apiFetch(`${API_BASE}/api/v1/intake/${sessionId}/audio`, {
         method: "POST",
         body: form
       });
@@ -1008,7 +1083,7 @@ export default function Home() {
 
   const retryAudio = async () => {
     if (!chatSessionId || !audioJob) return;
-    const response = await fetch(
+    const response = await apiFetch(
       `${API_BASE}/api/v1/intake/${chatSessionId}/audio/${audioJob.job_id}/retry`,
       { method: "POST" }
     );
@@ -1018,6 +1093,52 @@ export default function Home() {
       return;
     }
     setAudioJob(payload as IntakeAudioJob);
+  };
+
+  const submitAuth = async () => {
+    if (!authEmail.trim() || !authPassword) return;
+    setAuthSubmitting(true);
+    setAuthError("");
+    try {
+      const response = await apiFetch(`${API_BASE}/api/v1/auth/${authMode}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: authEmail.trim(),
+          password: authPassword,
+          ...(authMode === "register" ? { display_name: authDisplayName.trim() } : {})
+        })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.detail ?? "登录失败");
+      setCurrentUser(payload as CurrentUser);
+      setAuthPassword("");
+      await refreshConversations();
+    } catch (reason) {
+      setAuthError(reason instanceof Error ? reason.message : "登录失败");
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const logout = async () => {
+    await apiFetch(`${API_BASE}/api/v1/auth/logout`, { method: "POST" });
+    window.localStorage.removeItem(INTAKE_SESSION_STORAGE_KEY);
+    window.localStorage.removeItem(TASK_STORAGE_KEY);
+    window.location.reload();
+  };
+
+  const resumeConversation = (conversation: ConversationSummary) => {
+    if (conversation.intake_session_id) {
+      window.localStorage.setItem(INTAKE_SESSION_STORAGE_KEY, conversation.intake_session_id);
+      window.localStorage.removeItem(TASK_STORAGE_KEY);
+    } else if (conversation.latest_task_id) {
+      window.localStorage.setItem(TASK_STORAGE_KEY, conversation.latest_task_id);
+      window.localStorage.removeItem(INTAKE_SESSION_STORAGE_KEY);
+    } else {
+      return;
+    }
+    window.location.reload();
   };
 
   const taskActivityEntries = task
@@ -1052,6 +1173,29 @@ export default function Home() {
     { label: "综合分析与报告", icon: <FileText size={17} /> }
   ];
 
+  if (!authReady) {
+    return <main className="auth-shell"><LoaderCircle className="spin" size={24} /></main>;
+  }
+
+  if (currentUser?.auth_enabled && !currentUser.user_id) {
+    return (
+      <main className="auth-shell">
+        <section className="auth-panel" aria-label={authMode === "login" ? "登录" : "注册"}>
+          <div className="auth-brand"><Bot size={22} /><strong>资源推动 Agent</strong></div>
+          <div><span className="section-label">账户</span><h1>{authMode === "login" ? "登录" : "创建账户"}</h1></div>
+          {authMode === "register" && <label>姓名<input value={authDisplayName} onChange={(event) => setAuthDisplayName(event.target.value)} autoComplete="name" /></label>}
+          <label>邮箱<input type="email" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} autoComplete="email" /></label>
+          <label>密码<input type="password" value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} autoComplete={authMode === "login" ? "current-password" : "new-password"} onKeyDown={(event) => { if (event.key === "Enter") void submitAuth(); }} /></label>
+          {authError && <div className="error-banner"><AlertCircle size={15} />{authError}</div>}
+          <button className="primary-button" disabled={authSubmitting || (authMode === "register" && !authDisplayName.trim())} onClick={() => void submitAuth()}>
+            {authSubmitting && <LoaderCircle className="spin" size={15} />}{authMode === "login" ? "登录" : "注册并登录"}
+          </button>
+          {currentUser.registration_enabled && <button className="auth-mode-button" onClick={() => { setAuthMode(authMode === "login" ? "register" : "login"); setAuthError(""); }}>{authMode === "login" ? "创建新账户" : "返回登录"}</button>}
+        </section>
+      </main>
+    );
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -1060,12 +1204,31 @@ export default function Home() {
         </div>
         <div className="topbar-actions">
           <span className="agent-glyph" title="资源推动 Agent 在线"><Bot size={19} /></span>
+          <button className="icon-tool-button" onClick={() => { setHistoryOpen(!historyOpen); if (!historyOpen) void refreshConversations(); }} title="历史会话" aria-label="历史会话"><History size={18} /></button>
+          {currentUser?.auth_enabled && <button className="user-menu-button" onClick={() => void logout()} title="退出登录"><span>{currentUser.display_name}</span><LogOut size={15} /></button>}
           <button className="reset-button" onClick={reset} title="清空当前页面并新建调查">
             <span>重新开始</span>
             <RotateCcw size={15} />
           </button>
         </div>
       </header>
+
+      {historyOpen && (
+        <aside className="history-drawer" aria-label="历史会话">
+          <div className="history-heading"><div><span className="section-label">历史记录</span><h2>我的调查</h2></div><button className="icon-tool-button" onClick={() => setHistoryOpen(false)} aria-label="关闭历史记录"><X size={16} /></button></div>
+          <div className="history-list">
+            {conversations.length === 0 && <p className="history-empty">暂无历史会话</p>}
+            {conversations.map((conversation) => (
+              <button key={conversation.id} className="history-item" disabled={!conversation.intake_session_id && !conversation.latest_task_id} onClick={() => resumeConversation(conversation)}>
+                <strong>{conversation.title}</strong>
+                <span>{conversation.task_status ? STATUS_LABELS[conversation.task_status] ?? conversation.task_status : "信息采集"}</span>
+                {conversation.last_message && <small>{conversation.last_message}</small>}
+                <time>{new Date(conversation.updated_at).toLocaleString("zh-CN")}</time>
+              </button>
+            ))}
+          </div>
+        </aside>
+      )}
 
       <div className="workspace">
         <aside className="progress-panel" aria-label="处理进度">

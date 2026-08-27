@@ -20,6 +20,8 @@ from app.api.tasks import router as tasks_router
 from app.api.admin_models import router as admin_models_router
 from app.api.admin_prompts import router as admin_prompts_router
 from app.api.admin_mcp import router as admin_mcp_router
+from app.api.auth import router as auth_router
+from app.api.conversations import router as conversations_router
 
 # 导入数据库初始化函数。
 # 这个函数通常负责创建数据库表或完成数据库启动检查。
@@ -54,6 +56,8 @@ app.add_middleware(
     # 一般表示本地运行在 3000 端口的前端项目。
     allow_origins=["http://localhost:3000"],
 
+    allow_credentials=True,
+
     # 只允许前端使用 GET 和 POST 请求。
     # GET 通常用于查询数据，POST 通常用于提交数据。
     allow_methods=["GET", "POST"],
@@ -72,6 +76,8 @@ app.include_router(intake_router)
 app.include_router(admin_models_router)
 app.include_router(admin_prompts_router)
 app.include_router(admin_mcp_router)
+app.include_router(auth_router)
+app.include_router(conversations_router)
 
 
 # 定义一个 GET 请求接口，访问路径是 /health。

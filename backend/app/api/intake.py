@@ -27,6 +27,8 @@ from app.services.intake.activity import intake_activity
 from app.services.intake.agent import IntakeAgent
 from app.services.agent_config.service import AgentConfigService
 from app.services.agent_config.secrets import SecretStore
+from app.services.auth import Principal, get_current_principal
+from app.services.conversations import ConversationService
 from app.services.intake.completeness import (
     is_intake_ready,
     required_missing_information,
@@ -68,6 +70,26 @@ _default_entity_candidates = IntakeEntityCandidateService(
 )
 entity_candidates = _default_entity_candidates
 MAX_AUDIO_BYTES = 30 * 1024 * 1024
+
+
+def _owned_intake(
+    session: Session,
+    session_id: str,
+    principal: Principal,
+    *,
+    for_update: bool = False,
+) -> IntakeSession | None:
+    intake_session = IntakeSessionRepository(session).get(
+        session_id, for_update=for_update
+    )
+    if intake_session is None:
+        return None
+    if intake_session.owner_id and (
+        intake_session.owner_id != principal.user_id
+        or intake_session.tenant_id != principal.tenant_id
+    ):
+        return None
+    return intake_session
 
 
 def _agent_for(
@@ -174,11 +196,26 @@ def _repair_ready_session(
 
 @router.post("/chat", response_model=IntakeChatResponse)
 def chat(
-    request: IntakeChatRequest, session: Session = Depends(get_session)
+    request: IntakeChatRequest,
+    principal: Principal = Depends(get_current_principal),
+    session: Session = Depends(get_session),
 ) -> IntakeChatResponse:
     repository = IntakeSessionRepository(session)
+    existing = _owned_intake(session, str(request.session_id), principal)
+    if session.get(IntakeSession, str(request.session_id)) is not None and existing is None:
+        raise HTTPException(status_code=404, detail="信息采集会话不存在")
+    conversations = ConversationService(session)
+    try:
+        conversation = conversations.ensure_for_intake(
+            principal, str(request.session_id)
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=404, detail="信息采集会话不存在") from exc
     agent_run = AgentConfigService(session, settings).ensure_intake_run(
-        str(request.session_id)
+        str(request.session_id),
+        owner_id=principal.user_id,
+        tenant_id=principal.tenant_id,
+        conversation_id=conversation.id,
     )
     runner = IntakeRunner(
         repository=repository,
@@ -196,19 +233,37 @@ def chat(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except (IntakeChatConflict, IntakeAudioJobNotReviewable) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    conversations.attach_intake(conversation, intake_session)
+    conversations.sync_messages(
+        conversation,
+        intake_session.messages or [],
+        channel="intake",
+        author_id=principal.user_id,
+    )
     return _chat_response(intake_session)
 
 
 @router.get("/{session_id}/activity", response_model=IntakeActivityResponse)
-def get_intake_activity(session_id: UUID) -> IntakeActivityResponse:
+def get_intake_activity(
+    session_id: UUID,
+    principal: Principal = Depends(get_current_principal),
+    session: Session = Depends(get_session),
+) -> IntakeActivityResponse:
+    if (
+        _owned_intake(session, str(session_id), principal) is None
+        and principal.auth_enabled
+    ):
+        raise HTTPException(status_code=404, detail="信息采集会话不存在")
     return IntakeActivityResponse.model_validate(intake_activity.get(str(session_id)))
 
 
 @router.get("/{session_id}", response_model=IntakeSessionResponse)
 def get_intake_session(
-    session_id: UUID, session: Session = Depends(get_session)
+    session_id: UUID,
+    principal: Principal = Depends(get_current_principal),
+    session: Session = Depends(get_session),
 ) -> IntakeSessionResponse:
-    intake_session = IntakeSessionRepository(session).get(str(session_id))
+    intake_session = _owned_intake(session, str(session_id), principal)
     if intake_session is None:
         raise HTTPException(status_code=404, detail="信息采集会话不存在")
     active_audio_job = session.scalar(
@@ -239,14 +294,27 @@ def get_intake_session(
 async def upload_intake_audio(
     session_id: UUID,
     audio: UploadFile = File(...),
+    principal: Principal = Depends(get_current_principal),
     session: Session = Depends(get_session),
 ) -> IntakeAudioJobResponse:
     if not settings.intake_audio_enabled:
         raise HTTPException(status_code=503, detail="音频预处理当前已关闭")
-    intake_session = IntakeSessionRepository(session).get(str(session_id), for_update=True)
+    intake_session = _owned_intake(
+        session, str(session_id), principal, for_update=True
+    )
+    if session.get(IntakeSession, str(session_id)) is not None and intake_session is None:
+        raise HTTPException(status_code=404, detail="信息采集会话不存在")
+    conversations = ConversationService(session)
+    try:
+        conversation = conversations.ensure_for_intake(principal, str(session_id))
+    except PermissionError as exc:
+        raise HTTPException(status_code=404, detail="信息采集会话不存在") from exc
     if intake_session is None:
         intake_session = IntakeSession(
             id=str(session_id),
+            tenant_id=principal.tenant_id,
+            owner_id=principal.user_id,
+            conversation_id=conversation.id,
             status="COLLECTING",
             messages=[],
             structured_context={},
@@ -255,6 +323,7 @@ async def upload_intake_audio(
         )
         session.add(intake_session)
         session.flush()
+    conversations.attach_intake(conversation, intake_session)
     if intake_session.status in {"STARTING_ANALYSIS", "ANALYZING"}:
         raise HTTPException(status_code=409, detail="分析任务已创建，不能上传录音")
     if audio.content_type != "audio/webm":
@@ -289,8 +358,13 @@ async def upload_intake_audio(
     "/{session_id}/audio/{job_id}", response_model=IntakeAudioJobResponse
 )
 def get_intake_audio(
-    session_id: UUID, job_id: UUID, session: Session = Depends(get_session)
+    session_id: UUID,
+    job_id: UUID,
+    principal: Principal = Depends(get_current_principal),
+    session: Session = Depends(get_session),
 ) -> IntakeAudioJobResponse:
+    if _owned_intake(session, str(session_id), principal) is None:
+        raise HTTPException(status_code=404, detail="音频转写任务不存在")
     job = session.get(IntakeAudioJob, str(job_id))
     if job is None or job.session_id != str(session_id):
         raise HTTPException(status_code=404, detail="音频转写任务不存在")
@@ -303,10 +377,13 @@ def get_intake_audio(
     status_code=202,
 )
 def retry_intake_audio(
-    session_id: UUID, job_id: UUID, session: Session = Depends(get_session)
+    session_id: UUID,
+    job_id: UUID,
+    principal: Principal = Depends(get_current_principal),
+    session: Session = Depends(get_session),
 ) -> IntakeAudioJobResponse:
     job = session.get(IntakeAudioJob, str(job_id))
-    intake_session = IntakeSessionRepository(session).get(str(session_id))
+    intake_session = _owned_intake(session, str(session_id), principal)
     if job is None or job.session_id != str(session_id) or intake_session is None:
         raise HTTPException(status_code=404, detail="音频转写任务不存在")
     if job.status != "FAILED" or not job.audio_path:
@@ -325,14 +402,25 @@ def retry_intake_audio(
 def confirm_intake_entities(
     session_id: UUID,
     payload: ConfirmationPayload,
+    principal: Principal = Depends(get_current_principal),
     session: Session = Depends(get_session),
 ) -> IntakeSessionResponse:
     repository = IntakeSessionRepository(session)
-    existing_session = repository.get(str(session_id))
+    existing_session = _owned_intake(session, str(session_id), principal)
     if existing_session is None:
         raise HTTPException(status_code=404, detail="信息采集会话不存在")
-    agent_run = AgentConfigService(session, settings).ensure_intake_run(str(session_id))
-    intake_session = repository.get(str(session_id), for_update=True)
+    conversation = ConversationService(session).ensure_for_intake(
+        principal, str(session_id)
+    )
+    agent_run = AgentConfigService(session, settings).ensure_intake_run(
+        str(session_id),
+        owner_id=principal.user_id,
+        tenant_id=principal.tenant_id,
+        conversation_id=conversation.id,
+    )
+    intake_session = _owned_intake(
+        session, str(session_id), principal, for_update=True
+    )
     if intake_session is None:  # pragma: no cover - deleted between reads
         raise HTTPException(status_code=404, detail="信息采集会话不存在")
     request_agent = _agent_for(repository, agent_run.resolved_config_snapshot)
@@ -509,6 +597,12 @@ def confirm_intake_entities(
         tool_name="summarize_intake_confirmation",
     )
     response = _chat_response(intake_session)
+    ConversationService(session).sync_messages(
+        conversation,
+        intake_session.messages or [],
+        channel="intake",
+        author_id=principal.user_id,
+    )
     return IntakeSessionResponse(
         **response.model_dump(),
         messages=intake_session.messages or [],
@@ -524,10 +618,13 @@ def confirm_intake_entities(
 def confirm_intake_summary(
     session_id: UUID,
     payload: ConfirmIntakeSummaryRequest,
+    principal: Principal = Depends(get_current_principal),
     session: Session = Depends(get_session),
 ) -> IntakeSessionResponse:
     repository = IntakeSessionRepository(session)
-    intake_session = repository.get(str(session_id), for_update=True)
+    intake_session = _owned_intake(
+        session, str(session_id), principal, for_update=True
+    )
     if intake_session is None:
         raise HTTPException(status_code=404, detail="信息采集会话不存在")
     context = IntakeStructuredContext.model_validate(
@@ -586,6 +683,15 @@ def confirm_intake_summary(
         tool_name="confirm_intake_summary",
     )
     response = _chat_response(intake_session)
+    conversation = ConversationService(session).ensure_for_intake(
+        principal, str(session_id)
+    )
+    ConversationService(session).sync_messages(
+        conversation,
+        intake_session.messages or [],
+        channel="intake",
+        author_id=principal.user_id,
+    )
     return IntakeSessionResponse(
         **response.model_dump(),
         messages=intake_session.messages or [],
@@ -602,14 +708,25 @@ def confirm_intake_summary(
 def start_analysis(
     session_id: UUID,
     payload: StartAnalysisRequest,
+    principal: Principal = Depends(get_current_principal),
     session: Session = Depends(get_session),
 ) -> TaskCreated:
     repository = IntakeSessionRepository(session)
-    existing_session = repository.get(str(session_id))
+    existing_session = _owned_intake(session, str(session_id), principal)
     if existing_session is None:
         raise HTTPException(status_code=404, detail="信息采集会话不存在")
-    AgentConfigService(session, settings).ensure_intake_run(str(session_id))
-    intake_session = repository.get(str(session_id), for_update=True)
+    conversation = ConversationService(session).ensure_for_intake(
+        principal, str(session_id)
+    )
+    AgentConfigService(session, settings).ensure_intake_run(
+        str(session_id),
+        owner_id=principal.user_id,
+        tenant_id=principal.tenant_id,
+        conversation_id=conversation.id,
+    )
+    intake_session = _owned_intake(
+        session, str(session_id), principal, for_update=True
+    )
     if intake_session is None:  # pragma: no cover - deleted between reads
         raise HTTPException(status_code=404, detail="信息采集会话不存在")
 
@@ -618,7 +735,11 @@ def start_analysis(
         if task is None:
             raise HTTPException(status_code=409, detail="会话关联的分析任务不存在")
         AgentConfigService(session, settings).link_research_task(
-            intake_session.id, task.id
+            intake_session.id,
+            task.id,
+            owner_id=principal.user_id,
+            tenant_id=principal.tenant_id,
+            conversation_id=conversation.id,
         )
         return TaskCreated(task_id=UUID(task.id), input_type=task.input_type)
     if payload.expected_version is not None and payload.expected_version != intake_session.version:
@@ -677,6 +798,9 @@ def start_analysis(
         raise HTTPException(status_code=422, detail="已确认身份无法转换为分析上下文")
     task = ResearchTask(
         id=task_id,
+        tenant_id=principal.tenant_id,
+        owner_id=principal.user_id,
+        conversation_id=conversation.id,
         input_type="audio" if audio_jobs else "text",
         input_text=intake_session.analysis_input.strip(),
         intake_session_id=intake_session.id,
@@ -687,23 +811,32 @@ def start_analysis(
     intake_session.status = "ANALYZING"
     intake_session.research_task_id = task_id
     session.add(task)
+    ConversationService(session).attach_task(conversation, task)
     try:
         session.commit()
     except IntegrityError:
         session.rollback()
-        existing = repository.get(str(session_id))
+        existing = _owned_intake(session, str(session_id), principal)
         if existing is None or not existing.research_task_id:
             raise
         task = session.get(ResearchTask, existing.research_task_id)
         if task is None:
             raise
         AgentConfigService(session, settings).link_research_task(
-            intake_session.id, task.id
+            intake_session.id,
+            task.id,
+            owner_id=principal.user_id,
+            tenant_id=principal.tenant_id,
+            conversation_id=conversation.id,
         )
         return TaskCreated(task_id=UUID(task.id), input_type=task.input_type)
 
     AgentConfigService(session, settings).link_research_task(
-        intake_session.id, task_id
+        intake_session.id,
+        task_id,
+        owner_id=principal.user_id,
+        tenant_id=principal.tenant_id,
+        conversation_id=conversation.id,
     )
     TaskRepository(session).log_execution_event(
         task_id,

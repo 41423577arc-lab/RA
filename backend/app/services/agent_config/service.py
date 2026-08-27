@@ -22,6 +22,7 @@ from app.services.agent_config.snapshot import (
 )
 from app.services.agent_config.registry import NODE_REGISTRY
 from app.services.agent_config.prompts import PromptConfigService
+from app.services.auth import SYSTEM_USER_ID
 
 
 SYSTEM_TENANT_ID = "00000000-0000-0000-0000-000000000001"
@@ -357,7 +358,14 @@ class AgentConfigService:
         self.session.refresh(version)
         return version
 
-    def ensure_intake_run(self, intake_session_id: str) -> AgentRun:
+    def ensure_intake_run(
+        self,
+        intake_session_id: str,
+        *,
+        owner_id: str = SYSTEM_USER_ID,
+        tenant_id: str = SYSTEM_TENANT_ID,
+        conversation_id: str | None = None,
+    ) -> AgentRun:
         existing = self.session.scalar(
             select(AgentRun).where(AgentRun.intake_session_id == intake_session_id)
         )
@@ -366,7 +374,10 @@ class AgentConfigService:
         self.ensure_default_agent()
         snapshot, config_hash = self.resolve_published(DEFAULT_AGENT_DEFINITION_ID)
         run = AgentRun(
-            tenant_id=SYSTEM_TENANT_ID,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            started_by=owner_id,
+            conversation_id=conversation_id,
             agent_definition_id=DEFAULT_AGENT_DEFINITION_ID,
             agent_version_id=snapshot["agent_version_id"],
             config_schema_version=snapshot["config_schema_version"],
@@ -380,7 +391,14 @@ class AgentConfigService:
         self.session.refresh(run)
         return run
 
-    def ensure_task_run(self, research_task_id: str) -> AgentRun:
+    def ensure_task_run(
+        self,
+        research_task_id: str,
+        *,
+        owner_id: str = SYSTEM_USER_ID,
+        tenant_id: str = SYSTEM_TENANT_ID,
+        conversation_id: str | None = None,
+    ) -> AgentRun:
         existing = self.session.scalar(
             select(AgentRun).where(AgentRun.research_task_id == research_task_id)
         )
@@ -389,7 +407,10 @@ class AgentConfigService:
         self.ensure_default_agent()
         snapshot, config_hash = self.resolve_published(DEFAULT_AGENT_DEFINITION_ID)
         run = AgentRun(
-            tenant_id=SYSTEM_TENANT_ID,
+            tenant_id=tenant_id,
+            owner_id=owner_id,
+            started_by=owner_id,
+            conversation_id=conversation_id,
             agent_definition_id=DEFAULT_AGENT_DEFINITION_ID,
             agent_version_id=snapshot["agent_version_id"],
             config_schema_version=snapshot["config_schema_version"],
@@ -403,11 +424,27 @@ class AgentConfigService:
         self.session.refresh(run)
         return run
 
-    def link_research_task(self, intake_session_id: str, research_task_id: str) -> AgentRun:
-        run = self.ensure_intake_run(intake_session_id)
+    def link_research_task(
+        self,
+        intake_session_id: str,
+        research_task_id: str,
+        *,
+        owner_id: str = SYSTEM_USER_ID,
+        tenant_id: str = SYSTEM_TENANT_ID,
+        conversation_id: str | None = None,
+    ) -> AgentRun:
+        run = self.ensure_intake_run(
+            intake_session_id,
+            owner_id=owner_id,
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+        )
         if run.research_task_id and run.research_task_id != research_task_id:
             raise ValueError("Agent run is already linked to another research task")
         run.research_task_id = research_task_id
+        run.owner_id = owner_id
+        run.started_by = owner_id
+        run.conversation_id = conversation_id or run.conversation_id
         run.status = "PENDING"
         self.session.commit()
         self.session.refresh(run)

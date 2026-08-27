@@ -93,6 +93,12 @@ def test_alembic_clean_database_upgrade_downgrade_cycle(tmp_path, monkeypatch) -
     assert inspect(engine).has_table("mcp_server_revisions")
     assert inspect(engine).has_table("tool_mapping_revisions")
     assert inspect(engine).has_table("agent_tool_bindings")
+    assert inspect(engine).has_table("users")
+    assert inspect(engine).has_table("conversations")
+    assert inspect(engine).has_table("conversation_messages")
+    assert "owner_id" in {
+        item["name"] for item in inspect(engine).get_columns("intake_sessions")
+    }
     assert "model_profile_revision_id" in {
         item["name"] for item in inspect(engine).get_columns("agent_node_bindings")
     }
@@ -105,12 +111,15 @@ def test_alembic_clean_database_upgrade_downgrade_cycle(tmp_path, monkeypatch) -
     assert not inspect(engine).has_table("model_profiles")
     assert not inspect(engine).has_table("prompt_revisions")
     assert not inspect(engine).has_table("mcp_server_revisions")
+    assert not inspect(engine).has_table("users")
+    assert not inspect(engine).has_table("conversations")
 
     command.upgrade(config, "head")
     assert inspect(engine).has_table("agent_definitions")
     assert inspect(engine).has_table("model_profiles")
     assert inspect(engine).has_table("prompt_revisions")
     assert inspect(engine).has_table("agent_tool_bindings")
+    assert inspect(engine).has_table("auth_sessions")
     engine.dispose()
 
 

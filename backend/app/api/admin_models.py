@@ -25,11 +25,16 @@ from app.schemas.admin import (
 )
 from app.services.agent_config.models import ModelConfigService
 from app.services.agent_config.service import AgentConfigService, SYSTEM_TENANT_ID
+from app.services.auth import Principal, get_current_principal
 
 
-def require_agent_admin() -> None:
+def require_agent_admin(
+    principal: Principal = Depends(get_current_principal),
+) -> None:
     if not settings.agent_admin_enabled:
         raise HTTPException(status_code=404, detail="Agent administration is disabled")
+    if settings.auth_enabled and principal.role not in {"ADMIN", "SYSTEM"}:
+        raise HTTPException(status_code=403, detail="Administrator access required")
 
 
 router = APIRouter(

@@ -17,8 +17,10 @@ def init_database() -> None:
     Base.metadata.create_all(engine)
     _migrate_intake_sessions()
     with SessionLocal() as session:
+        from app.services.auth import AuthService
         from app.services.agent_config.service import AgentConfigService
 
+        AuthService(session, settings).ensure_system_user()
         AgentConfigService(session, settings).ensure_default_agent()
 
 

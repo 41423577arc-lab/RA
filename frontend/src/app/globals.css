@@ -28,9 +28,34 @@ button { letter-spacing: 0; }
 .topbar { position: sticky; top: 0; z-index: 30; height: 80px; display: flex; align-items: center; justify-content: space-between; padding: 0 40px; border-bottom: 1px solid var(--line); background: rgba(249, 250, 252, .97); }
 .brand-lockup h1 { margin: 0; color: var(--navy-dark); font-size: 26px; line-height: 1; font-weight: 760; }
 .topbar-actions { display: flex; align-items: center; gap: 18px; }
+.icon-tool-button { width: 40px; height: 40px; display: grid; place-items: center; color: var(--navy-dark); border: 1px solid #b7c1cf; border-radius: 6px; background: #fff; cursor: pointer; }
+.icon-tool-button:hover { border-color: var(--navy); background: #eef4fb; }
+.user-menu-button { min-height: 40px; padding: 0 12px; display: inline-flex; align-items: center; gap: 8px; color: #263449; border: 1px solid #b7c1cf; border-radius: 6px; background: #fff; cursor: pointer; }
+.user-menu-button:hover { color: var(--navy-dark); border-color: var(--navy); }
 .agent-glyph { width: 38px; height: 38px; display: grid; place-items: center; color: var(--navy-dark); }
 .reset-button { min-height: 44px; padding: 0 18px; display: inline-flex; align-items: center; justify-content: center; gap: 10px; color: var(--navy-dark); border: 1px solid #aeb9c9; border-radius: 8px; background: #fff; cursor: pointer; font-weight: 650; }
 .reset-button:hover { border-color: var(--navy); background: #eef4fb; }
+
+.auth-shell { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: #f4f6f8; }
+.auth-panel { width: min(420px, 100%); padding: 32px; display: grid; gap: 18px; border: 1px solid var(--line); border-radius: 7px; background: #fff; box-shadow: 0 18px 50px rgba(20, 35, 55, .08); }
+.auth-brand { display: flex; align-items: center; gap: 10px; color: var(--navy-dark); font-size: 18px; }
+.auth-panel h1 { margin: 5px 0 0; font-size: 25px; }
+.auth-panel label { display: grid; gap: 7px; color: #3b4758; font-size: 13px; font-weight: 650; }
+.auth-panel input { width: 100%; min-height: 44px; padding: 9px 11px; color: var(--ink); border: 1px solid #b8c2cf; border-radius: 5px; background: #fff; outline: none; }
+.auth-mode-button { padding: 4px; color: var(--navy); border: 0; background: transparent; cursor: pointer; font-size: 13px; }
+.history-drawer { position: fixed; z-index: 40; top: 80px; right: 0; width: min(420px, 100vw); height: calc(100vh - 80px); padding: 22px; overflow-y: auto; border-left: 1px solid var(--line); background: #f7f9fb; box-shadow: -14px 0 36px rgba(18, 34, 53, .12); }
+.history-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
+.history-heading h2 { margin: 5px 0 0; font-size: 21px; }
+.history-list { display: grid; margin-top: 12px; }
+.history-item { width: 100%; min-width: 0; padding: 16px 4px; display: grid; gap: 5px; text-align: left; border: 0; border-bottom: 1px solid var(--line-soft); background: transparent; cursor: pointer; }
+.history-item:hover { background: #eef3f8; }
+.history-item:disabled { opacity: .58; cursor: default; }
+.history-item strong, .history-item small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.history-item strong { color: #172337; font-size: 14px; }
+.history-item span { color: var(--navy); font-size: 11px; }
+.history-item small { color: #657184; font-size: 12px; }
+.history-item time { color: #8a93a0; font-size: 10px; }
+.history-empty { color: #7a8492; font-size: 13px; }
 
 .workspace { min-height: calc(100vh - 80px); display: grid; grid-template-columns: 350px minmax(0, 1fr); }
 .progress-panel { position: sticky; top: 80px; height: calc(100vh - 80px); padding: 28px 20px 18px; display: flex; flex-direction: column; border-right: 1px solid var(--line); background: #f1f3f5; }
@@ -229,6 +254,8 @@ textarea::placeholder, input::placeholder { color: #9199a5; }
   .brand-lockup h1 { font-size: 20px; }
   .agent-glyph { display: none; }
   .reset-button { min-height: 38px; padding: 0 11px; }
+  .user-menu-button span { display: none; }
+  .history-drawer { top: 66px; height: calc(100vh - 66px); }
   .workspace { display: block; min-height: calc(100vh - 66px); }
   .progress-panel { position: static; width: 100%; height: auto; padding: 14px 12px; border-right: 0; border-bottom: 1px solid var(--line); }
   .progress-heading, .progress-footer { display: none; }

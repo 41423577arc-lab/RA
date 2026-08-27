@@ -26,6 +26,40 @@ class Tenant(Base):
     )
 
 
+class User(Base):
+    __tablename__ = "users"
+    __table_args__ = (UniqueConstraint("tenant_id", "email"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id"), nullable=False, index=True
+    )
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    password_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False, default="MEMBER")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="ACTIVE")
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AuthSession(Base):
+    __tablename__ = "auth_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=False, index=True
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class ConfigSecret(Base):
     __tablename__ = "config_secrets"
     __table_args__ = (UniqueConstraint("tenant_id", "name"),)
@@ -315,12 +349,57 @@ class AgentToolBinding(Base):
     allowed_nodes: Mapped[list] = mapped_column(INTAKE_JSON, nullable=False, default=list)
 
 
+class Conversation(Base):
+    __tablename__ = "conversations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id"), nullable=False, index=True
+    )
+    owner_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=False, index=True
+    )
+    title: Mapped[str] = mapped_column(String(200), nullable=False, default="新调查")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="ACTIVE")
+    intake_session_id: Mapped[str | None] = mapped_column(String(36), unique=True, index=True)
+    latest_task_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ConversationMessage(Base):
+    __tablename__ = "conversation_messages"
+    __table_args__ = (UniqueConstraint("conversation_id", "sequence"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id"), nullable=False, index=True
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("conversations.id"), nullable=False, index=True
+    )
+    author_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"), index=True)
+    sequence: Mapped[int] = mapped_column(nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    message_metadata: Mapped[dict] = mapped_column(INTAKE_JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class AgentRun(Base):
     __tablename__ = "agent_runs"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     tenant_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("tenants.id"), nullable=False, index=True
+    )
+    owner_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"), index=True)
+    started_by: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"), index=True)
+    conversation_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("conversations.id"), index=True
     )
     agent_definition_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("agent_definitions.id"), nullable=False, index=True
@@ -350,6 +429,11 @@ class ResearchTask(Base):
     __tablename__ = "research_tasks"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    owner_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    conversation_id: Mapped[str | None] = mapped_column(
+        String(36), index=True
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="PENDING")
     input_type: Mapped[str] = mapped_column(String(16), nullable=False)
     audio_path: Mapped[str | None] = mapped_column(Text)
@@ -391,6 +475,11 @@ class IntakeSession(Base):
     __tablename__ = "intake_sessions"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    owner_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    conversation_id: Mapped[str | None] = mapped_column(
+        String(36), unique=True, index=True
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="COLLECTING")
     messages: Mapped[list] = mapped_column(INTAKE_JSON, nullable=False, default=list)
     structured_context: Mapped[dict] = mapped_column(INTAKE_JSON, nullable=False, default=dict)
