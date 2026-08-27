@@ -510,18 +510,23 @@ class MechanicalIntakeAgentLoop:
     ) -> AgentTurn:
         if turn.query_plan is None or not turn.query_plan.person_mentions:
             return turn
-        assessments = {
-            item.mention: item.is_standard
-            for item in (
-                *context.entity_assessments,
-                *turn.context_patch.entity_assessments,
-            )
-        }
-        title_suffixes = ("总", "经理", "主任", "董事长", "负责人", "领导")
+        title_suffixes = (
+            "总",
+            "董",
+            "经理",
+            "主任",
+            "董事长",
+            "负责人",
+            "领导",
+            "先生",
+            "女士",
+            "老师",
+        )
+        generic_mentions = {"客户", "老板", "负责人", "联系人", "领导"}
         searchable_mentions = [
             mention
             for mention in turn.query_plan.person_mentions
-            if assessments.get(mention) is not False
+            if "".join(mention.split()) not in generic_mentions
             and not "".join(mention.split()).endswith(title_suffixes)
         ]
         if searchable_mentions == turn.query_plan.person_mentions:

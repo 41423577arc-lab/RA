@@ -18,6 +18,7 @@ from app.api.intake import router as intake_router
 # 从 tasks 接口文件中导入任务相关的路由对象。
 from app.api.tasks import router as tasks_router
 from app.api.admin_models import router as admin_models_router
+from app.api.admin_prompts import router as admin_prompts_router
 
 # 导入数据库初始化函数。
 # 这个函数通常负责创建数据库表或完成数据库启动检查。
@@ -68,6 +69,7 @@ app.include_router(tasks_router)
 # 把信息采集相关接口注册到 FastAPI 应用中。
 app.include_router(intake_router)
 app.include_router(admin_models_router)
+app.include_router(admin_prompts_router)
 
 
 # 定义一个 GET 请求接口，访问路径是 /health。

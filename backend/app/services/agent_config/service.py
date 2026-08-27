@@ -19,6 +19,7 @@ from app.services.agent_config.snapshot import (
     resolved_snapshot,
 )
 from app.services.agent_config.registry import NODE_REGISTRY
+from app.services.agent_config.prompts import PromptConfigService
 
 
 SYSTEM_TENANT_ID = "00000000-0000-0000-0000-000000000001"
@@ -51,7 +52,19 @@ class AgentConfigService:
             self.session.add(definition)
         self.session.flush()
 
-        behavior = build_legacy_behavior_config(self.settings)
+        prompt_service = PromptConfigService(self.session, self.settings)
+        default_prompts = prompt_service.ensure_defaults(SYSTEM_TENANT_ID)
+        prompt_configs = {
+            node_key: prompt_service.resolve_revision(
+                revision.id,
+                expected_node_key=node_key,
+            )
+            for node_key, revision in default_prompts.items()
+        }
+        behavior = build_legacy_behavior_config(
+            self.settings,
+            prompt_configs=prompt_configs,
+        )
         behavior_hash = canonical_hash(behavior)
         published = (
             self.session.get(AgentVersion, definition.published_version_id)
@@ -94,6 +107,7 @@ class AgentConfigService:
                 AgentNodeBinding(
                     agent_version_id=version.id,
                     node_key=node_key,
+                    prompt_revision_id=default_prompts[node_key].id,
                     model_config=node["model"],
                     prompt_config=node["prompt"],
                     allowed_tools=node["allowed_tools"],
@@ -156,14 +170,24 @@ class AgentConfigService:
         )
         self.session.add(draft)
         self.session.flush()
+        prompt_service = PromptConfigService(self.session, self.settings)
+        default_prompts = prompt_service.ensure_defaults(SYSTEM_TENANT_ID)
         for binding in self._bindings(source.id):
+            prompt_revision_id = (
+                binding.prompt_revision_id or default_prompts[binding.node_key].id
+            )
+            prompt_config = prompt_service.resolve_revision(
+                prompt_revision_id,
+                expected_node_key=binding.node_key,
+            )
             self.session.add(
                 AgentNodeBinding(
                     agent_version_id=draft.id,
                     node_key=binding.node_key,
                     model_profile_revision_id=binding.model_profile_revision_id,
+                    prompt_revision_id=prompt_revision_id,
                     model_config=binding.model_config,
-                    prompt_config=binding.prompt_config,
+                    prompt_config=prompt_config,
                     allowed_tools=binding.allowed_tools,
                 )
             )
@@ -203,6 +227,36 @@ class AgentConfigService:
         self.session.refresh(version)
         return version
 
+    def set_draft_node_prompt(
+        self,
+        agent_version_id: str,
+        node_key: str,
+        prompt_revision_id: str,
+    ) -> AgentVersion:
+        if node_key not in NODE_REGISTRY:
+            raise ValueError(f"Unknown Agent node: {node_key}")
+        version = self.session.get(AgentVersion, agent_version_id)
+        if version is None or version.status != "DRAFT":
+            raise ValueError("Only draft Agent versions can be edited")
+        prompt_config = PromptConfigService(
+            self.session, self.settings
+        ).resolve_revision(prompt_revision_id, expected_node_key=node_key)
+        binding = self.session.scalar(
+            select(AgentNodeBinding).where(
+                AgentNodeBinding.agent_version_id == version.id,
+                AgentNodeBinding.node_key == node_key,
+            )
+        )
+        if binding is None:
+            raise ValueError(f"Draft is missing node binding: {node_key}")
+        binding.prompt_revision_id = prompt_revision_id
+        binding.prompt_config = prompt_config
+        self.session.flush()
+        version.config_hash = canonical_hash(self._behavior_for_version(version))
+        self.session.commit()
+        self.session.refresh(version)
+        return version
+
     def publish_draft(self, agent_version_id: str) -> AgentVersion:
         version = self.session.get(AgentVersion, agent_version_id)
         if version is None or version.status != "DRAFT":
@@ -213,6 +267,9 @@ class AgentConfigService:
         behavior = self._behavior_for_version(version)
         if set(behavior["nodes"]) != set(NODE_REGISTRY):
             raise ValueError("Draft does not contain the complete Node Registry")
+        bindings = self._bindings(version.id)
+        if any(binding.prompt_revision_id is None for binding in bindings):
+            raise ValueError("Draft contains a node without a Prompt revision")
         version.config_hash = canonical_hash(behavior)
         version.status = "PUBLISHED"
         version.published_at = datetime.now(timezone.utc)
@@ -294,14 +351,25 @@ class AgentConfigService:
         return run
 
     def _behavior_for_version(self, version: AgentVersion) -> dict:
-        nodes = {
-            binding.node_key: {
+        prompt_service = PromptConfigService(self.session, self.settings)
+        nodes = {}
+        for binding in self._bindings(version.id):
+            prompt_config = binding.prompt_config
+            if binding.prompt_revision_id:
+                resolved_prompt = prompt_service.resolve_revision(
+                    binding.prompt_revision_id,
+                    expected_node_key=binding.node_key,
+                )
+                if canonical_hash(prompt_config) != canonical_hash(resolved_prompt):
+                    raise ValueError(
+                        f"Prompt binding failed integrity validation: {binding.node_key}"
+                    )
+                prompt_config = resolved_prompt
+            nodes[binding.node_key] = {
                 "model": binding.model_config,
-                "prompt": binding.prompt_config,
+                "prompt": prompt_config,
                 "allowed_tools": binding.allowed_tools,
             }
-            for binding in self._bindings(version.id)
-        }
         return {**version.config, "nodes": nodes}
 
     def _bindings(self, agent_version_id: str) -> list[AgentNodeBinding]:

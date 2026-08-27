@@ -89,17 +89,23 @@ def test_alembic_clean_database_upgrade_downgrade_cycle(tmp_path, monkeypatch) -
     command.upgrade(config, "head")
     engine = create_engine(database_url)
     assert inspect(engine).has_table("model_profiles")
+    assert inspect(engine).has_table("prompt_revisions")
     assert "model_profile_revision_id" in {
+        item["name"] for item in inspect(engine).get_columns("agent_node_bindings")
+    }
+    assert "prompt_revision_id" in {
         item["name"] for item in inspect(engine).get_columns("agent_node_bindings")
     }
 
     command.downgrade(config, "base")
     assert not inspect(engine).has_table("agent_definitions")
     assert not inspect(engine).has_table("model_profiles")
+    assert not inspect(engine).has_table("prompt_revisions")
 
     command.upgrade(config, "head")
     assert inspect(engine).has_table("agent_definitions")
     assert inspect(engine).has_table("model_profiles")
+    assert inspect(engine).has_table("prompt_revisions")
     engine.dispose()
 
 

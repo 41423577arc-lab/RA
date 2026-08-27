@@ -28,10 +28,19 @@ def canonical_hash(value: object) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def build_legacy_behavior_config(settings: Settings) -> dict:
+def build_legacy_behavior_config(
+    settings: Settings,
+    *,
+    prompt_configs: dict[str, dict] | None = None,
+) -> dict:
     prompt_dir = Path(settings.prompt_dir)
     nodes = {
-        node_key: _legacy_node_config(settings, prompt_dir, node_key)
+        node_key: _legacy_node_config(
+            settings,
+            prompt_dir,
+            node_key,
+            prompt_config=(prompt_configs or {}).get(node_key),
+        )
         for node_key in NODE_REGISTRY
     }
     mcp_server = {
@@ -132,20 +141,30 @@ def resolved_snapshot(
     }
 
 
-def _legacy_node_config(settings: Settings, prompt_dir: Path, node_key: str) -> dict:
-    prompt_path = prompt_dir / f"{node_key}_v1.txt"
-    content = prompt_path.read_text(encoding="utf-8")
-    prompt = {
-        "revision_id": f"legacy-prompt:{node_key}:{canonical_hash(content)}",
-        "content_hash": canonical_hash(content),
-        "content": content,
-        "source": f"backend/prompts/{prompt_path.name}",
-        "skills": [],
-    }
-    if node_key == "intake_agent":
-        prompt["skills"] = [
-            _prompt_asset(path) for path in sorted((prompt_dir / "intake_skills").glob("*.txt"))
-        ]
+def _legacy_node_config(
+    settings: Settings,
+    prompt_dir: Path,
+    node_key: str,
+    *,
+    prompt_config: dict | None = None,
+) -> dict:
+    if prompt_config is not None:
+        prompt = dict(prompt_config)
+    else:
+        prompt_path = prompt_dir / f"{node_key}_v1.txt"
+        content = prompt_path.read_text(encoding="utf-8")
+        prompt = {
+            "revision_id": f"legacy-prompt:{node_key}:{canonical_hash(content)}",
+            "content_hash": canonical_hash(content),
+            "content": content,
+            "source": f"backend/prompts/{prompt_path.name}",
+            "skills": [],
+        }
+        if node_key == "intake_agent":
+            prompt["skills"] = [
+                _prompt_asset(path)
+                for path in sorted((prompt_dir / "intake_skills").glob("*.txt"))
+            ]
     return {
         "model": {
             "provider": settings.model_provider,

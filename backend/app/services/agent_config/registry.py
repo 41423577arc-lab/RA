@@ -7,6 +7,7 @@ class NodeSpec:
     output_schema: str
     conditional: bool = False
     allows_tools: bool = False
+    prompt_variables: tuple[str, ...] = ()
 
 
 NODE_REGISTRY = {

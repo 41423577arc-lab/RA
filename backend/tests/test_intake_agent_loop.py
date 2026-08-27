@@ -719,8 +719,8 @@ def test_mechanical_loop_forces_internal_lookup_before_redundant_user_question()
             IntakeEntityAssessment(
                 entity_type="PERSON",
                 mention="刘希川",
-                is_standard=True,
-                reason="用户提供完整姓名",
+                is_standard=False,
+                reason="模型错误地把完整姓名标记为非标准",
             ),
             IntakeEntityAssessment(
                 entity_type="ORGANIZATION",

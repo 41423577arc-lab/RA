@@ -24,6 +24,7 @@ from app.services.agent_config.service import (
     DEFAULT_AGENT_DEFINITION_ID,
     AgentConfigService,
 )
+from app.services.agent_config.snapshot import canonical_hash
 from app.services.integrations.llm_client import StructuredLLM
 
 
@@ -199,7 +200,24 @@ def test_structured_llm_uses_node_model_from_run_snapshot() -> None:
         "response_storage_disabled": True,
         "store": False,
     }
-    snapshot = {"nodes": {"evidence_verify": {"model": node_model}}}
+    prompt_content = (ROOT / "backend/prompts/evidence_verify_v1.txt").read_text(
+        encoding="utf-8"
+    )
+    snapshot = {
+        "nodes": {
+            "evidence_verify": {
+                "model": node_model,
+                "prompt": {
+                    "revision_id": "test-evidence-prompt",
+                    "version": 1,
+                    "node_key": "evidence_verify",
+                    "content": prompt_content,
+                    "content_hash": canonical_hash(prompt_content),
+                    "skills": [],
+                },
+            }
+        }
+    }
     adapter = _FakeAdapter()
     llm = StructuredLLM(
         config,

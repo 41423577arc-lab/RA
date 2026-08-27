@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from app.config import Settings
 from app.services.agent_config.provider_adapters import ProviderAdapterRegistry
 from app.services.agent_config.secrets import ALLOWED_ENV_SECRET_REFS, SecretStore
+from app.services.agent_config.snapshot import canonical_hash
 
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
@@ -97,7 +98,14 @@ class StructuredLLM:
         max_retries = int(model_config.get("max_retries", 1))
         max_output_tokens = int(model_config.get("max_output_tokens", 8000))
         reasoning_effort = model_config.get("reasoning_effort", "xhigh")
-        system_prompt = self._system_prompt(node_name)
+        prompt_config = self._prompt_config(node_name)
+        system_prompt = self._system_prompt(node_name, prompt_config)
+        prompt_version = self._prompt_version(prompt_config)
+        prompt_metadata = {
+            "prompt_revision_id": (prompt_config or {}).get("revision_id"),
+            "prompt_content_hash": (prompt_config or {}).get("content_hash"),
+            "prompt_version": prompt_version,
+        }
         safety_identifier = hashlib.sha256(
             f"{task_id}{safety_salt}".encode("utf-8")
         ).hexdigest()
@@ -124,6 +132,7 @@ class StructuredLLM:
                             "messages": messages,
                             "max_tokens": max_output_tokens,
                             "store": False,
+                            **prompt_metadata,
                         },
                     )
                     parsed, response = self._parse_chat_completion(
@@ -157,6 +166,7 @@ class StructuredLLM:
                             "reasoning_effort": reasoning_effort,
                             "max_output_tokens": max_output_tokens,
                             "store": False,
+                            **prompt_metadata,
                         },
                     )
                     parsed, response = self._parse_response(
@@ -201,6 +211,7 @@ class StructuredLLM:
                     response_id=getattr(response, "id", None),
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
+                    prompt_version=prompt_version,
                 )
                 return parsed
             except Exception as exc:
@@ -228,10 +239,41 @@ class StructuredLLM:
             started,
             error_type=type(last_error).__name__ if last_error else "UnknownError",
             error_message=str(last_error)[:1000] if last_error else "未知错误",
+            prompt_version=prompt_version,
         )
         raise LLMCallFailed(f"{node_name} 调用失败: {last_error}") from last_error
 
-    def _system_prompt(self, node_name: str) -> str:
+    def _system_prompt(
+        self,
+        node_name: str,
+        prompt_config: dict | None = None,
+    ) -> str:
+        if self.resolved_config is not None:
+            prompt = prompt_config if prompt_config is not None else self._prompt_config(node_name)
+            content = str(prompt.get("content", ""))
+            if not content or canonical_hash(content) != prompt.get("content_hash"):
+                raise LLMUnavailable(f"Prompt snapshot failed integrity validation: {node_name}")
+            if prompt.get("node_key") not in (None, node_name):
+                raise LLMUnavailable(f"Prompt snapshot node mismatch: {node_name}")
+            skills = list(prompt.get("skills") or [])
+            for skill in skills:
+                skill_content = str(skill.get("content", ""))
+                if not skill_content or canonical_hash(skill_content) != skill.get(
+                    "content_hash"
+                ):
+                    raise LLMUnavailable(
+                        f"Prompt Skill snapshot failed integrity validation: {node_name}"
+                    )
+            if node_name != "intake_agent":
+                if skills:
+                    raise LLMUnavailable(f"Prompt snapshot has unexpected Skills: {node_name}")
+                return content
+            if not skills:
+                raise LLMUnavailable("Intake Agent Prompt snapshot has no Skills")
+            return "\n\n".join(
+                [content.rstrip(), "## 可用 Skills", *(item["content"].strip() for item in skills)]
+            )
+
         prompt_dir = Path(self.settings.prompt_dir)
         prompt_path = prompt_dir / f"{node_name}_v1.txt"
         system_prompt = prompt_path.read_text(encoding="utf-8")
@@ -248,6 +290,24 @@ class StructuredLLM:
         return "\n\n".join(
             [system_prompt.rstrip(), "## 可用 Skills", *skill_prompts]
         )
+
+    def _prompt_config(self, node_name: str) -> dict | None:
+        if self.resolved_config is None:
+            return None
+        node = self.resolved_config.get("nodes", {}).get(node_name)
+        if node is None:
+            raise LLMUnavailable(f"Agent run does not configure node: {node_name}")
+        prompt = node.get("prompt")
+        if not isinstance(prompt, dict):
+            raise LLMUnavailable(f"Agent run does not configure Prompt: {node_name}")
+        return dict(prompt)
+
+    @staticmethod
+    def _prompt_version(prompt_config: dict | None) -> str:
+        if not prompt_config:
+            return "v1"
+        version = prompt_config.get("version")
+        return f"v{version}" if version is not None else "v1"
 
     def _parse_chat_completion(
         self,
@@ -452,6 +512,7 @@ class StructuredLLM:
         model: str,
         status: str,
         started: float,
+        prompt_version: str = "v1",
         **extra,
     ) -> None:
         logger = getattr(self.repository, "log_llm_call", None)
@@ -462,7 +523,7 @@ class StructuredLLM:
             node_name=node_name,
             model=model,
             status=status,
-            prompt_version="v1",
+            prompt_version=prompt_version,
             latency_ms=int((time.perf_counter() - started) * 1000),
             **extra,
         )
