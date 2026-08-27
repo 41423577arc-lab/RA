@@ -26,6 +26,7 @@ from app.schemas.task import ConfirmationPayload
 from app.services.intake.activity import intake_activity
 from app.services.intake.agent import IntakeAgent
 from app.services.agent_config.service import AgentConfigService
+from app.services.agent_config.secrets import SecretStore
 from app.services.intake.completeness import (
     is_intake_ready,
     required_missing_information,
@@ -62,9 +63,10 @@ from app.tasks.intake_audio import run_intake_audio_transcription
 router = APIRouter(prefix="/api/v1/intake", tags=["intake"])
 _default_intake_agent = IntakeAgent(StructuredLLM(settings))
 intake_agent = _default_intake_agent
-entity_candidates = IntakeEntityCandidateService(
+_default_entity_candidates = IntakeEntityCandidateService(
     ProjectMcpClient(settings.mcp_server_url), TavilyClient(settings.tavily_api_key)
 )
+entity_candidates = _default_entity_candidates
 MAX_AUDIO_BYTES = 30 * 1024 * 1024
 
 
@@ -74,6 +76,19 @@ def _agent_for(
     if intake_agent is not _default_intake_agent:
         return intake_agent
     return IntakeAgent(StructuredLLM(settings, repository, resolved_config))
+
+
+def _entity_candidates_for(session: Session, resolved_config: dict) -> object:
+    if entity_candidates is not _default_entity_candidates:
+        return entity_candidates
+    projects = ProjectMcpClient.from_snapshot(
+        resolved_config,
+        caller_node="intake_agent",
+        secret_resolver=SecretStore(session, settings).resolve,
+    )
+    return IntakeEntityCandidateService(
+        projects, TavilyClient(settings.tavily_api_key)
+    )
 
 
 def _chat_response(intake_session: IntakeSession) -> IntakeChatResponse:
@@ -169,7 +184,9 @@ def chat(
         repository=repository,
         session=session,
         agent=_agent_for(repository, agent_run.resolved_config_snapshot),
-        entity_candidates=entity_candidates,
+        entity_candidates=_entity_candidates_for(
+            session, agent_run.resolved_config_snapshot
+        ),
         activity=intake_activity,
         settings=settings,
     )

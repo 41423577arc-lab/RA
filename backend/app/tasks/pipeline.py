@@ -32,6 +32,7 @@ from app.services.agent_config.service import AgentConfigService
 from app.services.research.extractor import RuleExtractor
 from app.services.integrations.llm_client import StructuredLLM
 from app.services.integrations.mcp_client import ProjectMcpClient
+from app.services.agent_config.secrets import SecretStore
 from app.services.research.project_ranker import ProjectRanker
 from app.services.reporting.renderer import ReportRenderer
 from app.services.research.resource_association import ResourceAssociationBuilder
@@ -612,7 +613,11 @@ def run_research_pipeline(task_id: str) -> None:
             transcriber=LocalWhisperTranscriber(settings.whisper_model_path),
             extractor=RuleExtractor(settings.seed_dir),
             web=TavilyClient(settings.tavily_api_key),
-            projects=ProjectMcpClient(settings.mcp_server_url),
+            projects=ProjectMcpClient.from_snapshot(
+                agent_run.resolved_config_snapshot,
+                caller_node="research_pipeline",
+                secret_resolver=SecretStore(session, settings).resolve,
+            ),
             renderer=ReportRenderer(
                 settings.report_template,
                 settings.detailed_report_template,

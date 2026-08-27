@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     agent_secret_key: str = ""
     agent_allow_private_model_urls: bool = False
     agent_trusted_model_hosts: str = ""
+    agent_allow_private_mcp_urls: bool = False
+    agent_trusted_mcp_hosts: str = "mcp-server"
     intake_entity_resolution_enabled: bool = True
     intake_audio_enabled: bool = True
     intake_react_enabled: bool = True

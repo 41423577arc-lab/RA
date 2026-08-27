@@ -9,9 +9,11 @@ from app.models.database import (
     AgentDefinition,
     AgentNodeBinding,
     AgentRun,
+    AgentToolBinding,
     AgentVersion,
     Tenant,
 )
+from app.services.agent_config.mcp import DEFAULT_TOOL_MAPPINGS, McpConfigService
 from app.services.agent_config.snapshot import (
     CONFIG_SCHEMA_VERSION,
     build_legacy_behavior_config,
@@ -61,9 +63,20 @@ class AgentConfigService:
             )
             for node_key, revision in default_prompts.items()
         }
+        mcp_service = McpConfigService(self.session, self.settings)
+        default_server, default_tools = mcp_service.ensure_defaults(SYSTEM_TENANT_ID)
+        mcp_server_configs = [mcp_service.resolve_server_revision(default_server.id)]
+        mcp_tool_configs = []
+        for logical_key, (revision, allowed_nodes) in default_tools.items():
+            item = mcp_service.resolve_mapping_revision(revision.id)
+            item.pop("server", None)
+            item["allowed_nodes"] = allowed_nodes
+            mcp_tool_configs.append(item)
         behavior = build_legacy_behavior_config(
             self.settings,
             prompt_configs=prompt_configs,
+            mcp_server_configs=mcp_server_configs,
+            mcp_tool_configs=mcp_tool_configs,
         )
         behavior_hash = canonical_hash(behavior)
         published = (
@@ -111,6 +124,15 @@ class AgentConfigService:
                     model_config=node["model"],
                     prompt_config=node["prompt"],
                     allowed_tools=node["allowed_tools"],
+                )
+            )
+        for logical_key, (mapping_revision, allowed_nodes) in default_tools.items():
+            self.session.add(
+                AgentToolBinding(
+                    agent_version_id=version.id,
+                    logical_tool_key=logical_key,
+                    tool_mapping_revision_id=mapping_revision.id,
+                    allowed_nodes=allowed_nodes,
                 )
             )
         definition.published_version_id = version.id
@@ -191,6 +213,15 @@ class AgentConfigService:
                     allowed_tools=binding.allowed_tools,
                 )
             )
+        for binding in self._tool_bindings(source.id):
+            self.session.add(
+                AgentToolBinding(
+                    agent_version_id=draft.id,
+                    logical_tool_key=binding.logical_tool_key,
+                    tool_mapping_revision_id=binding.tool_mapping_revision_id,
+                    allowed_nodes=binding.allowed_nodes,
+                )
+            )
         self.session.commit()
         self.session.refresh(draft)
         return draft
@@ -257,6 +288,48 @@ class AgentConfigService:
         self.session.refresh(version)
         return version
 
+    def set_draft_tool_mapping(
+        self,
+        agent_version_id: str,
+        logical_tool_key: str,
+        tool_mapping_revision_id: str,
+        allowed_nodes: list[str],
+    ) -> AgentVersion:
+        version = self.session.get(AgentVersion, agent_version_id)
+        if version is None or version.status != "DRAFT":
+            raise ValueError("Only draft Agent versions can be edited")
+        allowed_callers = {*NODE_REGISTRY, "research_pipeline"}
+        normalized_nodes = sorted(set(allowed_nodes))
+        if not normalized_nodes or set(normalized_nodes) - allowed_callers:
+            raise ValueError("Tool mapping contains an unknown or empty allowed-nodes list")
+        resolved = McpConfigService(self.session, self.settings).resolve_mapping_revision(
+            tool_mapping_revision_id
+        )
+        if resolved["logical_tool_key"] != logical_tool_key:
+            raise ValueError("Tool mapping revision does not match the logical tool key")
+        binding = self.session.scalar(
+            select(AgentToolBinding).where(
+                AgentToolBinding.agent_version_id == version.id,
+                AgentToolBinding.logical_tool_key == logical_tool_key,
+            )
+        )
+        if binding is None:
+            binding = AgentToolBinding(
+                agent_version_id=version.id,
+                logical_tool_key=logical_tool_key,
+                tool_mapping_revision_id=tool_mapping_revision_id,
+                allowed_nodes=normalized_nodes,
+            )
+            self.session.add(binding)
+        else:
+            binding.tool_mapping_revision_id = tool_mapping_revision_id
+            binding.allowed_nodes = normalized_nodes
+        self.session.flush()
+        version.config_hash = canonical_hash(self._behavior_for_version(version))
+        self.session.commit()
+        self.session.refresh(version)
+        return version
+
     def publish_draft(self, agent_version_id: str) -> AgentVersion:
         version = self.session.get(AgentVersion, agent_version_id)
         if version is None or version.status != "DRAFT":
@@ -270,6 +343,12 @@ class AgentConfigService:
         bindings = self._bindings(version.id)
         if any(binding.prompt_revision_id is None for binding in bindings):
             raise ValueError("Draft contains a node without a Prompt revision")
+        tool_keys = {binding.logical_tool_key for binding in self._tool_bindings(version.id)}
+        missing_tools = set(DEFAULT_TOOL_MAPPINGS) - tool_keys
+        if missing_tools:
+            raise ValueError(
+                f"Draft is missing required logical tools: {', '.join(sorted(missing_tools))}"
+            )
         version.config_hash = canonical_hash(behavior)
         version.status = "PUBLISHED"
         version.published_at = datetime.now(timezone.utc)
@@ -370,7 +449,30 @@ class AgentConfigService:
                 "prompt": prompt_config,
                 "allowed_tools": binding.allowed_tools,
             }
-        return {**version.config, "nodes": nodes}
+        config = {**version.config, "nodes": nodes}
+        tool_bindings = self._tool_bindings(version.id)
+        if not tool_bindings:
+            return config
+        mcp_service = McpConfigService(self.session, self.settings)
+        tool_mappings = [
+            item
+            for item in config.get("tool_mappings", [])
+            if item.get("provider") != "mcp"
+        ]
+        servers: dict[str, dict] = {}
+        for binding in tool_bindings:
+            mapping = mcp_service.resolve_mapping_revision(
+                binding.tool_mapping_revision_id
+            )
+            server = mapping.pop("server")
+            mapping["allowed_nodes"] = sorted(set(binding.allowed_nodes))
+            tool_mappings.append(mapping)
+            servers[server["revision_id"]] = server
+        config["mcp_server_revisions"] = [servers[key] for key in sorted(servers)]
+        config["tool_mappings"] = sorted(
+            tool_mappings, key=lambda item: item["logical_tool_key"]
+        )
+        return config
 
     def _bindings(self, agent_version_id: str) -> list[AgentNodeBinding]:
         return list(
@@ -378,5 +480,14 @@ class AgentConfigService:
                 select(AgentNodeBinding)
                 .where(AgentNodeBinding.agent_version_id == agent_version_id)
                 .order_by(AgentNodeBinding.node_key)
+            )
+        )
+
+    def _tool_bindings(self, agent_version_id: str) -> list[AgentToolBinding]:
+        return list(
+            self.session.scalars(
+                select(AgentToolBinding)
+                .where(AgentToolBinding.agent_version_id == agent_version_id)
+                .order_by(AgentToolBinding.logical_tool_key)
             )
         )

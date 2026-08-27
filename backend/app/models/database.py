@@ -201,6 +201,85 @@ class PromptRevision(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class McpServerDefinition(Base):
+    __tablename__ = "mcp_server_definitions"
+    __table_args__ = (UniqueConstraint("tenant_id", "slug"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    slug: Mapped[str] = mapped_column(String(100), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="ACTIVE")
+    active_revision_id: Mapped[str | None] = mapped_column(String(36))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class McpServerRevision(Base):
+    __tablename__ = "mcp_server_revisions"
+    __table_args__ = (UniqueConstraint("mcp_server_definition_id", "version"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    mcp_server_definition_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("mcp_server_definitions.id"), nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(nullable=False)
+    transport: Mapped[str] = mapped_column(String(32), nullable=False)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    authentication_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    secret_ref: Mapped[str | None] = mapped_column(String(255))
+    timeout_seconds: Mapped[int] = mapped_column(nullable=False, default=10)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="PUBLISHED")
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ToolMappingDefinition(Base):
+    __tablename__ = "tool_mapping_definitions"
+    __table_args__ = (UniqueConstraint("tenant_id", "logical_tool_key"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    logical_tool_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="ACTIVE")
+    active_revision_id: Mapped[str | None] = mapped_column(String(36))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ToolMappingRevision(Base):
+    __tablename__ = "tool_mapping_revisions"
+    __table_args__ = (UniqueConstraint("tool_mapping_definition_id", "version"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tool_mapping_definition_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tool_mapping_definitions.id"), nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(nullable=False)
+    mcp_server_revision_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("mcp_server_revisions.id"), nullable=False, index=True
+    )
+    remote_tool_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    adapter_key: Mapped[str] = mapped_column(String(100), nullable=False, default="declarative")
+    input_mapping: Mapped[dict] = mapped_column(INTAKE_JSON, nullable=False, default=dict)
+    output_mapping: Mapped[dict] = mapped_column(INTAKE_JSON, nullable=False, default=dict)
+    timeout_seconds: Mapped[int] = mapped_column(nullable=False, default=10)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="PUBLISHED")
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class AgentNodeBinding(Base):
     __tablename__ = "agent_node_bindings"
     __table_args__ = (UniqueConstraint("agent_version_id", "node_key"),)
@@ -219,6 +298,21 @@ class AgentNodeBinding(Base):
     model_config: Mapped[dict] = mapped_column(INTAKE_JSON, nullable=False, default=dict)
     prompt_config: Mapped[dict] = mapped_column(INTAKE_JSON, nullable=False, default=dict)
     allowed_tools: Mapped[list] = mapped_column(INTAKE_JSON, nullable=False, default=list)
+
+
+class AgentToolBinding(Base):
+    __tablename__ = "agent_tool_bindings"
+    __table_args__ = (UniqueConstraint("agent_version_id", "logical_tool_key"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    agent_version_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_versions.id"), nullable=False, index=True
+    )
+    logical_tool_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    tool_mapping_revision_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tool_mapping_revisions.id"), nullable=False, index=True
+    )
+    allowed_nodes: Mapped[list] = mapped_column(INTAKE_JSON, nullable=False, default=list)
 
 
 class AgentRun(Base):

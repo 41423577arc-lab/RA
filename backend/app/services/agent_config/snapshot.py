@@ -32,6 +32,8 @@ def build_legacy_behavior_config(
     settings: Settings,
     *,
     prompt_configs: dict[str, dict] | None = None,
+    mcp_server_configs: list[dict] | None = None,
+    mcp_tool_configs: list[dict] | None = None,
 ) -> dict:
     prompt_dir = Path(settings.prompt_dir)
     nodes = {
@@ -43,13 +45,15 @@ def build_legacy_behavior_config(
         )
         for node_key in NODE_REGISTRY
     }
-    mcp_server = {
+    legacy_mcp_server = {
         "transport": "streamable_http",
         "url": settings.mcp_server_url,
-        "authentication": {"type": "none", "secret_ref": None},
+        "authentication_type": "none",
+        "secret_ref": None,
+        "timeout_seconds": 10,
     }
-    mcp_revision_id = f"legacy-mcp:{canonical_hash(mcp_server)}"
-    tool_mappings = [
+    mcp_revision_id = f"legacy-mcp:{canonical_hash(legacy_mcp_server)}"
+    legacy_mcp_tools = [
         {
             "logical_tool_key": "identity.find_candidates",
             "mapping_revision_id": "legacy-mapping:identity.find_candidates:v1",
@@ -72,6 +76,8 @@ def build_legacy_behavior_config(
             "input_mapping": {},
             "output_mapping": {},
         },
+    ]
+    external_tool_mappings = [
         {
             "logical_tool_key": "identity.search_public",
             "mapping_revision_id": "legacy-mapping:identity.search_public:v1",
@@ -94,13 +100,19 @@ def build_legacy_behavior_config(
             "allowed_nodes": ["research_pipeline"],
         },
     ]
+    tool_mappings = sorted(
+        [*(mcp_tool_configs or legacy_mcp_tools), *external_tool_mappings],
+        key=lambda item: item["logical_tool_key"],
+    )
     return {
         "config_schema_version": CONFIG_SCHEMA_VERSION,
         "management": {"source": "legacy_bootstrap"},
         "nodes": nodes,
-        "mcp_server_revisions": [
-            {"revision_id": mcp_revision_id, **mcp_server}
-        ],
+        "mcp_server_revisions": sorted(
+            mcp_server_configs
+            or [{"revision_id": mcp_revision_id, **legacy_mcp_server}],
+            key=lambda item: item["revision_id"],
+        ),
         "tool_mappings": tool_mappings,
         "loop": {
             "max_loops": settings.agent_max_loops,

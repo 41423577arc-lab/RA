@@ -86,3 +86,54 @@ async def test_mcp_client_retries_twice_before_succeeding(monkeypatch) -> None:
     assert projects == []
     assert search_once.await_count == 3
     assert [call.args[0] for call in sleep.await_args_list] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_tool_mapping_enforces_node_permission_before_network(monkeypatch) -> None:
+    transport = AsyncMock()
+    monkeypatch.setattr(mcp_module, "streamable_http_client", transport)
+    snapshot = {
+        "mcp_server_revisions": [
+            {
+                "revision_id": "server-1",
+                "url": "http://mcp:8001/mcp",
+                "authentication_type": "none",
+            }
+        ],
+        "tool_mappings": [
+            {
+                "logical_tool_key": "projects.search",
+                "provider": "mcp",
+                "server_revision_id": "server-1",
+                "remote_tool_name": "search_projects",
+                "allowed_nodes": ["research_pipeline"],
+            }
+        ],
+    }
+    client = ProjectMcpClient.from_snapshot(snapshot, caller_node="intake_agent")
+
+    with pytest.raises(PermissionError, match="cannot call"):
+        await client._call_tool("projects.search", {})
+
+    transport.assert_not_called()
+
+
+def test_declarative_mapping_renames_fields_without_executing_code() -> None:
+    mapped_input = mcp_module.DeclarativeToolAdapter.map_input(
+        {"organization_names": ["中建二局"], "keywords": ["储能"]},
+        {
+            "rename": {"organization_names": "customer_names"},
+            "constants": {"scope": "active"},
+        },
+    )
+    mapped_output = mcp_module.DeclarativeToolAdapter.map_output(
+        [{"xm_mc": "示例项目", "status": "ACTIVE"}],
+        {"rename": {"xm_mc": "project_name"}},
+    )
+
+    assert mapped_input == {
+        "customer_names": ["中建二局"],
+        "keywords": ["储能"],
+        "scope": "active",
+    }
+    assert mapped_output == [{"project_name": "示例项目", "status": "ACTIVE"}]
