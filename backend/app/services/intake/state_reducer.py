@@ -58,7 +58,8 @@ class IntakeStateReducer:
         observation: ToolObservation,
     ) -> AgentState:
         additions = IntakeStateReducer._expand_relationship_resolutions(
-            observation.resolutions
+            observation.resolutions,
+            state.context,
         )
         resolutions = IntakeStateReducer._merge_resolutions(
             state.context.entity_resolutions,
@@ -131,6 +132,7 @@ class IntakeStateReducer:
     @staticmethod
     def _expand_relationship_resolutions(
         resolutions: list[IntakeEntityResolution],
+        context: IntakeStructuredContext,
     ) -> list[IntakeEntityResolution]:
         expanded = list(resolutions)
         existing_organizations = {
@@ -146,11 +148,16 @@ class IntakeStateReducer:
             ):
                 continue
             # 受控人物候选中的所属关系同时构成企业身份依据。
+            mention = (
+                context.organizations[0]
+                if len(context.people) == 1 and len(context.organizations) == 1
+                else item.organization
+            )
             expanded.append(
                 IntakeEntityResolution(
                     entity_type="ORGANIZATION",
                     canonical_name=item.organization,
-                    mention=item.organization,
+                    mention=mention,
                     confidence=item.confidence,
                     confirmed_by=item.confirmed_by,
                     source_url=item.source_url,

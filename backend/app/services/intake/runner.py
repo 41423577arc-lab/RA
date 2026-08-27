@@ -236,9 +236,12 @@ def standardized_context(context: dict, resolutions: list[dict] | None) -> dict:
         if item.get("entity_type") == "ORGANIZATION" and item.get("canonical_name")
     }
     output["people"] = [person_names.get(name, name) for name in output.get("people", [])]
-    output["organizations"] = [
-        organization_names.get(name, name) for name in output.get("organizations", [])
-    ]
+    output["organizations"] = list(
+        dict.fromkeys(
+            organization_names.get(name, name)
+            for name in output.get("organizations", [])
+        )
+    )
     output["people_details"] = [
         {
             **item,

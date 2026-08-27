@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     agent_max_loops: int = 8
     agent_max_tool_calls: int = 4
     agent_max_repeated_actions: int = 2
+    agent_admin_enabled: bool = False
+    agent_secret_key: str = ""
+    agent_allow_private_model_urls: bool = False
+    agent_trusted_model_hosts: str = ""
     intake_entity_resolution_enabled: bool = True
     intake_audio_enabled: bool = True
     intake_react_enabled: bool = True

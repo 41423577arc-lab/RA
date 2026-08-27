@@ -28,6 +28,7 @@ from app.services.research.final_synthesis import (
     validate_final_synthesis,
 )
 from app.services.intake.entity_resolver import EntityResolver
+from app.services.agent_config.service import AgentConfigService
 from app.services.research.extractor import RuleExtractor
 from app.services.integrations.llm_client import StructuredLLM
 from app.services.integrations.mcp_client import ProjectMcpClient
@@ -596,7 +597,16 @@ def identity_claims_from_intake_snapshot(snapshot: dict | None) -> list[PublicCl
 def run_research_pipeline(task_id: str) -> None:
     with SessionLocal() as session:
         repository = TaskRepository(session)
-        llm = StructuredLLM(settings, repository)
+        if repository.get(task_id) is None:
+            raise KeyError(f"Task {task_id} not found")
+        config_service = AgentConfigService(session, settings)
+        agent_run = config_service.get_for_task(task_id) or config_service.ensure_task_run(
+            task_id
+        )
+        config_service.update_run_status(agent_run, "RUNNING")
+        llm = StructuredLLM(
+            settings, repository, agent_run.resolved_config_snapshot
+        )
         pipeline = ResearchPipeline(
             repository=repository,
             transcriber=LocalWhisperTranscriber(settings.whisper_model_path),
@@ -611,4 +621,10 @@ def run_research_pipeline(task_id: str) -> None:
             agents=AgentNodes(llm),
             entity_resolver=EntityResolver(),
         )
-        pipeline.run(task_id)
+        try:
+            pipeline.run(task_id)
+        finally:
+            task = repository.get_fresh(task_id)
+            config_service.update_run_status(
+                agent_run, task.status if task is not None else "FAILED"
+            )

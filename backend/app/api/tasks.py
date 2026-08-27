@@ -33,6 +33,7 @@ from app.schemas.task import (
     WebVerification,
 )
 from app.services.intake.entity_resolver import EntityResolver
+from app.services.agent_config.service import AgentConfigService
 from app.services.reporting.analysis_chat import (
     AnalysisChatAgent,
     build_task_chat_context,
@@ -52,6 +53,7 @@ def create_text_task(payload: TextTaskRequest, session: Session = Depends(get_se
     task = TaskRepository(session).add(
         ResearchTask(id=str(uuid4()), input_type="text", input_text=payload.text.strip())
     )
+    AgentConfigService(session, settings).ensure_task_run(task.id)
     run_research_pipeline.delay(task.id)
     return TaskCreated(task_id=UUID(task.id), input_type="text")
 
@@ -75,6 +77,7 @@ async def create_audio_task(
     task = TaskRepository(session).add(
         ResearchTask(id=task_id, input_type="audio", audio_path=str(audio_path))
     )
+    AgentConfigService(session, settings).ensure_task_run(task.id)
     run_research_pipeline.delay(task.id)
     return TaskCreated(task_id=UUID(task.id), input_type="audio")
 
@@ -251,6 +254,10 @@ def cancel_task(task_id: UUID, session: Session = Depends(get_session)) -> TaskR
     if task.status in {"COMPLETED", "FAILED", "CANCELLED"}:
         raise HTTPException(status_code=409, detail="当前任务已经结束")
     repository.update(str(task_id), status="CANCELLED")
+    config_service = AgentConfigService(session, settings)
+    agent_run = config_service.get_for_task(str(task_id))
+    if agent_run is not None:
+        config_service.update_run_status(agent_run, "CANCELLED")
     return get_task(task_id, session)
 
 
@@ -270,8 +277,14 @@ def chat_with_task(
         for item in snapshot.get("analysis_chat_messages", [])
     ][-38:]
     context = build_task_chat_context(task)
+    config_service = AgentConfigService(session, settings)
+    agent_run = config_service.get_for_task(str(task_id)) or config_service.ensure_task_run(
+        str(task_id)
+    )
     try:
-        result = AnalysisChatAgent(StructuredLLM(settings, repository)).respond(
+        result = AnalysisChatAgent(
+            StructuredLLM(settings, repository, agent_run.resolved_config_snapshot)
+        ).respond(
             str(task_id), payload.message.strip(), history, context
         )
         assistant_reply = result.assistant_reply

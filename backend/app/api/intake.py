@@ -25,6 +25,7 @@ from app.schemas.task import TaskCreated
 from app.schemas.task import ConfirmationPayload
 from app.services.intake.activity import intake_activity
 from app.services.intake.agent import IntakeAgent
+from app.services.agent_config.service import AgentConfigService
 from app.services.intake.completeness import (
     is_intake_ready,
     required_missing_information,
@@ -67,10 +68,12 @@ entity_candidates = IntakeEntityCandidateService(
 MAX_AUDIO_BYTES = 30 * 1024 * 1024
 
 
-def _agent_for(repository: IntakeSessionRepository) -> IntakeAgent:
+def _agent_for(
+    repository: IntakeSessionRepository, resolved_config: dict | None = None
+) -> IntakeAgent:
     if intake_agent is not _default_intake_agent:
         return intake_agent
-    return IntakeAgent(StructuredLLM(settings, repository))
+    return IntakeAgent(StructuredLLM(settings, repository, resolved_config))
 
 
 def _chat_response(intake_session: IntakeSession) -> IntakeChatResponse:
@@ -159,10 +162,13 @@ def chat(
     request: IntakeChatRequest, session: Session = Depends(get_session)
 ) -> IntakeChatResponse:
     repository = IntakeSessionRepository(session)
+    agent_run = AgentConfigService(session, settings).ensure_intake_run(
+        str(request.session_id)
+    )
     runner = IntakeRunner(
         repository=repository,
         session=session,
-        agent=_agent_for(repository),
+        agent=_agent_for(repository, agent_run.resolved_config_snapshot),
         entity_candidates=entity_candidates,
         activity=intake_activity,
         settings=settings,
@@ -305,10 +311,14 @@ def confirm_intake_entities(
     session: Session = Depends(get_session),
 ) -> IntakeSessionResponse:
     repository = IntakeSessionRepository(session)
-    request_agent = _agent_for(repository)
-    intake_session = repository.get(str(session_id), for_update=True)
-    if intake_session is None:
+    existing_session = repository.get(str(session_id))
+    if existing_session is None:
         raise HTTPException(status_code=404, detail="信息采集会话不存在")
+    agent_run = AgentConfigService(session, settings).ensure_intake_run(str(session_id))
+    intake_session = repository.get(str(session_id), for_update=True)
+    if intake_session is None:  # pragma: no cover - deleted between reads
+        raise HTTPException(status_code=404, detail="信息采集会话不存在")
+    request_agent = _agent_for(repository, agent_run.resolved_config_snapshot)
     if intake_session.status != "NEEDS_CONFIRMATION" or not intake_session.confirmation_request:
         raise HTTPException(status_code=409, detail="当前会话不需要身份确认")
     request = intake_session.confirmation_request
@@ -578,14 +588,21 @@ def start_analysis(
     session: Session = Depends(get_session),
 ) -> TaskCreated:
     repository = IntakeSessionRepository(session)
+    existing_session = repository.get(str(session_id))
+    if existing_session is None:
+        raise HTTPException(status_code=404, detail="信息采集会话不存在")
+    AgentConfigService(session, settings).ensure_intake_run(str(session_id))
     intake_session = repository.get(str(session_id), for_update=True)
-    if intake_session is None:
+    if intake_session is None:  # pragma: no cover - deleted between reads
         raise HTTPException(status_code=404, detail="信息采集会话不存在")
 
     if intake_session.research_task_id:
         task = session.get(ResearchTask, intake_session.research_task_id)
         if task is None:
             raise HTTPException(status_code=409, detail="会话关联的分析任务不存在")
+        AgentConfigService(session, settings).link_research_task(
+            intake_session.id, task.id
+        )
         return TaskCreated(task_id=UUID(task.id), input_type=task.input_type)
     if payload.expected_version is not None and payload.expected_version != intake_session.version:
         raise HTTPException(status_code=409, detail="会话版本已更新，请刷新后重试")
@@ -663,8 +680,14 @@ def start_analysis(
         task = session.get(ResearchTask, existing.research_task_id)
         if task is None:
             raise
+        AgentConfigService(session, settings).link_research_task(
+            intake_session.id, task.id
+        )
         return TaskCreated(task_id=UUID(task.id), input_type=task.input_type)
 
+    AgentConfigService(session, settings).link_research_task(
+        intake_session.id, task_id
+    )
     TaskRepository(session).log_execution_event(
         task_id,
         event_type="STATUS",

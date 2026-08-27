@@ -16,6 +16,10 @@ def init_database() -> None:
         _migrate_research_tasks()
     Base.metadata.create_all(engine)
     _migrate_intake_sessions()
+    with SessionLocal() as session:
+        from app.services.agent_config.service import AgentConfigService
+
+        AgentConfigService(session, settings).ensure_default_agent()
 
 
 def _migrate_intake_sessions() -> None:

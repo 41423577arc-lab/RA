@@ -278,13 +278,6 @@ const ANALYSIS_STATUS_ORDER = [
   "COMPLETED"
 ];
 
-const PROGRESS_STAGES = [
-  { label: "信息已确认", endStatus: "CONTEXT_EXTRACTING" },
-  { label: "公开信息检索", endStatus: "VERIFYING_WEB_RESULTS" },
-  { label: "内部项目检索", endStatus: "RERANKING_PROJECTS" },
-  { label: "综合分析与报告", endStatus: "COMPLETED" }
-];
-
 type ActivityEntry = {
   status: string;
   label: string;
@@ -1040,47 +1033,71 @@ export default function Home() {
   const currentCodePath = latestActivity ? debugCodePath(latestActivity) : undefined;
   const reportReady = Boolean(task?.status === "COMPLETED" && (task.detailed_report_markdown || task.report_markdown));
   const currentStatusIndex = task ? ANALYSIS_STATUS_ORDER.indexOf(task.status) : -1;
+  const sidebarStageIndex = task
+    ? currentStatusIndex <= ANALYSIS_STATUS_ORDER.indexOf("CONTEXT_EXTRACTING")
+      ? 1
+      : currentStatusIndex <= ANALYSIS_STATUS_ORDER.indexOf("VERIFYING_WEB_RESULTS")
+        ? 2
+        : currentStatusIndex <= ANALYSIS_STATUS_ORDER.indexOf("RERANKING_PROJECTS")
+          ? 3
+          : 4
+    : readyToAnalyze || finalConfirmation?.status === "PENDING" || Boolean(intakeConfirmationRequest)
+      ? 1
+      : 0;
+  const sidebarSteps = [
+    { label: "对话收集信息", icon: <MessageSquare size={17} /> },
+    { label: "信息已确认", icon: <Check size={17} /> },
+    { label: "公开信息检索", icon: <Globe2 size={17} /> },
+    { label: "内部项目检索", icon: <Database size={17} /> },
+    { label: "综合分析与报告", icon: <FileText size={17} /> }
+  ];
 
   return (
     <main className="app-shell">
       <header className="topbar">
-        <div className="brand-mark"><Search size={18} strokeWidth={2.2} /></div>
-        <div>
+        <div className="brand-lockup">
           <h1>资源推动 Agent</h1>
-          <p>企业人物与项目资源调查</p>
         </div>
-        <button className="reset-button" onClick={reset} title="清空当前页面并新建调查">
-          <RotateCcw size={16} />
-          <span>重新开始</span>
-        </button>
+        <div className="topbar-actions">
+          <span className="agent-glyph" title="资源推动 Agent 在线"><Bot size={19} /></span>
+          <button className="reset-button" onClick={reset} title="清空当前页面并新建调查">
+            <span>重新开始</span>
+            <RotateCcw size={15} />
+          </button>
+        </div>
       </header>
 
       <div className="workspace">
         <aside className="progress-panel" aria-label="处理进度">
-          <div className="section-label">任务阶段</div>
+          <div className="progress-heading">
+            <span className="progress-avatar"><Bot size={18} /></span>
+            <div>
+              <strong>任务进度</strong>
+              <span>企业人物与项目资源调查</span>
+            </div>
+          </div>
           <ol className="steps">
-            {!task && (
-              <li className="active">
-                <span className="step-dot">1</span>
-                <span>对话收集信息</span>
-              </li>
-            )}
-            {task && PROGRESS_STAGES.map((stage, index) => {
-              const endIndex = ANALYSIS_STATUS_ORDER.indexOf(stage.endStatus);
-              const previousEndIndex = index === 0 ? -1 : ANALYSIS_STATUS_ORDER.indexOf(PROGRESS_STAGES[index - 1].endStatus);
-              const done = task.status === "COMPLETED" || currentStatusIndex > endIndex;
-              const active = !done && currentStatusIndex > previousEndIndex && currentStatusIndex <= endIndex;
+            {sidebarSteps.map((stage, index) => {
+              const done = index < sidebarStageIndex || (task?.status === "COMPLETED" && index < 4);
+              const active = index === sidebarStageIndex;
               return (
                 <li key={stage.label} className={done ? "done" : active ? "active" : ""}>
-                  <span className="step-dot">{done ? <Check size={13} /> : index + 1}</span>
-                  <span>{stage.label}</span>
+                  <span className="step-dot">{done ? <Check size={14} /> : stage.icon}</span>
+                  <span className="step-copy">
+                    <strong>{stage.label}</strong>
+                    {(done || active) && <small>{done ? "已完成" : "当前阶段"}</small>}
+                  </span>
                 </li>
               );
             })}
           </ol>
+          <div className="progress-footer">
+            <span className="system-badge">Ag</span>
+            <span>System Ready</span>
+          </div>
         </aside>
 
-        <section className="main-column">
+        <section className={`main-column ${task ? "task-column" : "intake-column"}`}>
           {!task && (
             <div className="input-panel chat-panel">
               <div className="panel-heading">

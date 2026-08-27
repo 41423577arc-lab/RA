@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, JSON, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, JSON, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -11,6 +11,201 @@ class Base(DeclarativeBase):
 
 
 INTAKE_JSON = JSON().with_variant(JSONB(), "postgresql")
+
+
+class Tenant(Base):
+    __tablename__ = "tenants"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    slug: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="ACTIVE")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ConfigSecret(Base):
+    __tablename__ = "config_secrets"
+    __table_args__ = (UniqueConstraint("tenant_id", "name"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    version: Mapped[int] = mapped_column("key_version", nullable=False, default=1)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="ACTIVE")
+    rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AgentDefinition(Base):
+    __tablename__ = "agent_definitions"
+    __table_args__ = (UniqueConstraint("tenant_id", "slug"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    slug: Mapped[str] = mapped_column(String(100), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="ACTIVE")
+    published_version_id: Mapped[str | None] = mapped_column(String(36))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AgentVersion(Base):
+    __tablename__ = "agent_versions"
+    __table_args__ = (UniqueConstraint("agent_definition_id", "version"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    agent_definition_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_definitions.id"), nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="DRAFT")
+    config_schema_version: Mapped[int] = mapped_column(nullable=False, default=1)
+    config: Mapped[dict] = mapped_column(INTAKE_JSON, nullable=False, default=dict)
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ModelConnection(Base):
+    __tablename__ = "model_connections"
+    __table_args__ = (UniqueConstraint("tenant_id", "slug"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    slug: Mapped[str] = mapped_column(String(100), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="ACTIVE")
+    active_revision_id: Mapped[str | None] = mapped_column(String(36))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ModelConnectionRevision(Base):
+    __tablename__ = "model_connection_revisions"
+    __table_args__ = (UniqueConstraint("model_connection_id", "version"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    model_connection_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("model_connections.id"), nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    base_url: Mapped[str] = mapped_column(Text, nullable=False)
+    authentication_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    secret_ref: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="PUBLISHED")
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ModelProfile(Base):
+    __tablename__ = "model_profiles"
+    __table_args__ = (UniqueConstraint("tenant_id", "slug"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    slug: Mapped[str] = mapped_column(String(100), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="ACTIVE")
+    active_revision_id: Mapped[str | None] = mapped_column(String(36))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ModelProfileRevision(Base):
+    __tablename__ = "model_profile_revisions"
+    __table_args__ = (UniqueConstraint("model_profile_id", "version"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    model_profile_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("model_profiles.id"), nullable=False, index=True
+    )
+    connection_revision_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("model_connection_revisions.id"), nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(nullable=False)
+    model_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    api_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    parameters: Mapped[dict] = mapped_column(INTAKE_JSON, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="PUBLISHED")
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AgentNodeBinding(Base):
+    __tablename__ = "agent_node_bindings"
+    __table_args__ = (UniqueConstraint("agent_version_id", "node_key"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    agent_version_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_versions.id"), nullable=False, index=True
+    )
+    node_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    model_profile_revision_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("model_profile_revisions.id"), index=True
+    )
+    model_config: Mapped[dict] = mapped_column(INTAKE_JSON, nullable=False, default=dict)
+    prompt_config: Mapped[dict] = mapped_column(INTAKE_JSON, nullable=False, default=dict)
+    allowed_tools: Mapped[list] = mapped_column(INTAKE_JSON, nullable=False, default=list)
+
+
+class AgentRun(Base):
+    __tablename__ = "agent_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id"), nullable=False, index=True
+    )
+    agent_definition_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_definitions.id"), nullable=False, index=True
+    )
+    agent_version_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_versions.id"), nullable=False, index=True
+    )
+    config_schema_version: Mapped[int] = mapped_column(nullable=False)
+    resolved_config_snapshot: Mapped[dict] = mapped_column(
+        INTAKE_JSON, nullable=False, default=dict
+    )
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="COLLECTING")
+    intake_session_id: Mapped[str | None] = mapped_column(
+        String(36), unique=True, index=True
+    )
+    research_task_id: Mapped[str | None] = mapped_column(
+        String(36), unique=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class ResearchTask(Base):

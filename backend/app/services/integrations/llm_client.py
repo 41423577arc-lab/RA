@@ -8,6 +8,8 @@ from openai import OpenAI
 from pydantic import BaseModel
 
 from app.config import Settings
+from app.services.agent_config.provider_adapters import ProviderAdapterRegistry
+from app.services.agent_config.secrets import ALLOWED_ENV_SECRET_REFS, SecretStore
 
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
@@ -28,9 +30,17 @@ class LLMCallFailed(RuntimeError):
 
 
 class StructuredLLM:
-    def __init__(self, settings: Settings, repository=None):
+    def __init__(
+        self,
+        settings: Settings,
+        repository=None,
+        resolved_config: dict | None = None,
+        provider_adapters: ProviderAdapterRegistry | None = None,
+    ):
         self.settings = settings
         self.repository = repository
+        self.resolved_config = resolved_config
+        self.provider_adapters = provider_adapters or ProviderAdapterRegistry()
         self.client = None
         if self.enabled:
             self.client = OpenAI(
@@ -55,7 +65,23 @@ class StructuredLLM:
         input_payload: dict,
         output_model: type[OutputT],
     ) -> OutputT:
-        if not self.enabled or self.client is None:
+        model_config = self._model_config(node_name)
+        try:
+            client = self._client_for_node(model_config)
+            safety_salt = self._resolve_secret(
+                model_config.get("safety_identifier_salt_ref", "env:LLM_SAFETY_SALT")
+            )
+        except Exception as exc:
+            self._record_execution(
+                task_id,
+                event_type="LLM_ERROR",
+                node_name=node_name,
+                status="UNAVAILABLE",
+                title=f"模型节点配置不可用：{node_name}",
+                detail=f"{type(exc).__name__}: {str(exc)[:500]}",
+            )
+            raise LLMUnavailable(f"模型节点配置不可用: {node_name}") from exc
+        if not self._node_enabled(model_config, client):
             self._record_execution(
                 task_id,
                 event_type="LLM_ERROR",
@@ -66,21 +92,21 @@ class StructuredLLM:
             )
             raise LLMUnavailable("大模型未启用、密钥为空或响应存储未关闭")
 
-        model = (
-            self.settings.llm_review_model
-            if node_name in REVIEW_NODES
-            else self.settings.llm_model
-        )
+        model = model_config["model_id"]
+        api_mode = model_config["api_mode"]
+        max_retries = int(model_config.get("max_retries", 1))
+        max_output_tokens = int(model_config.get("max_output_tokens", 8000))
+        reasoning_effort = model_config.get("reasoning_effort", "xhigh")
         system_prompt = self._system_prompt(node_name)
         safety_identifier = hashlib.sha256(
-            f"{task_id}{self.settings.llm_safety_salt}".encode("utf-8")
+            f"{task_id}{safety_salt}".encode("utf-8")
         ).hexdigest()
         started = time.perf_counter()
         last_error: Exception | None = None
 
-        for attempt in range(self.settings.llm_max_retries + 1):
+        for attempt in range(max_retries + 1):
             try:
-                if self.settings.llm_api_mode == "chat_completions":
+                if api_mode == "chat_completions":
                     messages = self._chat_messages(
                         system_prompt, input_payload, output_model, attempt
                     )
@@ -96,18 +122,20 @@ class StructuredLLM:
                             "model": model,
                             "attempt": attempt + 1,
                             "messages": messages,
-                            "max_tokens": 16000 if node_name in LONG_NODES else 8000,
+                            "max_tokens": max_output_tokens,
                             "store": False,
                         },
                     )
                     parsed, response = self._parse_chat_completion(
+                        client,
                         task_id,
                         model,
                         node_name,
                         output_model,
                         messages,
+                        model_config,
                     )
-                elif self.settings.llm_api_mode == "responses":
+                elif api_mode == "responses":
                     response_input = self._dynamic_context(input_payload)
                     response_instructions = self._prompt_with_output_contract(
                         system_prompt, output_model, attempt
@@ -126,23 +154,23 @@ class StructuredLLM:
                             "instructions": response_instructions,
                             "input": response_input,
                             "output_schema": output_model.model_json_schema(),
-                            "reasoning_effort": self.settings.llm_reasoning_effort,
-                            "max_output_tokens": 16000 if node_name in LONG_NODES else 8000,
+                            "reasoning_effort": reasoning_effort,
+                            "max_output_tokens": max_output_tokens,
                             "store": False,
                         },
                     )
                     parsed, response = self._parse_response(
+                        client,
                         model,
                         node_name,
                         response_instructions,
                         response_input,
                         output_model,
                         safety_identifier,
+                        model_config,
                     )
                 else:
-                    raise ValueError(
-                        f"不支持的 LLM_API_MODE: {self.settings.llm_api_mode}"
-                    )
+                    raise ValueError(f"不支持的 LLM_API_MODE: {api_mode}")
                 usage = getattr(response, "usage", None)
                 input_tokens = getattr(usage, "input_tokens", None)
                 output_tokens = getattr(usage, "output_tokens", None)
@@ -181,7 +209,7 @@ class StructuredLLM:
                     task_id,
                     event_type="LLM_ERROR",
                     node_name=node_name,
-                    status="RETRYING" if attempt < self.settings.llm_max_retries else "DEGRADED",
+                    status="RETRYING" if attempt < max_retries else "DEGRADED",
                     title=f"模型调用失败：{node_name}",
                     detail=str(exc)[:1000],
                     payload={
@@ -189,7 +217,7 @@ class StructuredLLM:
                         "error_type": type(exc).__name__,
                     },
                 )
-                if attempt < self.settings.llm_max_retries:
+                if attempt < max_retries:
                     time.sleep(2)
 
         self._log(
@@ -223,18 +251,26 @@ class StructuredLLM:
 
     def _parse_chat_completion(
         self,
+        client,
         task_id: str,
         model: str,
         node_name: str,
         output_model: type[OutputT],
         messages: list[dict[str, str]],
+        model_config: dict,
     ) -> tuple[OutputT, object]:
-        response = self.client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=16000 if node_name in LONG_NODES else 8000,
-            store=False,
-            timeout=self.settings.llm_timeout_seconds,
+        request = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": int(model_config.get("max_output_tokens", 8000)),
+            "store": False,
+            "timeout": float(model_config.get("timeout_seconds", 120)),
+        }
+        for key in ("temperature", "top_p"):
+            if model_config.get(key) is not None:
+                request[key] = model_config[key]
+        response = client.chat.completions.create(
+            **request,
         )
         content = response.choices[0].message.content
         if not content:
@@ -317,28 +353,92 @@ class StructuredLLM:
 
     def _parse_response(
         self,
+        client,
         model: str,
         node_name: str,
         system_prompt: str,
         response_input: str,
         output_model: type[OutputT],
         safety_identifier: str,
+        model_config: dict,
     ) -> tuple[OutputT, object]:
-        response = self.client.responses.parse(
-            model=model,
-            reasoning={"effort": self.settings.llm_reasoning_effort},
-            instructions=system_prompt,
-            input=response_input,
-            text_format=output_model,
-            max_output_tokens=16000 if node_name in LONG_NODES else 8000,
-            store=False,
-            safety_identifier=safety_identifier,
-            timeout=self.settings.llm_timeout_seconds,
-        )
+        request = {
+            "model": model,
+            "reasoning": {"effort": model_config.get("reasoning_effort", "xhigh")},
+            "instructions": system_prompt,
+            "input": response_input,
+            "text_format": output_model,
+            "max_output_tokens": int(model_config.get("max_output_tokens", 8000)),
+            "store": False,
+            "safety_identifier": safety_identifier,
+            "timeout": float(model_config.get("timeout_seconds", 120)),
+        }
+        for key in ("temperature", "top_p"):
+            if model_config.get(key) is not None:
+                request[key] = model_config[key]
+        response = client.responses.parse(**request)
         parsed = response.output_parsed
         if parsed is None:
             raise ValueError("模型未返回可解析的结构化结果")
         return parsed, response
+
+    def _model_config(self, node_name: str) -> dict:
+        if self.resolved_config is not None:
+            node = self.resolved_config.get("nodes", {}).get(node_name)
+            if node is None:
+                raise LLMUnavailable(f"Agent run does not configure node: {node_name}")
+            return dict(node.get("model") or {})
+        return {
+            "provider": self.settings.model_provider,
+            "base_url": self.settings.openai_base_url,
+            "secret_ref": "env:OPENAI_API_KEY",
+            "safety_identifier_salt_ref": "env:LLM_SAFETY_SALT",
+            "model_id": self.settings.llm_review_model
+            if node_name in REVIEW_NODES
+            else self.settings.llm_model,
+            "api_mode": self.settings.llm_api_mode,
+            "reasoning_effort": self.settings.llm_reasoning_effort,
+            "timeout_seconds": self.settings.llm_timeout_seconds,
+            "max_retries": self.settings.llm_max_retries,
+            "max_output_tokens": 16000 if node_name in LONG_NODES else 8000,
+            "enabled": self.settings.llm_enabled,
+            "response_storage_disabled": self.settings.llm_disable_response_storage,
+            "store": False,
+        }
+
+    def _client_for_node(self, model_config: dict):
+        if self.resolved_config is None:
+            return self.client
+        api_key = self._resolve_secret(model_config.get("secret_ref", ""))
+        if not api_key:
+            return None
+        adapter = self.provider_adapters.get(model_config.get("provider", ""))
+        return adapter.create_client(
+            {
+                **model_config,
+                "_allow_private": self.settings.agent_allow_private_model_urls,
+                "_trusted_hosts": self.settings.agent_trusted_model_hosts,
+            },
+            api_key,
+        )
+
+    def _resolve_secret(self, secret_ref: str) -> str:
+        setting_name = ALLOWED_ENV_SECRET_REFS.get(secret_ref)
+        if setting_name:
+            return str(getattr(self.settings, setting_name, ""))
+        session = getattr(self.repository, "session", None)
+        if session is None:
+            return ""
+        return SecretStore(session, self.settings).resolve(secret_ref)
+
+    @staticmethod
+    def _node_enabled(model_config: dict, client) -> bool:
+        return bool(
+            model_config.get("enabled", True)
+            and model_config.get("response_storage_disabled", True)
+            and model_config.get("store") is False
+            and client is not None
+        )
 
     def _record_execution(self, task_id: str, **values) -> None:
         logger = getattr(self.repository, "log_execution_event", None)

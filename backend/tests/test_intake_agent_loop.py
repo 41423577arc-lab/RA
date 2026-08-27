@@ -7,6 +7,7 @@ from pydantic import ValidationError
 from app.config import Settings
 from app.schemas.intake import (
     IntakeChatRequest,
+    IntakeEntityAssessment,
     IntakeEntityResolution,
     IntakeStructuredContext,
     IntakeToolAttempt,
@@ -195,7 +196,10 @@ def test_reducer_records_typed_observation_without_promoting_candidate() -> None
 
 
 def test_reducer_promotes_controlled_person_relationship_to_organization() -> None:
-    context = IntakeStructuredContext(people=["刘总", "刘希川"])
+    context = IntakeStructuredContext(
+        people=["刘希川"],
+        organizations=["中建二局"],
+    )
     observation = ToolObservation(
         action="SEARCH_INTERNAL",
         target_fields=["organization"],
@@ -220,7 +224,10 @@ def test_reducer_promotes_controlled_person_relationship_to_organization() -> No
     )
 
     assert reduced.context.people == ["刘希川"]
-    assert reduced.context.organizations == ["中国建筑第二工程局有限公司"]
+    assert reduced.context.organizations == [
+        "中建二局",
+        "中国建筑第二工程局有限公司",
+    ]
     assert {
         (item.entity_type, item.canonical_name)
         for item in reduced.context.entity_resolutions
@@ -228,6 +235,12 @@ def test_reducer_promotes_controlled_person_relationship_to_organization() -> No
         ("PERSON", "刘希川"),
         ("ORGANIZATION", "中国建筑第二工程局有限公司"),
     }
+    organization_resolution = next(
+        item
+        for item in reduced.context.entity_resolutions
+        if item.entity_type == "ORGANIZATION"
+    )
+    assert organization_resolution.mention == "中建二局"
 
 
 def test_tool_observation_distinguishes_technical_failure() -> None:
@@ -656,6 +669,247 @@ def test_mechanical_loop_python_hard_gate_can_promote_ask_user_to_ready() -> Non
     assert result.stop_reason == "READY"
     assert result.tool_calls == 0
     assert result.state.context.next_action == "READY"
+
+
+def test_mechanical_loop_hard_gate_prevents_redundant_internal_search() -> None:
+    context = _context().model_copy(
+        update={
+            "entity_resolutions": [
+                *_context().entity_resolutions,
+                IntakeEntityResolution(
+                    entity_type="ORGANIZATION",
+                    canonical_name="中建二局",
+                    mention="中建二局",
+                    confirmed_by="INTERNAL",
+                ),
+            ]
+        }
+    )
+    backend = _CandidateBackend()
+
+    result = _mechanical_loop(
+        _DecisionProvider([_agent_turn("SEARCH_INTERNAL")]),
+        backend,
+    ).run(
+        context,
+        version=1,
+        source_text=None,
+        hard_gate=lambda value: len(value.entity_resolutions) == 2,
+    )
+
+    assert result.stop_reason == "READY"
+    assert result.tool_calls == 0
+    assert result.state.context.next_action == "READY"
+    assert backend.contexts == []
+
+
+def test_mechanical_loop_forces_internal_lookup_before_redundant_user_question() -> None:
+    extracted_context = IntakeContextPatch(
+        people=["刘希川"],
+        people_details=[
+            {
+                "name": "刘希川",
+                "organization": "中建二局",
+            }
+        ],
+        organizations=["中建二局"],
+        event_type="宴请",
+        target_fields=["identity"],
+        entity_assessments=[
+            IntakeEntityAssessment(
+                entity_type="PERSON",
+                mention="刘希川",
+                is_standard=True,
+                reason="用户提供完整姓名",
+            ),
+            IntakeEntityAssessment(
+                entity_type="ORGANIZATION",
+                mention="中建二局",
+                is_standard=True,
+                reason="用户提供企业名称",
+            ),
+        ],
+    )
+    redundant_question = AgentTurn(
+        context_patch=extracted_context,
+        skill="identity_resolution",
+        next_action="ASK_USER",
+        user_message="请补充目标人物的完整姓名、所在企业或具体职位。",
+        reason="模型错误地要求重复补充已知身份",
+    )
+    resolved_person = IntakeEntityResolution(
+        candidate_id="internal:contact:CC023",
+        entity_type="PERSON",
+        canonical_name="刘希川",
+        mention="刘希川",
+        organization="中国建筑第二工程局有限公司",
+        confirmed_by="INTERNAL",
+    )
+    stale_organization_confirmation = ConfirmationRequest(
+        version=1,
+        items=[
+            ConfirmationItem(
+                mention="中建二局",
+                entity_type="ORGANIZATION",
+                candidates=[
+                    CandidateOption(
+                        candidate_id="internal:customer:C024",
+                        entity_type="ORGANIZATION",
+                        canonical_name="中建二局安装工程有限公司",
+                        confidence=0.8,
+                        reason="名称相似的内部企业候选",
+                    )
+                ],
+            )
+        ],
+    )
+    backend = _CandidateBackend(
+        internal_result=(
+            [resolved_person.model_dump(mode="json")],
+            stale_organization_confirmation,
+        )
+    )
+    provider = _DecisionProvider([redundant_question, _agent_turn("READY")])
+
+    result = _mechanical_loop(provider, backend).run(
+        IntakeStructuredContext(),
+        version=1,
+        source_text="今晚和中建二局的刘希川一起吃饭",
+        hard_gate=lambda context: {
+            item.entity_type for item in context.entity_resolutions
+        }
+        == {"PERSON", "ORGANIZATION"},
+    )
+
+    assert result.stop_reason == "READY"
+    assert result.tool_calls == 1
+    assert backend.contexts[0].people == ["刘希川"]
+    assert backend.contexts[0].organizations == ["中建二局"]
+    assert result.state.context.event_type == "宴请"
+    assert result.state.context.user_question is None
+    assert result.confirmation is None
+
+
+def test_mechanical_loop_keeps_asking_for_nonstandard_title_without_searching() -> None:
+    vague_question = AgentTurn(
+        context_patch=IntakeContextPatch(
+            people=["刘总"],
+            entity_assessments=[
+                IntakeEntityAssessment(
+                    entity_type="PERSON",
+                    mention="刘总",
+                    is_standard=False,
+                    reason="仅有姓氏和称谓",
+                )
+            ],
+        ),
+        skill="identity_resolution",
+        next_action="ASK_USER",
+        user_message="请补充刘总的完整姓名。",
+        reason="称谓不足以执行身份查询",
+    )
+    backend = _CandidateBackend()
+
+    result = _mechanical_loop(_DecisionProvider([vague_question]), backend).run(
+        IntakeStructuredContext(),
+        version=1,
+        source_text="今晚和刘总吃饭",
+        hard_gate=lambda _context: False,
+    )
+
+    assert result.stop_reason == "WAITING_USER"
+    assert result.tool_calls == 0
+    assert result.state.context.people == ["刘总"]
+    assert result.state.context.user_question == "请补充刘总的完整姓名。"
+    assert backend.contexts == []
+
+
+def test_mechanical_loop_asks_for_full_name_before_internal_person_search() -> None:
+    ambiguous_turn = AgentTurn(
+        context_patch=IntakeContextPatch(
+            people=["刘总"],
+            entity_assessments=[
+                IntakeEntityAssessment(
+                    entity_type="PERSON",
+                    mention="刘总",
+                    is_standard=False,
+                    reason="仅有姓氏和称谓",
+                )
+            ],
+        ),
+        skill="internal_lookup",
+        next_action="SEARCH_INTERNAL",
+        query_plan=QueryPlan(
+            action="SEARCH_INTERNAL",
+            target_fields=["identity"],
+            person_mentions=["刘总"],
+        ),
+        reason="尝试查询内部身份",
+    )
+    backend = _CandidateBackend()
+
+    ambiguous_result = _mechanical_loop(
+        _DecisionProvider([ambiguous_turn]), backend
+    ).run(
+        IntakeStructuredContext(),
+        version=1,
+        source_text="今晚和刘总吃饭",
+        hard_gate=lambda _context: False,
+    )
+
+    assert ambiguous_result.stop_reason == "WAITING_USER"
+    assert ambiguous_result.tool_calls == 0
+    assert ambiguous_result.state.context.people == ["刘总"]
+    assert ambiguous_result.state.context.next_action == "ASK_USER"
+    assert backend.contexts == []
+
+    resolved_person = IntakeEntityResolution(
+        candidate_id="internal:contact:CC023",
+        entity_type="PERSON",
+        canonical_name="刘希川",
+        mention="刘希川",
+        organization="中国建筑第二工程局有限公司",
+        confirmed_by="INTERNAL",
+    )
+    full_name_turn = AgentTurn(
+        context_patch=IntakeContextPatch(
+            people=["刘希川"],
+            entity_assessments=[
+                IntakeEntityAssessment(
+                    entity_type="PERSON",
+                    mention="刘希川",
+                    is_standard=True,
+                    reason="用户补充完整姓名",
+                )
+            ],
+        ),
+        skill="internal_lookup",
+        next_action="SEARCH_INTERNAL",
+        query_plan=QueryPlan(
+            action="SEARCH_INTERNAL",
+            target_fields=["identity", "organization"],
+            person_mentions=["刘总", "刘希川"],
+        ),
+        reason="使用完整姓名查询内部身份",
+    )
+    backend.internal_result = ([resolved_person.model_dump(mode="json")], None)
+
+    full_name_result = _mechanical_loop(
+        _DecisionProvider([full_name_turn, _agent_turn("READY")]), backend
+    ).run(
+        ambiguous_result.state.context,
+        version=2,
+        source_text="叫刘希川，帮我从内部数据库查一下他的公司",
+        hard_gate=lambda context: {
+            item.entity_type for item in context.entity_resolutions
+        }
+        == {"PERSON", "ORGANIZATION"},
+    )
+
+    assert full_name_result.stop_reason == "READY"
+    assert full_name_result.tool_calls == 1
+    assert backend.contexts[-1].people == ["刘希川"]
+    assert full_name_result.state.context.people == ["刘希川"]
 
 
 def test_mechanical_loop_clears_stale_confirmation_after_resolution() -> None:

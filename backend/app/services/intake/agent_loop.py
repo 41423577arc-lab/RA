@@ -344,9 +344,10 @@ class MechanicalIntakeAgentLoop:
                 )
             turn_queries.add(query_key)
 
+            query_context = state.context
             observation = self.query_executor.execute(
                 turn.query_plan,
-                state.context,
+                query_context,
                 version=version,
                 source_text=source_text,
                 confirmation=confirmation,
@@ -358,24 +359,12 @@ class MechanicalIntakeAgentLoop:
             state = self.reducer.apply_observation(state, observation)
             if observation.confirmation is not None:
                 confirmation = observation.confirmation
-            elif confirmation is not None and observation.resolutions:
-                # 精确 Resolution 可能只缺可选职位，仍应移除已被全名取代的旧称谓。
-                active_mentions = {
-                    *state.context.people,
-                    *state.context.organizations,
-                }
-                remaining_items = [
-                    item
-                    for item in confirmation.items
-                    if item.mention in active_mentions
-                ]
-                confirmation = (
-                    ConfirmationRequest(
-                        version=confirmation.version,
-                        items=remaining_items,
-                    )
-                    if remaining_items
-                    else None
+            if confirmation is not None and observation.resolutions:
+                confirmation = self._reconcile_confirmation(
+                    confirmation,
+                    observation,
+                    query_context,
+                    state.context,
                 )
             self._checkpoint(checkpoint, state.context, confirmation)
 
@@ -391,6 +380,52 @@ class MechanicalIntakeAgentLoop:
             checkpoint,
         )
 
+    @staticmethod
+    def _reconcile_confirmation(
+        confirmation: ConfirmationRequest,
+        observation: ToolObservation,
+        query_context: IntakeStructuredContext,
+        updated_context: IntakeStructuredContext,
+    ) -> ConfirmationRequest | None:
+        active_mentions = {
+            *updated_context.people,
+            *updated_context.organizations,
+        }
+        resolved_mentions = {
+            (resolution.entity_type, resolution.mention)
+            for resolution in observation.resolutions
+        } | {
+            (resolution.entity_type, resolution.canonical_name)
+            for resolution in observation.resolutions
+        }
+        linked_organization_mentions: set[str] = set()
+        if len(query_context.people) == 1 and len(query_context.organizations) == 1:
+            queried_person = query_context.people[0]
+            if any(
+                resolution.entity_type == "PERSON"
+                and queried_person in {resolution.mention, resolution.canonical_name}
+                and resolution.organization
+                for resolution in observation.resolutions
+            ):
+                linked_organization_mentions.add(query_context.organizations[0])
+
+        remaining_items = [
+            item
+            for item in confirmation.items
+            if item.mention in active_mentions
+            and (item.entity_type, item.mention) not in resolved_mentions
+            and not (
+                item.entity_type == "ORGANIZATION"
+                and item.mention in linked_organization_mentions
+            )
+        ]
+        if not remaining_items:
+            return None
+        return ConfirmationRequest(
+            version=confirmation.version,
+            items=remaining_items,
+        )
+
     def _apply_hard_constraints(
         self,
         turn: AgentTurn,
@@ -400,11 +435,44 @@ class MechanicalIntakeAgentLoop:
     ) -> AgentTurn:
         attempts = {item.action for item in state.context.tool_attempts}
         gate_ready = confirmation is None and hard_gate(state.context)
-        if turn.next_action == "ASK_USER" and gate_ready:
-            return self._ready_turn("身份硬校验已满足")
+        if gate_ready:
+            return turn if turn.next_action == "READY" else self._ready_turn(
+                "身份硬校验已满足"
+            )
+        if turn.next_action == "SEARCH_INTERNAL":
+            turn = self._filter_nonstandard_person_mentions(turn, state.context)
+            if turn.next_action == "ASK_USER":
+                return turn
+        if (
+            turn.next_action == "ASK_USER"
+            and confirmation is None
+            and "SEARCH_INTERNAL" not in attempts
+            and self._has_identity_mentions(state.context, turn.context_patch)
+        ):
+            forced_search = self._search_turn(
+                "SEARCH_INTERNAL",
+                state.context,
+                context_patch=turn.context_patch,
+            )
+            filtered_turn = self._filter_nonstandard_person_mentions(
+                forced_search,
+                state.context,
+            )
+            if filtered_turn.next_action == "ASK_USER":
+                return filtered_turn.model_copy(
+                    update={
+                        "user_message": turn.user_message,
+                        "reason": turn.reason,
+                    }
+                )
+            return filtered_turn
         if turn.next_action == "READY" and not gate_ready:
             if "SEARCH_INTERNAL" not in attempts:
-                return self._search_turn("SEARCH_INTERNAL", state.context)
+                return self._search_turn(
+                    "SEARCH_INTERNAL",
+                    state.context,
+                    context_patch=turn.context_patch,
+                )
             if (
                 confirmation is not None
                 and any(len(item.candidates) != 1 for item in confirmation.items)
@@ -414,10 +482,68 @@ class MechanicalIntakeAgentLoop:
             return self._ask_turn(state.context)
         if turn.next_action == "SEARCH_PUBLIC":
             if "SEARCH_INTERNAL" not in attempts:
-                return self._search_turn("SEARCH_INTERNAL", state.context)
+                return self._search_turn(
+                    "SEARCH_INTERNAL",
+                    state.context,
+                    context_patch=turn.context_patch,
+                )
             if confirmation is None:
                 return self._ask_turn(state.context)
         return turn
+
+    @staticmethod
+    def _has_identity_mentions(
+        context: IntakeStructuredContext,
+        context_patch: IntakeContextPatch,
+    ) -> bool:
+        return bool(
+            context_patch.people
+            or context_patch.organizations
+            or context.people
+            or context.organizations
+        )
+
+    @staticmethod
+    def _filter_nonstandard_person_mentions(
+        turn: AgentTurn,
+        context: IntakeStructuredContext,
+    ) -> AgentTurn:
+        if turn.query_plan is None or not turn.query_plan.person_mentions:
+            return turn
+        assessments = {
+            item.mention: item.is_standard
+            for item in (
+                *context.entity_assessments,
+                *turn.context_patch.entity_assessments,
+            )
+        }
+        title_suffixes = ("总", "经理", "主任", "董事长", "负责人", "领导")
+        searchable_mentions = [
+            mention
+            for mention in turn.query_plan.person_mentions
+            if assessments.get(mention) is not False
+            and not "".join(mention.split()).endswith(title_suffixes)
+        ]
+        if searchable_mentions == turn.query_plan.person_mentions:
+            return turn
+        if searchable_mentions:
+            return turn.model_copy(
+                update={
+                    "query_plan": turn.query_plan.model_copy(
+                        update={"person_mentions": searchable_mentions}
+                    )
+                }
+            )
+        return AgentTurn(
+            context_patch=turn.context_patch,
+            skill="identity_resolution",
+            next_action="ASK_USER",
+            user_message=(
+                context.user_question
+                or "请补充目标人物的完整姓名、所在企业或具体职位。"
+            ),
+            reason="非标准人物称谓不能用于内部身份查询",
+        )
 
     def _action_fingerprint(
         self,
@@ -435,19 +561,25 @@ class MechanicalIntakeAgentLoop:
     def _search_turn(
         action: IntakeToolAction,
         context: IntakeStructuredContext,
+        *,
+        context_patch: IntakeContextPatch | None = None,
     ) -> AgentTurn:
+        patch = context_patch or IntakeContextPatch()
+        people = patch.people or context.people
+        organizations = patch.organizations or context.organizations
         return AgentTurn(
+            context_patch=patch,
             skill="internal_lookup" if action == "SEARCH_INTERNAL" else "public_lookup",
             next_action=action,
             query_plan=QueryPlan(
                 action=action,
-                target_fields=context.target_fields or ["identity"],
+                target_fields=patch.target_fields or context.target_fields or ["identity"],
                 entity_types=[
-                    *(("PERSON",) if context.people else ()),
-                    *(("ORGANIZATION",) if context.organizations else ()),
+                    *(("PERSON",) if people else ()),
+                    *(("ORGANIZATION",) if organizations else ()),
                 ],
-                person_mentions=context.people,
-                organization_mentions=context.organizations,
+                person_mentions=people,
+                organization_mentions=organizations,
             ),
             reason="Python 硬约束要求先完成身份查询",
         )

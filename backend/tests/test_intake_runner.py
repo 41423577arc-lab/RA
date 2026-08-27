@@ -13,7 +13,11 @@ from app.schemas.intake import (
 from app.schemas.task import CandidateOption, ConfirmationItem, ConfirmationRequest
 from app.services.intake.agent_loop import AgentTurn, IntakeContextPatch, QueryPlan
 from app.services.intake.identity_loop import IntakeIdentityLoopResult
-from app.services.intake.runner import IntakeChatConflict, IntakeRunner
+from app.services.intake.runner import (
+    IntakeChatConflict,
+    IntakeRunner,
+    standardized_context,
+)
 from app.services.integrations.llm_client import LLMCallFailed
 
 
@@ -258,6 +262,30 @@ def test_runner_serializes_typed_loop_resolutions_at_json_boundary() -> None:
     assert all(
         isinstance(item, dict)
         for item in result.structured_context["entity_resolutions"]
+    )
+
+
+def test_standardized_context_deduplicates_organization_alias_and_canonical_name() -> None:
+    context = {
+        "people": ["刘希川"],
+        "organizations": ["中建二局", "中国建筑第二工程局有限公司"],
+        "people_details": [
+            {"name": "刘希川", "organization": "中建二局", "title": None}
+        ],
+    }
+    resolutions = [
+        {
+            "entity_type": "ORGANIZATION",
+            "mention": "中建二局",
+            "canonical_name": "中国建筑第二工程局有限公司",
+        }
+    ]
+
+    result = standardized_context(context, resolutions)
+
+    assert result["organizations"] == ["中国建筑第二工程局有限公司"]
+    assert result["people_details"][0]["organization"] == (
+        "中国建筑第二工程局有限公司"
     )
 
 
