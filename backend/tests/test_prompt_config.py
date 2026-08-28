@@ -120,7 +120,9 @@ def test_prompt_revision_draft_binding_changes_only_new_runs_without_publish(ses
     ] != revision.id
     draft = agent_service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
     agent_service.set_draft_node_prompt(draft.id, "intake_chat", revision.id)
-    new_run = agent_service.ensure_intake_run("new-prompt-run")
+    new_run = agent_service.ensure_intake_run(
+        "new-prompt-run", initiator_role="ADMIN"
+    )
 
     old_prompt = old_run.resolved_config_snapshot["nodes"]["intake_chat"]["prompt"]
     new_prompt = new_run.resolved_config_snapshot["nodes"]["intake_chat"]["prompt"]
@@ -175,7 +177,9 @@ def test_working_prompt_can_be_saved_repeatedly_without_creating_revisions(sessi
         binding.prompt_config["content"]
     )
 
-    new_run = agent_service.ensure_intake_run("working-prompt-new-run")
+    new_run = agent_service.ensure_intake_run(
+        "working-prompt-new-run", initiator_role="ADMIN"
+    )
     new_prompt = new_run.resolved_config_snapshot["nodes"]["analysis_chat"]["prompt"]
     assert new_run.agent_version_id == draft.id
     assert "WORKING_ITERATION_9" in new_prompt["content"]
@@ -242,7 +246,9 @@ def test_historical_revision_can_become_immediately_runnable_working_prompt(sess
         "analysis_chat",
         content="# Historical Working Analysis Chat\n\nHISTORICAL_WORKING_MARKER",
     )
-    run = agent_service.ensure_task_run("historical-working-task")
+    run = agent_service.ensure_task_run(
+        "historical-working-task", initiator_role="ADMIN"
+    )
 
     prompt = run.resolved_config_snapshot["nodes"]["analysis_chat"]["prompt"]
     assert published.id != draft.id

@@ -27,6 +27,7 @@ from app.services.auth import SYSTEM_USER_ID
 
 SYSTEM_TENANT_ID = "00000000-0000-0000-0000-000000000001"
 DEFAULT_AGENT_DEFINITION_ID = "00000000-0000-0000-0000-000000000002"
+DRAFT_ELIGIBLE_ROLES = frozenset({"ADMIN", "SYSTEM"})
 
 
 class AgentConfigService:
@@ -188,12 +189,14 @@ class AgentConfigService:
         )
         return snapshot, canonical_hash(snapshot)
 
-    def resolve_for_new_run(self) -> tuple[dict, str]:
+    def resolve_for_new_run(self, *, initiator_role: str | None = None) -> tuple[dict, str]:
         definition = self.session.get(AgentDefinition, DEFAULT_AGENT_DEFINITION_ID)
         if definition is None or definition.status != "ACTIVE":
             raise KeyError(
                 f"Agent definition {DEFAULT_AGENT_DEFINITION_ID} not found or inactive"
             )
+        if initiator_role not in DRAFT_ELIGIBLE_ROLES:
+            return self.resolve_published(definition.id)
         drafts = list(
             self.session.scalars(
                 select(AgentVersion)
@@ -217,9 +220,27 @@ class AgentConfigService:
         return self.resolve_published(definition.id)
 
     def create_draft(self, agent_definition_id: str) -> AgentVersion:
-        definition = self.session.get(AgentDefinition, agent_definition_id)
+        definition = self.session.scalar(
+            select(AgentDefinition)
+            .where(AgentDefinition.id == agent_definition_id)
+            .with_for_update()
+        )
         if definition is None or not definition.published_version_id:
             raise KeyError(f"Agent definition has no published version: {agent_definition_id}")
+        drafts = list(
+            self.session.scalars(
+                select(AgentVersion).where(
+                    AgentVersion.agent_definition_id == definition.id,
+                    AgentVersion.status == "DRAFT",
+                )
+            )
+        )
+        if len(drafts) == 1:
+            raise ValueError("Agent definition already has a draft version")
+        if len(drafts) > 1:
+            raise ValueError(
+                f"Agent definition {definition.id} has multiple draft versions"
+            )
         source = self.session.get(AgentVersion, definition.published_version_id)
         if source is None:
             raise ValueError("Published AgentVersion does not exist")
@@ -473,6 +494,7 @@ class AgentConfigService:
         owner_id: str = SYSTEM_USER_ID,
         tenant_id: str = SYSTEM_TENANT_ID,
         conversation_id: str | None = None,
+        initiator_role: str | None = None,
     ) -> AgentRun:
         existing = self.session.scalar(
             select(AgentRun).where(AgentRun.intake_session_id == intake_session_id)
@@ -480,7 +502,9 @@ class AgentConfigService:
         if existing is not None:
             return existing
         self.ensure_default_agent()
-        snapshot, config_hash = self.resolve_for_new_run()
+        snapshot, config_hash = self.resolve_for_new_run(
+            initiator_role=initiator_role
+        )
         run = AgentRun(
             tenant_id=tenant_id,
             owner_id=owner_id,
@@ -506,6 +530,7 @@ class AgentConfigService:
         owner_id: str = SYSTEM_USER_ID,
         tenant_id: str = SYSTEM_TENANT_ID,
         conversation_id: str | None = None,
+        initiator_role: str | None = None,
     ) -> AgentRun:
         existing = self.session.scalar(
             select(AgentRun).where(AgentRun.research_task_id == research_task_id)
@@ -513,7 +538,9 @@ class AgentConfigService:
         if existing is not None:
             return existing
         self.ensure_default_agent()
-        snapshot, config_hash = self.resolve_for_new_run()
+        snapshot, config_hash = self.resolve_for_new_run(
+            initiator_role=initiator_role
+        )
         run = AgentRun(
             tenant_id=tenant_id,
             owner_id=owner_id,
@@ -540,12 +567,14 @@ class AgentConfigService:
         owner_id: str = SYSTEM_USER_ID,
         tenant_id: str = SYSTEM_TENANT_ID,
         conversation_id: str | None = None,
+        initiator_role: str | None = None,
     ) -> AgentRun:
         run = self.ensure_intake_run(
             intake_session_id,
             owner_id=owner_id,
             tenant_id=tenant_id,
             conversation_id=conversation_id,
+            initiator_role=initiator_role,
         )
         if run.research_task_id and run.research_task_id != research_task_id:
             raise ValueError("Agent run is already linked to another research task")

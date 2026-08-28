@@ -121,7 +121,9 @@ def test_model_profile_draft_binding_changes_only_new_runs_without_publish(sessi
     agent_service.set_draft_node_model(
         draft.id, "intake_chat", profile_revision.id
     )
-    new_run = agent_service.ensure_intake_run("new-intake")
+    new_run = agent_service.ensure_intake_run(
+        "new-intake", initiator_role="ADMIN"
+    )
 
     assert old_run.agent_version_id != draft.id
     assert old_run.resolved_config_snapshot == old_snapshot

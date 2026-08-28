@@ -163,9 +163,14 @@ def test_new_runs_use_single_draft_and_existing_intake_run_stays_frozen(session)
     existing_hash = existing.config_hash
     draft = service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
 
-    new_intake = service.ensure_intake_run("draft-intake")
-    new_task = service.ensure_task_run("draft-task")
-    reused = service.ensure_intake_run("existing-intake")
+    new_intake = service.ensure_intake_run("draft-intake", initiator_role="ADMIN")
+    new_task = service.ensure_task_run("draft-task", initiator_role="SYSTEM")
+    reused = service.ensure_intake_run("existing-intake", initiator_role="ADMIN")
+    member_run = service.ensure_task_run("member-task", initiator_role="MEMBER")
+    unknown_role_run = service.ensure_task_run(
+        "unknown-role-task", initiator_role="FUTURE_ROLE"
+    )
+    worker_fallback_run = service.ensure_task_run("worker-fallback-task")
 
     assert existing.agent_version_id == published.id
     assert new_intake.agent_version_id == draft.id
@@ -174,16 +179,39 @@ def test_new_runs_use_single_draft_and_existing_intake_run_stays_frozen(session)
     assert reused.agent_version_id == published.id
     assert reused.resolved_config_snapshot == existing_snapshot
     assert reused.config_hash == existing_hash
+    assert member_run.agent_version_id == published.id
+    assert unknown_role_run.agent_version_id == published.id
+    assert worker_fallback_run.agent_version_id == published.id
 
 
-def test_new_run_rejects_multiple_drafts(session) -> None:
+def test_create_draft_rejects_a_second_draft(session) -> None:
     service = AgentConfigService(session, _settings())
     service.ensure_default_agent()
     service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
-    service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+
+    with pytest.raises(ValueError, match="already has a draft version"):
+        service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+
+
+def test_new_admin_run_rejects_corrupted_multiple_drafts(session) -> None:
+    service = AgentConfigService(session, _settings())
+    published = service.ensure_default_agent()
+    first = service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+    duplicate = AgentVersion(
+        agent_definition_id=DEFAULT_AGENT_DEFINITION_ID,
+        version=first.version + 1,
+        status="DRAFT",
+        config_schema_version=published.config_schema_version,
+        config=published.config,
+        config_hash=published.config_hash,
+    )
+    session.add(duplicate)
+    session.commit()
 
     with pytest.raises(ValueError, match="multiple draft versions"):
-        service.ensure_intake_run("ambiguous-draft-intake")
+        service.ensure_intake_run(
+            "ambiguous-draft-intake", initiator_role="ADMIN"
+        )
 
 
 def test_new_run_rejects_draft_with_unsupported_schema(session) -> None:
@@ -194,7 +222,7 @@ def test_new_run_rejects_draft_with_unsupported_schema(session) -> None:
     session.commit()
 
     with pytest.raises(ValueError, match="Unsupported agent config schema version"):
-        service.ensure_intake_run("invalid-schema-intake")
+        service.ensure_intake_run("invalid-schema-intake", initiator_role="ADMIN")
 
 
 def test_new_run_rejects_incomplete_draft_bindings(session) -> None:
@@ -212,7 +240,7 @@ def test_new_run_rejects_incomplete_draft_bindings(session) -> None:
     session.commit()
 
     with pytest.raises(ValueError, match="missing required logical tools"):
-        service.ensure_task_run("incomplete-draft-task")
+        service.ensure_task_run("incomplete-draft-task", initiator_role="ADMIN")
 
 
 def test_agent_admin_detail_exposes_unified_version_configuration(session) -> None:

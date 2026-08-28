@@ -216,6 +216,7 @@ def chat(
         owner_id=principal.user_id,
         tenant_id=principal.tenant_id,
         conversation_id=conversation.id,
+        initiator_role=principal.role,
     )
     runner = IntakeRunner(
         repository=repository,
@@ -417,6 +418,7 @@ def confirm_intake_entities(
         owner_id=principal.user_id,
         tenant_id=principal.tenant_id,
         conversation_id=conversation.id,
+        initiator_role=principal.role,
     )
     intake_session = _owned_intake(
         session, str(session_id), principal, for_update=True
@@ -723,6 +725,7 @@ def start_analysis(
         owner_id=principal.user_id,
         tenant_id=principal.tenant_id,
         conversation_id=conversation.id,
+        initiator_role=principal.role,
     )
     intake_session = _owned_intake(
         session, str(session_id), principal, for_update=True
@@ -740,6 +743,7 @@ def start_analysis(
             owner_id=principal.user_id,
             tenant_id=principal.tenant_id,
             conversation_id=conversation.id,
+            initiator_role=principal.role,
         )
         return TaskCreated(task_id=UUID(task.id), input_type=task.input_type)
     if payload.expected_version is not None and payload.expected_version != intake_session.version:
@@ -828,6 +832,7 @@ def start_analysis(
             owner_id=principal.user_id,
             tenant_id=principal.tenant_id,
             conversation_id=conversation.id,
+            initiator_role=principal.role,
         )
         return TaskCreated(task_id=UUID(task.id), input_type=task.input_type)
 
@@ -837,6 +842,7 @@ def start_analysis(
         owner_id=principal.user_id,
         tenant_id=principal.tenant_id,
         conversation_id=conversation.id,
+        initiator_role=principal.role,
     )
     TaskRepository(session).log_execution_event(
         task_id,

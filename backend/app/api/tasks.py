@@ -94,6 +94,7 @@ def create_text_task(
         owner_id=principal.user_id,
         tenant_id=principal.tenant_id,
         conversation_id=conversation.id,
+        initiator_role=principal.role,
     )
     run_research_pipeline.delay(task.id)
     return TaskCreated(task_id=UUID(task.id), input_type="text")
@@ -136,6 +137,7 @@ async def create_audio_task(
         owner_id=principal.user_id,
         tenant_id=principal.tenant_id,
         conversation_id=conversation.id,
+        initiator_role=principal.role,
     )
     run_research_pipeline.delay(task.id)
     return TaskCreated(task_id=UUID(task.id), input_type="audio")
@@ -354,6 +356,7 @@ def chat_with_task(
         owner_id=principal.user_id,
         tenant_id=principal.tenant_id,
         conversation_id=task.conversation_id,
+        initiator_role=principal.role,
     )
     try:
         result = AnalysisChatAgent(

@@ -325,15 +325,22 @@ def _version_response(version: AgentVersion) -> AgentVersionResponse:
 
 
 def _latest_draft(session: Session, agent_definition_id: str) -> AgentVersion | None:
-    return session.scalar(
-        select(AgentVersion)
-        .where(
-            AgentVersion.agent_definition_id == agent_definition_id,
-            AgentVersion.status == "DRAFT",
+    drafts = list(
+        session.scalars(
+            select(AgentVersion)
+            .where(
+                AgentVersion.agent_definition_id == agent_definition_id,
+                AgentVersion.status == "DRAFT",
+            )
+            .order_by(AgentVersion.version)
         )
-        .order_by(AgentVersion.version.desc())
-        .limit(1)
     )
+    if len(drafts) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Agent configuration has multiple draft versions",
+        )
+    return drafts[0] if drafts else None
 
 
 def _version_detail(
