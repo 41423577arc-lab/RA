@@ -128,7 +128,7 @@ class PromptConfigService:
         content: str,
         skills: list[dict] | None = None,
     ) -> PromptRevision:
-        definition = self._definition(prompt_definition_id)
+        definition = self._locked_definition(prompt_definition_id)
         active = self.session.get(PromptRevision, definition.active_revision_id)
         if active is None:
             raise ValueError("Prompt definition has no active revision")
@@ -145,6 +145,47 @@ class PromptConfigService:
         self.session.commit()
         self.session.refresh(revision)
         return revision
+
+    def freeze_working_copy(
+        self,
+        prompt_config: dict,
+        *,
+        base_revision_id: str,
+        expected_node_key: str,
+    ) -> tuple[PromptRevision, bool]:
+        working = self.resolve_working_copy(
+            prompt_config,
+            base_revision_id=base_revision_id,
+            expected_node_key=expected_node_key,
+        )
+        base = self.session.get(PromptRevision, base_revision_id)
+        if base is None:
+            raise KeyError(f"Prompt revision not found: {base_revision_id}")
+        core_payload = self._revision_payload(
+            node_key=expected_node_key,
+            content=working["content"],
+            skills=working["skills"],
+            required_variables=working["required_variables"],
+        )
+        if canonical_hash(core_payload) == base.config_hash:
+            return base, False
+
+        definition = self._locked_definition(base.prompt_definition_id)
+        if definition.node_key != expected_node_key:
+            raise ValueError(
+                f"Prompt revision belongs to {definition.node_key}, not {expected_node_key}"
+            )
+        revision = self._build_revision(
+            definition,
+            content=working["content"],
+            skills=working["skills"],
+            source="admin-publish",
+            version=self._next_version(definition.id),
+        )
+        self.session.add(revision)
+        self.session.flush()
+        definition.active_revision_id = revision.id
+        return revision, True
 
     def list_definitions(
         self, tenant_id: str, *, node_key: str | None = None
@@ -441,6 +482,16 @@ class PromptConfigService:
 
     def _definition(self, prompt_definition_id: str) -> PromptDefinition:
         definition = self.session.get(PromptDefinition, prompt_definition_id)
+        if definition is None or definition.status != "ACTIVE":
+            raise KeyError(f"Prompt definition not found: {prompt_definition_id}")
+        return definition
+
+    def _locked_definition(self, prompt_definition_id: str) -> PromptDefinition:
+        definition = self.session.scalar(
+            select(PromptDefinition)
+            .where(PromptDefinition.id == prompt_definition_id)
+            .with_for_update()
+        )
         if definition is None or definition.status != "ACTIVE":
             raise KeyError(f"Prompt definition not found: {prompt_definition_id}")
         return definition

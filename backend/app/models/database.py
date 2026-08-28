@@ -111,6 +111,7 @@ class AgentVersion(Base):
     config_schema_version: Mapped[int] = mapped_column(nullable=False, default=1)
     config: Mapped[dict] = mapped_column(INTAKE_JSON, nullable=False, default=dict)
     config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    release_note: Mapped[str | None] = mapped_column(Text)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

@@ -75,6 +75,11 @@ class AgentVersionResponse(BaseModel):
     version: int
     status: str
     config_hash: str
+    release_note: str | None = None
+
+
+class PublishAgentVersionRequest(BaseModel):
+    release_note: str | None = Field(default=None, max_length=2000)
 
 
 class NodeModelBindingRequest(BaseModel):

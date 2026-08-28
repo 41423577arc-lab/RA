@@ -107,6 +107,9 @@ def test_alembic_clean_database_upgrade_downgrade_cycle(tmp_path, monkeypatch) -
     assert "prompt_revision_id" in {
         item["name"] for item in inspect(engine).get_columns("agent_node_bindings")
     }
+    assert "release_note" in {
+        item["name"] for item in inspect(engine).get_columns("agent_versions")
+    }
 
     command.downgrade(config, "base")
     assert not inspect(engine).has_table("agent_definitions")

@@ -485,39 +485,63 @@ class AgentConfigService:
             raise KeyError(f"Agent version not found: {agent_version_id}")
         return self._behavior_for_version(version)
 
-    def publish_draft(self, agent_version_id: str) -> AgentVersion:
-        version = self.session.get(AgentVersion, agent_version_id)
-        if version is None or version.status != "DRAFT":
-            raise ValueError("Only draft Agent versions can be published")
-        definition = self.session.get(AgentDefinition, version.agent_definition_id)
-        if definition is None:
-            raise ValueError("Agent definition does not exist")
-        if any(
-            binding.prompt_config.get("working") is True
-            for binding in self._bindings(version.id)
-        ):
-            raise ValueError(
-                "Working Prompts must be frozen as stable revisions before publishing"
+    def publish_draft(
+        self,
+        agent_version_id: str,
+        *,
+        release_note: str | None = None,
+    ) -> AgentVersion:
+        try:
+            version = self.session.scalar(
+                select(AgentVersion)
+                .where(AgentVersion.id == agent_version_id)
+                .with_for_update()
             )
-        behavior = self._behavior_for_version(version)
-        if set(behavior["nodes"]) != set(NODE_REGISTRY):
-            raise ValueError("Draft does not contain the complete Node Registry")
-        bindings = self._bindings(version.id)
-        if any(binding.prompt_revision_id is None for binding in bindings):
-            raise ValueError("Draft contains a node without a Prompt revision")
-        tool_keys = {binding.logical_tool_key for binding in self._tool_bindings(version.id)}
-        missing_tools = set(DEFAULT_TOOL_MAPPINGS) - tool_keys
-        if missing_tools:
-            raise ValueError(
-                f"Draft is missing required logical tools: {', '.join(sorted(missing_tools))}"
+            if version is None or version.status != "DRAFT":
+                raise ValueError("Only draft Agent versions can be published")
+            definition = self.session.scalar(
+                select(AgentDefinition)
+                .where(AgentDefinition.id == version.agent_definition_id)
+                .with_for_update()
             )
-        version.config_hash = canonical_hash(behavior)
-        version.status = "PUBLISHED"
-        version.published_at = datetime.now(timezone.utc)
-        definition.published_version_id = version.id
-        self.session.commit()
-        self.session.refresh(version)
-        return version
+            if definition is None:
+                raise ValueError("Agent definition does not exist")
+
+            self._validate_version_bindings(version)
+            prompt_service = PromptConfigService(self.session, self.settings)
+            for binding in self._bindings(version.id):
+                if binding.prompt_revision_id is None:
+                    raise ValueError(
+                        f"Draft node has no Prompt revision: {binding.node_key}"
+                    )
+                if binding.prompt_config.get("working") is True:
+                    revision, _ = prompt_service.freeze_working_copy(
+                        binding.prompt_config,
+                        base_revision_id=binding.prompt_revision_id,
+                        expected_node_key=binding.node_key,
+                    )
+                    binding.prompt_revision_id = revision.id
+                    binding.prompt_config = prompt_service.resolve_revision(
+                        revision.id,
+                        expected_node_key=binding.node_key,
+                    )
+
+            self.session.flush()
+            self._validate_version_bindings(version)
+            behavior = self._behavior_for_version(version)
+            if set(behavior["nodes"]) != set(NODE_REGISTRY):
+                raise ValueError("Draft does not contain the complete Node Registry")
+            version.config_hash = canonical_hash(behavior)
+            version.status = "PUBLISHED"
+            version.published_at = datetime.now(timezone.utc)
+            version.release_note = release_note.strip() if release_note else None
+            definition.published_version_id = version.id
+            self.session.commit()
+            self.session.refresh(version)
+            return version
+        except Exception:
+            self.session.rollback()
+            raise
 
     def ensure_intake_run(
         self,

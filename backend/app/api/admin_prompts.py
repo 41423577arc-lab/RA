@@ -143,6 +143,7 @@ def bind_node_prompt(
         version=version.version,
         status=version.status,
         config_hash=version.config_hash,
+        release_note=version.release_note,
     )
 
 
@@ -173,6 +174,7 @@ def save_node_prompt_working_copy(
         version=version.version,
         status=version.status,
         config_hash=version.config_hash,
+        release_note=version.release_note,
     )
 
 
@@ -198,6 +200,7 @@ def discard_node_prompt_working_copy(
         version=version.version,
         status=version.status,
         config_hash=version.config_hash,
+        release_note=version.release_note,
     )
 
 

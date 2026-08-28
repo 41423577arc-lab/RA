@@ -27,7 +27,7 @@ const apiFetch = (path: string, init?: RequestInit) =>
   fetch(`${API_BASE}${path}`, { ...init, credentials: "include" });
 
 type User = { user_id?: string; display_name?: string; role?: string; agent_admin_enabled: boolean };
-type Version = { id: string; agent_definition_id: string; version: number; status: string; config_hash: string };
+type Version = { id: string; agent_definition_id: string; version: number; status: string; config_hash: string; release_note?: string };
 type NodeBinding = { node_key: string; output_schema: string; conditional: boolean; allows_tools: boolean; model_profile_revision_id?: string; model_id: string; provider: string; prompt_definition_id?: string; prompt_revision_id?: string; prompt_version?: number; prompt_source?: string; prompt_config: PromptConfig; allowed_tools: string[] };
 type ToolBinding = { logical_tool_key: string; tool_mapping_revision_id: string; remote_tool_name: string; adapter_key: string; allowed_nodes: string[] };
 type VersionDetail = Version & { config_schema_version: number; nodes: NodeBinding[]; tools: ToolBinding[] };
@@ -117,10 +117,6 @@ export default function AdminPage() {
 
   const draft = agent?.draft_version;
   const active = draft ?? agent?.published_version;
-  const draftHasWorkingPrompt = Boolean(
-    draft?.nodes.some((node) => node.prompt_config.working)
-  );
-
   const mutate = async (label: string, action: () => Promise<unknown>, refreshResources = false) => {
     if (!agent) return;
     setBusy(label); setError(""); setNotice("");
@@ -132,6 +128,16 @@ export default function AdminPage() {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : `${label}失败`);
     } finally { setBusy(""); }
+  };
+  const publishDraft = async () => {
+    if (!draft) return;
+    const releaseNote = window.prompt("发布备注（可选）", "");
+    if (releaseNote === null) return;
+    await mutate("发布", () => jsonRequest(`/api/v1/admin/agent-versions/${draft.id}/publish`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ release_note: releaseNote.trim() || null }),
+    }));
   };
 
   if (loading) return <main className={styles.center}><LoaderCircle className={styles.spin} /></main>;
@@ -163,7 +169,7 @@ export default function AdminPage() {
             <div><span className={styles.eyebrow}>{TABS.find((item) => item.key === tab)?.label}</span><h1>{agent.name}</h1><p>当前草稿用于下一次新任务，已经开始的任务继续使用原 Snapshot。</p></div>
             <div className={styles.actions}>
               {!draft && <button className={styles.secondaryButton} disabled={Boolean(busy)} onClick={() => void mutate("创建草稿", () => jsonRequest(`/api/v1/admin/agents/${agent.id}/drafts`, { method: "POST" }))}><Plus size={16} />创建草稿</button>}
-              {draft && <button className={styles.primaryButton} title={draftHasWorkingPrompt ? "工作稿冻结为稳定 Revision 将在下一阶段实现" : "发布当前稳定配置"} disabled={Boolean(busy) || draftHasWorkingPrompt} onClick={() => void mutate("发布", () => jsonRequest(`/api/v1/admin/agent-versions/${draft.id}/publish`, { method: "POST" }))}><Rocket size={16} />发布 v{draft.version}</button>}
+              {draft && <button className={styles.primaryButton} title="冻结当前工作配置并发布为稳定版本" disabled={Boolean(busy)} onClick={() => void publishDraft()}><Rocket size={16} />发布 v{draft.version}</button>}
             </div>
           </div>
           {error && <div className={styles.error}>{error}</div>}

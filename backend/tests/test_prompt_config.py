@@ -12,6 +12,7 @@ from app.config import Settings, settings
 from app.main import app
 from app.models.database import (
     AgentNodeBinding,
+    AgentVersion,
     Base,
     PromptDefinition,
     PromptRevision,
@@ -332,21 +333,126 @@ def test_published_version_rejects_working_prompt_even_with_matching_agent_hash(
         agent_service.resolve_published(DEFAULT_AGENT_DEFINITION_ID)
 
 
-def test_working_prompt_cannot_create_an_invalid_published_version(session) -> None:
+def test_publish_freezes_changed_working_prompt_once_and_updates_active_revision(
+    session,
+) -> None:
     config = _settings()
     agent_service = AgentConfigService(session, config)
     agent_service.ensure_default_agent()
     draft = agent_service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+    binding = session.scalar(
+        select(AgentNodeBinding).where(
+            AgentNodeBinding.agent_version_id == draft.id,
+            AgentNodeBinding.node_key == "analysis_chat",
+        )
+    )
+    assert binding is not None
+    definition = session.get(
+        PromptDefinition, binding.prompt_config["prompt_definition_id"]
+    )
+    assert definition is not None
+    base_revision_id = binding.prompt_revision_id
+    revision_count = session.scalar(select(func.count()).select_from(PromptRevision))
     agent_service.save_draft_node_prompt_working_copy(
         draft.id,
         "analysis_chat",
-        content="# Working Prompt\n\nNOT_FROZEN_YET",
+        content="# Working Prompt\n\nFREEZE_THIS_ONCE",
     )
 
-    with pytest.raises(ValueError, match="must be frozen as stable revisions"):
+    published = agent_service.publish_draft(
+        draft.id, release_note="Prompt experiment is stable"
+    )
+
+    session.refresh(binding)
+    assert published.status == "PUBLISHED"
+    assert published.release_note == "Prompt experiment is stable"
+    assert binding.prompt_revision_id != base_revision_id
+    assert binding.prompt_config.get("working") is not True
+    assert "FREEZE_THIS_ONCE" in binding.prompt_config["content"]
+    assert definition.active_revision_id == binding.prompt_revision_id
+    assert session.scalar(select(func.count()).select_from(PromptRevision)) == revision_count + 1
+    assert not session.scalars(
+        select(AgentVersion).where(AgentVersion.status == "DRAFT")
+    ).first()
+    behavior = agent_service.behavior_for_version(published.id)
+    assert canonical_hash(behavior) == published.config_hash
+    serialized = json.dumps(behavior, ensure_ascii=False)
+    assert "Prompt experiment is stable" not in serialized
+
+
+def test_publish_reuses_unchanged_working_prompt_revision(session) -> None:
+    config = _settings()
+    agent_service = AgentConfigService(session, config)
+    agent_service.ensure_default_agent()
+    draft = agent_service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+    binding = session.scalar(
+        select(AgentNodeBinding).where(
+            AgentNodeBinding.agent_version_id == draft.id,
+            AgentNodeBinding.node_key == "analysis_chat",
+        )
+    )
+    assert binding is not None
+    base_revision_id = binding.prompt_revision_id
+    revision_count = session.scalar(select(func.count()).select_from(PromptRevision))
+    agent_service.set_draft_node_prompt(
+        draft.id, "analysis_chat", base_revision_id
+    )
+
+    agent_service.publish_draft(draft.id)
+
+    session.refresh(binding)
+    assert binding.prompt_revision_id == base_revision_id
+    assert session.scalar(select(func.count()).select_from(PromptRevision)) == revision_count
+
+
+def test_publish_rolls_back_prompt_revision_when_finalization_fails(
+    session, monkeypatch
+) -> None:
+    config = _settings()
+    agent_service = AgentConfigService(session, config)
+    agent_service.ensure_default_agent()
+    draft = agent_service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+    binding = session.scalar(
+        select(AgentNodeBinding).where(
+            AgentNodeBinding.agent_version_id == draft.id,
+            AgentNodeBinding.node_key == "analysis_chat",
+        )
+    )
+    assert binding is not None
+    definition = session.get(
+        PromptDefinition, binding.prompt_config["prompt_definition_id"]
+    )
+    assert definition is not None
+    active_revision_id = definition.active_revision_id
+    revision_count = session.scalar(select(func.count()).select_from(PromptRevision))
+    agent_service.save_draft_node_prompt_working_copy(
+        draft.id,
+        "analysis_chat",
+        content="# Working Prompt\n\nROLL_BACK_THIS_REVISION",
+    )
+
+    monkeypatch.setattr(
+        agent_service,
+        "_behavior_for_version",
+        lambda _version: (_ for _ in ()).throw(RuntimeError("finalization failed")),
+    )
+    with pytest.raises(RuntimeError, match="finalization failed"):
         agent_service.publish_draft(draft.id)
 
-    assert draft.status == "DRAFT"
+    restored_draft = session.get(AgentVersion, draft.id)
+    restored_definition = session.get(PromptDefinition, definition.id)
+    restored_binding = session.scalar(
+        select(AgentNodeBinding).where(
+            AgentNodeBinding.agent_version_id == draft.id,
+            AgentNodeBinding.node_key == "analysis_chat",
+        )
+    )
+    assert restored_draft is not None and restored_draft.status == "DRAFT"
+    assert restored_definition is not None
+    assert restored_definition.active_revision_id == active_revision_id
+    assert restored_binding is not None
+    assert restored_binding.prompt_config["working"] is True
+    assert session.scalar(select(func.count()).select_from(PromptRevision)) == revision_count
 
 
 def test_prompt_history_preserves_old_revision_and_allows_draft_binding(session) -> None:

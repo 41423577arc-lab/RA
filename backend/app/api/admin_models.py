@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -29,6 +29,7 @@ from app.schemas.admin import (
     ModelProfileResponse,
     ModelProfileRevisionCreate,
     NodeModelBindingRequest,
+    PublishAgentVersionRequest,
     SecretRotateRequest,
 )
 from app.services.agent_config.models import ModelConfigService
@@ -264,10 +265,14 @@ def bind_node_model(
 )
 def publish_agent_version(
     agent_version_id: str,
+    payload: PublishAgentVersionRequest | None = Body(default=None),
     session: Session = Depends(get_session),
 ) -> AgentVersionResponse:
     try:
-        version = AgentConfigService(session, settings).publish_draft(agent_version_id)
+        version = AgentConfigService(session, settings).publish_draft(
+            agent_version_id,
+            release_note=payload.release_note if payload else None,
+        )
     except (KeyError, ValueError) as exc:
         session.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -321,6 +326,7 @@ def _version_response(version: AgentVersion) -> AgentVersionResponse:
         version=version.version,
         status=version.status,
         config_hash=version.config_hash,
+        release_note=version.release_note,
     )
 
 
