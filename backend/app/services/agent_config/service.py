@@ -59,6 +59,35 @@ class AgentConfigService:
             self.session.add(definition)
         self.session.flush()
 
+        published = (
+            self.session.get(AgentVersion, definition.published_version_id)
+            if definition.published_version_id
+            else None
+        )
+        if published is not None:
+            if published.status != "PUBLISHED":
+                raise ValueError("Default Agent has an invalid published version")
+            bindings = self._bindings(published.id)
+            if {binding.node_key for binding in bindings} != set(NODE_REGISTRY):
+                raise ValueError("Published Default Agent has incomplete node bindings")
+            if all(
+                binding.model_profile_revision_id is not None
+                for binding in bindings
+            ):
+                self.session.commit()
+                return published
+
+            from app.services.agent_config.models import ModelConfigService
+
+            model_service = ModelConfigService(self.session, self.settings)
+            default_models = model_service.ensure_defaults()
+            return self._migrate_legacy_model_bindings(
+                definition,
+                published,
+                model_service,
+                default_models,
+            )
+
         prompt_service = PromptConfigService(self.session, self.settings)
         default_prompts = prompt_service.ensure_defaults(SYSTEM_TENANT_ID)
         prompt_configs = {
@@ -94,32 +123,6 @@ class AgentConfigService:
         for node_key, model_config in model_configs.items():
             behavior["nodes"][node_key]["model"] = model_config
         behavior_hash = canonical_hash(behavior)
-        published = (
-            self.session.get(AgentVersion, definition.published_version_id)
-            if definition.published_version_id
-            else None
-        )
-        if published is not None and any(
-            binding.model_profile_revision_id is None
-            for binding in self._bindings(published.id)
-        ):
-            published = self._migrate_legacy_model_bindings(
-                definition,
-                published,
-                model_service,
-                default_models,
-            )
-        if (
-            published is not None
-            and (published.config or {}).get("management", {}).get("source")
-            == "admin"
-        ):
-            self.session.commit()
-            return published
-        if published is not None and published.config_hash == behavior_hash:
-            self.session.commit()
-            return published
-
         next_version = (
             self.session.scalar(
                 select(func.max(AgentVersion.version)).where(

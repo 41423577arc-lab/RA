@@ -1,6 +1,7 @@
 from copy import deepcopy
 import json
 import re
+import shutil
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ from app.models.database import (
     AgentToolBinding,
     AgentVersion,
     Base,
+    PromptRevision,
     Tenant,
 )
 from app.services.agent_config.registry import NODE_REGISTRY
@@ -521,6 +523,52 @@ def test_environment_model_change_does_not_replace_database_configuration(sessio
     ] == "model-v1"
     assert session.get(Tenant, SYSTEM_TENANT_ID) is not None
     assert session.scalar(select(func.count()).select_from(AgentRun)) == 2
+
+
+def test_existing_database_ignores_prompt_files_and_bootstrap_settings(
+    session, tmp_path
+) -> None:
+    prompt_dir = tmp_path / "prompts"
+    shutil.copytree(ROOT / "backend/prompts", prompt_dir)
+    initial = _settings(prompt_dir=prompt_dir, llm_model="database-model")
+    service = AgentConfigService(session, initial)
+    published = service.ensure_default_agent()
+    version_count = session.scalar(select(func.count()).select_from(AgentVersion))
+    prompt_revision_count = session.scalar(
+        select(func.count()).select_from(PromptRevision)
+    )
+    snapshot_before, hash_before = service.resolve_published(
+        DEFAULT_AGENT_DEFINITION_ID
+    )
+    prompt_path = prompt_dir / "analysis_chat_v1.txt"
+    prompt_path.write_text(
+        "# Changed Disk Prompt\n\nTHIS_MUST_NOT_RESEED_DATABASE\n",
+        encoding="utf-8",
+    )
+
+    changed_settings_service = AgentConfigService(
+        session,
+        _settings(
+            prompt_dir=prompt_dir,
+            llm_model="changed-environment-model",
+            agent_max_loops=99,
+        ),
+    )
+    resolved = changed_settings_service.ensure_default_agent()
+    snapshot_after, hash_after = changed_settings_service.resolve_published(
+        DEFAULT_AGENT_DEFINITION_ID
+    )
+
+    assert resolved.id == published.id
+    assert snapshot_after == snapshot_before
+    assert hash_after == hash_before
+    assert "THIS_MUST_NOT_RESEED_DATABASE" not in json.dumps(
+        snapshot_after, ensure_ascii=False
+    )
+    assert session.scalar(select(func.count()).select_from(AgentVersion)) == version_count
+    assert session.scalar(
+        select(func.count()).select_from(PromptRevision)
+    ) == prompt_revision_count
 
 
 def test_resolver_rejects_mutated_published_binding(session) -> None:
