@@ -1,3 +1,4 @@
+from copy import deepcopy
 import json
 import re
 from pathlib import Path
@@ -270,6 +271,111 @@ def test_agent_admin_routes_expose_fixed_agent_without_runtime_editor() -> None:
         "/api/v1/admin/agent-versions/{agent_version_id}/nodes/{node_key}/prompt-working-copy"
         in route_paths
     )
+
+
+def test_published_history_restore_copies_complete_version_to_draft(session) -> None:
+    service = AgentConfigService(session, _settings())
+    published_v1 = service.ensure_default_agent()
+    old_run = service.ensure_task_run("history-old-run", initiator_role="MEMBER")
+    old_snapshot = deepcopy(old_run.resolved_config_snapshot)
+
+    draft_v2 = service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+    changed_binding = session.scalar(
+        select(AgentNodeBinding).where(
+            AgentNodeBinding.agent_version_id == draft_v2.id,
+            AgentNodeBinding.node_key == "intake_chat",
+        )
+    )
+    assert changed_binding is not None
+    changed_binding.model_config = {
+        **changed_binding.model_config,
+        "model_id": "published-v2-model",
+    }
+    draft_v2.config_hash = canonical_hash(service.behavior_for_version(draft_v2.id))
+    session.commit()
+    published_v2 = service.publish_draft(draft_v2.id, release_note="second stable")
+    working = service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+
+    with pytest.raises(ValueError, match="overwrite confirmation"):
+        service.restore_published_version_to_draft(published_v1.id)
+    restored = service.restore_published_version_to_draft(
+        published_v1.id, confirm_overwrite=True
+    )
+
+    definition = session.get(AgentDefinition, DEFAULT_AGENT_DEFINITION_ID)
+    assert definition is not None
+    assert restored.id == working.id
+    assert restored.status == "DRAFT"
+    assert restored.config == published_v1.config
+    assert restored.config_hash == published_v1.config_hash
+    assert definition.published_version_id == published_v2.id
+    assert [
+        (
+            item.node_key,
+            item.prompt_revision_id,
+            item.prompt_config,
+            item.model_profile_revision_id,
+            item.model_config,
+            item.allowed_tools,
+        )
+        for item in service._bindings(restored.id)
+    ] == [
+        (
+            item.node_key,
+            item.prompt_revision_id,
+            item.prompt_config,
+            item.model_profile_revision_id,
+            item.model_config,
+            item.allowed_tools,
+        )
+        for item in service._bindings(published_v1.id)
+    ]
+    assert [
+        (item.logical_tool_key, item.tool_mapping_revision_id, item.allowed_nodes)
+        for item in service._tool_bindings(restored.id)
+    ] == [
+        (item.logical_tool_key, item.tool_mapping_revision_id, item.allowed_nodes)
+        for item in service._tool_bindings(published_v1.id)
+    ]
+    admin_run = service.ensure_task_run("history-admin-run", initiator_role="ADMIN")
+    member_run = service.ensure_task_run("history-member-run", initiator_role="MEMBER")
+    assert admin_run.agent_version_id == restored.id
+    assert member_run.agent_version_id == published_v2.id
+    assert old_run.resolved_config_snapshot == old_snapshot
+
+
+def test_simple_diff_reports_prompt_model_and_tool_changes(session) -> None:
+    service = AgentConfigService(session, _settings())
+    published = service.ensure_default_agent()
+    no_draft = service.diff_draft_to_published()
+    assert no_draft["has_draft"] is False
+    assert no_draft["published_version"] == published.version
+    draft = service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+    service.save_draft_node_prompt_working_copy(
+        draft.id,
+        "analysis_chat",
+        content="# Diff Analysis Chat\n\nDIFF_PROMPT_MARKER",
+    )
+    binding = session.scalar(
+        select(AgentNodeBinding).where(
+            AgentNodeBinding.agent_version_id == draft.id,
+            AgentNodeBinding.node_key == "intake_chat",
+        )
+    )
+    assert binding is not None
+    binding.model_config = {**binding.model_config, "model_id": "diff-model"}
+    draft.config_hash = canonical_hash(service.behavior_for_version(draft.id))
+    session.commit()
+
+    diff = service.diff_draft_to_published()
+
+    nodes = {item["node_key"]: item for item in diff["nodes"]}
+    assert diff["has_draft"] is True
+    assert diff["has_changes"] is True
+    assert nodes["analysis_chat"]["prompt_changed"] is True
+    assert nodes["analysis_chat"]["prompt_content_hash_changed"] is True
+    assert nodes["intake_chat"]["model_changed"] is True
+    assert all(item["changed"] is False for item in diff["tools"])
 
 
 def test_prompt_working_copy_put_passes_browser_cors_preflight() -> None:

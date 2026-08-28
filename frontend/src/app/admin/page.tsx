@@ -14,6 +14,7 @@ import {
   Pencil,
   Plus,
   Rocket,
+  RotateCcw,
   Save,
   SlidersHorizontal,
   TestTube2,
@@ -27,7 +28,7 @@ const apiFetch = (path: string, init?: RequestInit) =>
   fetch(`${API_BASE}${path}`, { ...init, credentials: "include" });
 
 type User = { user_id?: string; display_name?: string; role?: string; agent_admin_enabled: boolean };
-type Version = { id: string; agent_definition_id: string; version: number; status: string; config_hash: string; release_note?: string };
+type Version = { id: string; agent_definition_id: string; version: number; status: string; config_hash: string; release_note?: string; published_at?: string };
 type NodeBinding = { node_key: string; output_schema: string; conditional: boolean; allows_tools: boolean; model_profile_revision_id?: string; model_id: string; provider: string; prompt_definition_id?: string; prompt_revision_id?: string; prompt_version?: number; prompt_source?: string; prompt_config: PromptConfig; allowed_tools: string[] };
 type ToolBinding = { logical_tool_key: string; tool_mapping_revision_id: string; remote_tool_name: string; adapter_key: string; allowed_nodes: string[] };
 type VersionDetail = Version & { config_schema_version: number; nodes: NodeBinding[]; tools: ToolBinding[] };
@@ -39,7 +40,10 @@ type PromptValidation = { valid?: boolean; node_key?: string; output_schema?: st
 type PromptConfig = { prompt_definition_id?: string; revision_id?: string; base_revision_id?: string; version?: number; node_key?: string; content: string; content_hash: string; config_hash?: string; required_variables: string[]; skills: PromptSkill[]; validation_report: PromptValidation; smoke_test_status?: string; source?: string; working?: boolean };
 type PromptRevision = { id: string; prompt_definition_id: string; version: number; content: string; content_hash: string; required_variables: string[]; skills: PromptSkill[]; validation_report: PromptValidation; smoke_test_status: string; source: string; status: string };
 type PromptDefinition = { id: string; name: string; slug: string; node_key: string; active_revision: PromptRevision };
-type Tab = "overview" | "nodes" | "models" | "prompts";
+type NodeDiff = { node_key: string; prompt_changed: boolean; draft_prompt_revision_id?: string; published_prompt_revision_id?: string; prompt_content_hash_changed: boolean; model_changed: boolean; draft_model_name: string; published_model_name: string; draft_model_revision_id?: string; published_model_revision_id?: string };
+type ToolDiff = { logical_tool_key: string; changed: boolean };
+type ConfigDiff = { has_draft: boolean; has_changes: boolean; draft_version?: number; published_version: number; nodes: NodeDiff[]; tools: ToolDiff[] };
+type Tab = "overview" | "nodes" | "models" | "prompts" | "versions";
 
 const NODE_LABELS: Record<string, string> = {
   intake_chat: "Intake 对话",
@@ -60,6 +64,7 @@ const TABS: { key: Tab; label: string; icon: typeof Gauge }[] = [
   { key: "nodes", label: "节点配置", icon: Network },
   { key: "models", label: "模型", icon: SlidersHorizontal },
   { key: "prompts", label: "Prompt", icon: FileText },
+  { key: "versions", label: "版本", icon: History },
 ];
 
 async function jsonRequest<T>(path: string, init?: RequestInit): Promise<T> {
@@ -178,10 +183,54 @@ export default function AdminPage() {
           {tab === "nodes" && <NodesPanel version={active} draft={draft} profiles={profiles} prompts={prompts} busy={busy} mutate={mutate} />}
           {tab === "models" && <ModelsPanel connections={connections} profiles={profiles} busy={busy} mutate={mutate} />}
           {tab === "prompts" && <PromptsPanel version={active} draft={draft} prompts={prompts} busy={busy} mutate={mutate} />}
+          {tab === "versions" && <VersionsPanel agent={agent} busy={busy} mutate={mutate} />}
         </section>
       </div>
     </main>
   );
+}
+
+function VersionsPanel({ agent, busy, mutate }: { agent: AgentDetail; busy: string; mutate: (label: string, action: () => Promise<unknown>) => Promise<void> }) {
+  const [versions, setVersions] = useState<Version[]>([]);
+  const [diff, setDiff] = useState<ConfigDiff | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setLoadError("");
+    Promise.all([
+      jsonRequest<Version[]>("/api/v1/admin/agent/versions"),
+      jsonRequest<ConfigDiff>("/api/v1/admin/agent/diff"),
+    ]).then(([history, currentDiff]) => {
+      if (!cancelled) { setVersions(history); setDiff(currentDiff); }
+    }).catch((reason) => {
+      if (!cancelled) setLoadError(reason instanceof Error ? reason.message : "版本信息加载失败");
+    }).finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [agent.draft_version?.config_hash, agent.published_version.config_hash]);
+  const restore = async (version: Version) => {
+    const overwriting = Boolean(agent.draft_version);
+    if (!window.confirm(overwriting ? "将使用此历史版本覆盖当前工作配置，现有草稿修改会丢失。" : "将以此历史版本创建新的工作草稿。")) return;
+    await mutate(`恢复 v${version.version}`, () => jsonRequest(`/api/v1/admin/agent/versions/${version.id}/restore`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm_overwrite: overwriting }),
+    }));
+  };
+  if (loading) return <section className={styles.section}><LoaderCircle className={styles.spin} size={18} /></section>;
+  if (loadError) return <section className={styles.section}>{loadError}</section>;
+  return <div className={styles.stack}>
+    <section className={styles.section}>
+      <div className={styles.sectionHeading}><div><span className={styles.eyebrow}>Draft vs Published</span><h2>当前配置差异</h2></div><p>{diff?.has_draft ? `草稿 v${diff.draft_version} 对比已发布 v${diff.published_version}` : "当前没有草稿。"}</p></div>
+      {diff?.has_draft && <div className={styles.tableWrap}><table><thead><tr><th>节点</th><th>Prompt</th><th>模型</th></tr></thead><tbody>{diff.nodes.map((item) => <tr key={item.node_key}><td><strong>{NODE_LABELS[item.node_key] ?? item.node_key}</strong></td><td>{item.prompt_changed ? "已修改" : "未变化"}<small>{item.prompt_content_hash_changed ? "内容 Hash 已变化" : "内容 Hash 相同"}</small></td><td>{item.model_changed ? <><strong>{item.published_model_name}</strong><small>→ {item.draft_model_name}</small></> : <><span>未变化</span><small>{item.draft_model_name}</small></>}</td></tr>)}</tbody></table></div>}
+      {diff?.has_draft && diff.tools.some((item) => item.changed) && <div className={styles.resourceList}>{diff.tools.map((item) => <div key={item.logical_tool_key}><div><strong>{item.logical_tool_key}</strong><span>{item.changed ? "绑定已变化" : "未变化"}</span></div></div>)}</div>}
+    </section>
+    <section className={styles.section}>
+      <div className={styles.sectionHeading}><div><span className={styles.eyebrow}>Published Checkpoints</span><h2>稳定版本历史</h2></div><p>恢复只会写入当前工作草稿，不会立即改变正式版本。</p></div>
+      <div className={styles.resourceList}>{versions.map((version) => <div key={version.id}><div><strong>v{version.version}{version.id === agent.published_version.id ? " · 当前正式" : ""}</strong><span>{version.published_at ? new Date(version.published_at).toLocaleString("zh-CN") : ""}</span></div><div><code>{version.config_hash.slice(0, 16)}</code><small>{version.release_note || "无发布备注"}</small></div><button className={styles.iconButton} disabled={Boolean(busy)} title="恢复到工作草稿" onClick={() => void restore(version)}><RotateCcw size={16} /></button></div>)}</div>
+    </section>
+  </div>;
 }
 
 function Overview({ agent, active, connections, profiles, prompts }: { agent: AgentDetail; active: VersionDetail; connections: ModelConnection[]; profiles: ModelProfile[]; prompts: PromptDefinition[] }) {

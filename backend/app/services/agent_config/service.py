@@ -1,3 +1,4 @@
+from copy import deepcopy
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -11,6 +12,8 @@ from app.models.database import (
     AgentRun,
     AgentToolBinding,
     AgentVersion,
+    ModelProfile,
+    ModelProfileRevision,
     Tenant,
 )
 from app.services.agent_config.mcp import DEFAULT_TOOL_MAPPINGS, McpConfigService
@@ -301,6 +304,224 @@ class AgentConfigService:
         self.session.commit()
         self.session.refresh(draft)
         return draft
+
+    def list_published_versions(self) -> list[AgentVersion]:
+        return list(
+            self.session.scalars(
+                select(AgentVersion)
+                .where(
+                    AgentVersion.agent_definition_id
+                    == DEFAULT_AGENT_DEFINITION_ID,
+                    AgentVersion.status == "PUBLISHED",
+                )
+                .order_by(AgentVersion.version.desc())
+            )
+        )
+
+    def restore_published_version_to_draft(
+        self,
+        agent_version_id: str,
+        *,
+        confirm_overwrite: bool = False,
+    ) -> AgentVersion:
+        try:
+            definition = self.session.scalar(
+                select(AgentDefinition)
+                .where(AgentDefinition.id == DEFAULT_AGENT_DEFINITION_ID)
+                .with_for_update()
+            )
+            if definition is None or definition.status != "ACTIVE":
+                raise KeyError("Default Agent definition does not exist")
+            source = self.session.scalar(
+                select(AgentVersion)
+                .where(AgentVersion.id == agent_version_id)
+                .with_for_update()
+            )
+            if (
+                source is None
+                or source.agent_definition_id != definition.id
+                or source.status != "PUBLISHED"
+            ):
+                raise ValueError("Only a published Default Agent version can be restored")
+            drafts = list(
+                self.session.scalars(
+                    select(AgentVersion).where(
+                        AgentVersion.agent_definition_id == definition.id,
+                        AgentVersion.status == "DRAFT",
+                    )
+                )
+            )
+            if len(drafts) > 1:
+                raise ValueError(
+                    f"Agent definition {definition.id} has multiple draft versions"
+                )
+            if drafts and not confirm_overwrite:
+                raise ValueError("Restoring this version requires draft overwrite confirmation")
+
+            if drafts:
+                draft = drafts[0]
+                for binding in self._bindings(draft.id):
+                    self.session.delete(binding)
+                for binding in self._tool_bindings(draft.id):
+                    self.session.delete(binding)
+                self.session.flush()
+            else:
+                next_version = (
+                    self.session.scalar(
+                        select(func.max(AgentVersion.version)).where(
+                            AgentVersion.agent_definition_id == definition.id
+                        )
+                    )
+                    or 0
+                ) + 1
+                draft = AgentVersion(
+                    agent_definition_id=definition.id,
+                    version=next_version,
+                    status="DRAFT",
+                    config_schema_version=source.config_schema_version,
+                    config={},
+                    config_hash=source.config_hash,
+                )
+                self.session.add(draft)
+                self.session.flush()
+
+            draft.config_schema_version = source.config_schema_version
+            draft.config = deepcopy(source.config)
+            draft.release_note = None
+            draft.published_at = None
+            for binding in self._bindings(source.id):
+                self.session.add(
+                    AgentNodeBinding(
+                        agent_version_id=draft.id,
+                        node_key=binding.node_key,
+                        model_profile_revision_id=binding.model_profile_revision_id,
+                        prompt_revision_id=binding.prompt_revision_id,
+                        model_config=deepcopy(binding.model_config),
+                        prompt_config=deepcopy(binding.prompt_config),
+                        allowed_tools=deepcopy(binding.allowed_tools),
+                    )
+                )
+            for binding in self._tool_bindings(source.id):
+                self.session.add(
+                    AgentToolBinding(
+                        agent_version_id=draft.id,
+                        logical_tool_key=binding.logical_tool_key,
+                        tool_mapping_revision_id=binding.tool_mapping_revision_id,
+                        allowed_nodes=deepcopy(binding.allowed_nodes),
+                    )
+                )
+            self.session.flush()
+            self._validate_version_bindings(draft)
+            draft.config_hash = canonical_hash(self._behavior_for_version(draft))
+            self.session.commit()
+            self.session.refresh(draft)
+            return draft
+        except Exception:
+            self.session.rollback()
+            raise
+
+    def diff_draft_to_published(self) -> dict:
+        definition = self.session.get(
+            AgentDefinition, DEFAULT_AGENT_DEFINITION_ID
+        )
+        if definition is None or not definition.published_version_id:
+            raise ValueError("Default Agent has no published version")
+        published = self.session.get(
+            AgentVersion, definition.published_version_id
+        )
+        if published is None or published.status != "PUBLISHED":
+            raise ValueError("Default Agent has an invalid published version")
+        drafts = list(
+            self.session.scalars(
+                select(AgentVersion).where(
+                    AgentVersion.agent_definition_id == definition.id,
+                    AgentVersion.status == "DRAFT",
+                )
+            )
+        )
+        if len(drafts) > 1:
+            raise ValueError(
+                f"Agent definition {definition.id} has multiple draft versions"
+            )
+        if not drafts:
+            return {
+                "has_draft": False,
+                "has_changes": False,
+                "draft_version": None,
+                "published_version": published.version,
+                "nodes": [],
+                "tools": [],
+            }
+        draft = drafts[0]
+        draft_nodes = {item.node_key: item for item in self._bindings(draft.id)}
+        published_nodes = {
+            item.node_key: item for item in self._bindings(published.id)
+        }
+        node_diffs = []
+        for node_key in sorted(NODE_REGISTRY):
+            draft_binding = draft_nodes[node_key]
+            published_binding = published_nodes[node_key]
+            prompt_changed = canonical_hash(
+                self._prompt_runtime_core(draft_binding.prompt_config)
+            ) != canonical_hash(
+                self._prompt_runtime_core(published_binding.prompt_config)
+            )
+            model_changed = canonical_hash(draft_binding.model_config) != canonical_hash(
+                published_binding.model_config
+            )
+            node_diffs.append(
+                {
+                    "node_key": node_key,
+                    "prompt_changed": prompt_changed,
+                    "draft_prompt_revision_id": draft_binding.prompt_revision_id,
+                    "published_prompt_revision_id": published_binding.prompt_revision_id,
+                    "prompt_content_hash_changed": draft_binding.prompt_config.get(
+                        "content_hash"
+                    )
+                    != published_binding.prompt_config.get("content_hash"),
+                    "model_changed": model_changed,
+                    "draft_model_name": self._model_display_name(draft_binding),
+                    "published_model_name": self._model_display_name(
+                        published_binding
+                    ),
+                    "draft_model_revision_id": draft_binding.model_profile_revision_id,
+                    "published_model_revision_id": published_binding.model_profile_revision_id,
+                }
+            )
+        draft_tools = {
+            item.logical_tool_key: item for item in self._tool_bindings(draft.id)
+        }
+        published_tools = {
+            item.logical_tool_key: item
+            for item in self._tool_bindings(published.id)
+        }
+        tool_diffs = []
+        for logical_key in sorted(set(draft_tools) | set(published_tools)):
+            draft_binding = draft_tools.get(logical_key)
+            published_binding = published_tools.get(logical_key)
+            changed = (
+                draft_binding is None
+                or published_binding is None
+                or draft_binding.tool_mapping_revision_id
+                != published_binding.tool_mapping_revision_id
+                or sorted(draft_binding.allowed_nodes)
+                != sorted(published_binding.allowed_nodes)
+            )
+            tool_diffs.append(
+                {"logical_tool_key": logical_key, "changed": changed}
+            )
+        return {
+            "has_draft": True,
+            "has_changes": any(
+                item["prompt_changed"] or item["model_changed"]
+                for item in node_diffs
+            )
+            or any(item["changed"] for item in tool_diffs),
+            "draft_version": draft.version,
+            "published_version": published.version,
+            "nodes": node_diffs,
+            "tools": tool_diffs,
+        }
 
     def set_draft_node_model(
         self,
@@ -792,3 +1013,25 @@ class AgentConfigService:
                 .order_by(AgentToolBinding.logical_tool_key)
             )
         )
+
+    @staticmethod
+    def _prompt_runtime_core(prompt_config: dict) -> dict:
+        return {
+            "content": prompt_config.get("content"),
+            "skills": prompt_config.get("skills", []),
+            "required_variables": prompt_config.get("required_variables", []),
+        }
+
+    def _model_display_name(self, binding: AgentNodeBinding) -> str:
+        if binding.model_profile_revision_id:
+            revision = self.session.get(
+                ModelProfileRevision, binding.model_profile_revision_id
+            )
+            profile = (
+                self.session.get(ModelProfile, revision.model_profile_id)
+                if revision
+                else None
+            )
+            if profile is not None:
+                return f"{profile.name} · {revision.model_id}"
+        return str(binding.model_config.get("model_id", "环境默认"))

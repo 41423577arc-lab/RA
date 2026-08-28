@@ -17,6 +17,7 @@ from app.models.database import (
 )
 from app.schemas.admin import (
     AgentDefinitionDetailResponse,
+    AgentConfigDiffResponse,
     AgentNodeBindingResponse,
     AgentToolBindingResponse,
     AgentVersionDetailResponse,
@@ -30,6 +31,7 @@ from app.schemas.admin import (
     ModelProfileRevisionCreate,
     NodeModelBindingRequest,
     PublishAgentVersionRequest,
+    RestoreAgentVersionRequest,
     SecretRotateRequest,
 )
 from app.services.agent_config.models import ModelConfigService
@@ -79,6 +81,54 @@ def get_default_agent(
         published_version=_version_detail(session, published),
         draft_version=_version_detail(session, draft) if draft else None,
     )
+
+
+@router.get("/agent/versions", response_model=list[AgentVersionResponse])
+def list_default_agent_versions(
+    session: Session = Depends(get_session),
+) -> list[AgentVersionResponse]:
+    AgentConfigService(session, settings).ensure_default_agent()
+    return [
+        _version_response(version)
+        for version in AgentConfigService(
+            session, settings
+        ).list_published_versions()
+    ]
+
+
+@router.get("/agent/diff", response_model=AgentConfigDiffResponse)
+def diff_default_agent(
+    session: Session = Depends(get_session),
+) -> AgentConfigDiffResponse:
+    try:
+        AgentConfigService(session, settings).ensure_default_agent()
+        return AgentConfigDiffResponse.model_validate(
+            AgentConfigService(session, settings).diff_draft_to_published()
+        )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post(
+    "/agent/versions/{agent_version_id}/restore",
+    response_model=AgentVersionResponse,
+)
+def restore_default_agent_version(
+    agent_version_id: str,
+    payload: RestoreAgentVersionRequest,
+    session: Session = Depends(get_session),
+) -> AgentVersionResponse:
+    try:
+        version = AgentConfigService(
+            session, settings
+        ).restore_published_version_to_draft(
+            agent_version_id,
+            confirm_overwrite=payload.confirm_overwrite,
+        )
+    except (KeyError, ValueError) as exc:
+        session.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _version_response(version)
 
 
 @router.post("/model-connections", response_model=ModelConnectionResponse)
@@ -327,6 +377,7 @@ def _version_response(version: AgentVersion) -> AgentVersionResponse:
         status=version.status,
         config_hash=version.config_hash,
         release_note=version.release_note,
+        published_at=version.published_at,
     )
 
 
