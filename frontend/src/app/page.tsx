@@ -1186,7 +1186,7 @@ export default function Home() {
           <div className="auth-brand"><Bot size={22} /><strong>资源推动 Agent</strong></div>
           <div><span className="section-label">账户</span><h1>{authMode === "login" ? "登录" : "创建账户"}</h1></div>
           {authMode === "register" && <label>姓名<input value={authDisplayName} onChange={(event) => setAuthDisplayName(event.target.value)} autoComplete="name" /></label>}
-          <label>邮箱<input type="email" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} autoComplete="email" /></label>
+          <label>{authMode === "login" ? "账号或邮箱" : "邮箱"}<input type={authMode === "login" ? "text" : "email"} value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} autoComplete={authMode === "login" ? "username" : "email"} /></label>
           <label>密码<input type="password" value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} autoComplete={authMode === "login" ? "current-password" : "new-password"} onKeyDown={(event) => { if (event.key === "Enter") void submitAuth(); }} /></label>
           {authError && <div className="error-banner"><AlertCircle size={15} />{authError}</div>}
           <button className="primary-button" disabled={authSubmitting || (authMode === "register" && !authDisplayName.trim())} onClick={() => void submitAuth()}>
