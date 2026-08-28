@@ -392,6 +392,77 @@ def test_simple_diff_reports_prompt_model_and_tool_changes(session) -> None:
     assert all(item["changed"] is False for item in diff["tools"])
 
 
+def test_admin_draft_and_member_published_flow_remain_snapshot_isolated(session) -> None:
+    config = _settings()
+    service = AgentConfigService(session, config)
+    original_published = service.ensure_default_agent()
+    old_run = service.ensure_task_run("flow-old-member", initiator_role="MEMBER")
+    old_snapshot = deepcopy(old_run.resolved_config_snapshot)
+    draft = service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+
+    model_service = ModelConfigService(session, config)
+    _, connection_revision = model_service.create_connection(
+        name="Flow Model Connection",
+        slug="flow-model-connection",
+        provider="openai_compatible",
+        base_url="https://flow-model.example/v1",
+        secret_ref="env:OPENAI_API_KEY",
+    )
+    _, profile_revision = model_service.create_profile(
+        name="Flow GPT",
+        slug="flow-gpt",
+        connection_revision_id=connection_revision.id,
+        model_id="flow-gpt-model",
+        api_mode="chat_completions",
+        parameters={},
+    )
+    service.set_draft_node_model(
+        draft.id, "intake_chat", profile_revision.id
+    )
+    service.save_draft_node_prompt_working_copy(
+        draft.id,
+        "analysis_chat",
+        content="# Flow Analysis Chat\n\nFLOW_WORKING_PROMPT",
+    )
+
+    admin_run = service.ensure_task_run("flow-admin", initiator_role="ADMIN")
+    member_before_publish = service.ensure_task_run(
+        "flow-member-before", initiator_role="MEMBER"
+    )
+    assert admin_run.agent_version_id == draft.id
+    assert admin_run.resolved_config_snapshot["nodes"]["intake_chat"]["model"][
+        "model_id"
+    ] == "flow-gpt-model"
+    assert "FLOW_WORKING_PROMPT" in admin_run.resolved_config_snapshot["nodes"][
+        "analysis_chat"
+    ]["prompt"]["content"]
+    assert member_before_publish.agent_version_id == original_published.id
+    assert "FLOW_WORKING_PROMPT" not in member_before_publish.resolved_config_snapshot[
+        "nodes"
+    ]["analysis_chat"]["prompt"]["content"]
+    assert old_run.resolved_config_snapshot == old_snapshot
+
+    published = service.publish_draft(draft.id, release_note="flow stable")
+    member_after_publish = service.ensure_task_run(
+        "flow-member-after", initiator_role="MEMBER"
+    )
+    assert member_after_publish.agent_version_id == published.id
+    assert member_after_publish.resolved_config_snapshot["nodes"]["intake_chat"][
+        "model"
+    ]["model_id"] == "flow-gpt-model"
+    stable_prompt = member_after_publish.resolved_config_snapshot["nodes"][
+        "analysis_chat"
+    ]["prompt"]
+    assert "FLOW_WORKING_PROMPT" in stable_prompt["content"]
+    assert stable_prompt.get("working") is not True
+    assert not session.scalars(
+        select(AgentVersion).where(AgentVersion.status == "DRAFT")
+    ).first()
+    serialized = json.dumps(member_after_publish.resolved_config_snapshot)
+    assert config.openai_api_key not in serialized
+    assert old_run.resolved_config_snapshot == old_snapshot
+
+
 def test_prompt_working_copy_put_passes_browser_cors_preflight() -> None:
     with TestClient(app) as client:
         response = client.options(
