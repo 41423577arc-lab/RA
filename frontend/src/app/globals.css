@@ -29,6 +29,7 @@ button { letter-spacing: 0; }
 .brand-lockup h1 { margin: 0; color: var(--navy-dark); font-size: 26px; line-height: 1; font-weight: 760; }
 .topbar-actions { display: flex; align-items: center; gap: 18px; }
 .icon-tool-button { width: 40px; height: 40px; display: grid; place-items: center; color: var(--navy-dark); border: 1px solid #b7c1cf; border-radius: 6px; background: #fff; cursor: pointer; }
+.topbar-actions a.icon-tool-button { text-decoration: none; }
 .icon-tool-button:hover { border-color: var(--navy); background: #eef4fb; }
 .user-menu-button { min-height: 40px; padding: 0 12px; display: inline-flex; align-items: center; gap: 8px; color: #263449; border: 1px solid #b7c1cf; border-radius: 6px; background: #fff; cursor: pointer; }
 .user-menu-button:hover { color: var(--navy-dark); border-color: var(--navy); }

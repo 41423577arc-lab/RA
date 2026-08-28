@@ -23,6 +23,7 @@ def current_user(
         return CurrentUserResponse(
             auth_enabled=True,
             registration_enabled=settings.auth_allow_registration,
+            agent_admin_enabled=settings.agent_admin_enabled,
         )
     return _user_response(principal)
 
@@ -46,6 +47,7 @@ def register(
     return CurrentUserResponse(
         auth_enabled=True,
         registration_enabled=settings.auth_allow_registration,
+        agent_admin_enabled=settings.agent_admin_enabled,
         user_id=user.id,
         email=user.email,
         display_name=user.display_name,
@@ -71,6 +73,7 @@ def login(
     return CurrentUserResponse(
         auth_enabled=True,
         registration_enabled=settings.auth_allow_registration,
+        agent_admin_enabled=settings.agent_admin_enabled,
         user_id=user.id,
         email=user.email,
         display_name=user.display_name,
@@ -106,6 +109,7 @@ def _user_response(principal: Principal) -> CurrentUserResponse:
     return CurrentUserResponse(
         auth_enabled=principal.auth_enabled,
         registration_enabled=settings.auth_allow_registration,
+        agent_admin_enabled=settings.agent_admin_enabled,
         user_id=principal.user_id,
         email=principal.email,
         display_name=principal.display_name,

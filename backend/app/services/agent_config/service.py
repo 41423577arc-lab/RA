@@ -331,6 +331,41 @@ class AgentConfigService:
         self.session.refresh(version)
         return version
 
+    def set_draft_runtime_config(
+        self,
+        agent_version_id: str,
+        *,
+        loop: dict,
+        output: dict,
+    ) -> AgentVersion:
+        version = self.session.get(AgentVersion, agent_version_id)
+        if version is None or version.status != "DRAFT":
+            raise ValueError("Only draft Agent versions can be edited")
+        current_output = dict((version.config or {}).get("output", {}))
+        version.config = {
+            **version.config,
+            "management": {"source": "admin"},
+            "loop": dict(loop),
+            "output": {
+                **current_output,
+                "formats": sorted(set(output["formats"])),
+                "evidence_validation_required": bool(
+                    output["evidence_validation_required"]
+                ),
+            },
+        }
+        self.session.flush()
+        version.config_hash = canonical_hash(self._behavior_for_version(version))
+        self.session.commit()
+        self.session.refresh(version)
+        return version
+
+    def behavior_for_version(self, agent_version_id: str) -> dict:
+        version = self.session.get(AgentVersion, agent_version_id)
+        if version is None:
+            raise KeyError(f"Agent version not found: {agent_version_id}")
+        return self._behavior_for_version(version)
+
     def publish_draft(self, agent_version_id: str) -> AgentVersion:
         version = self.session.get(AgentVersion, agent_version_id)
         if version is None or version.status != "DRAFT":

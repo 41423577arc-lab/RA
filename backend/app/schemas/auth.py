@@ -15,6 +15,7 @@ class LoginRequest(BaseModel):
 class CurrentUserResponse(BaseModel):
     auth_enabled: bool
     registration_enabled: bool
+    agent_admin_enabled: bool
     user_id: str | None = None
     email: str | None = None
     display_name: str | None = None

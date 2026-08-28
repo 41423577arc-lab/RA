@@ -19,6 +19,7 @@ import {
   LogOut,
   Search,
   Send,
+  Settings,
   TerminalSquare,
   X
 } from "lucide-react";
@@ -71,6 +72,7 @@ type StreamConnection = "CONNECTING" | "LIVE" | "RECONNECTING" | "STOPPED";
 type CurrentUser = {
   auth_enabled: boolean;
   registration_enabled: boolean;
+  agent_admin_enabled?: boolean;
   user_id?: string;
   email?: string;
   display_name?: string;
@@ -1204,6 +1206,7 @@ export default function Home() {
         </div>
         <div className="topbar-actions">
           <span className="agent-glyph" title="资源推动 Agent 在线"><Bot size={19} /></span>
+          {currentUser?.agent_admin_enabled && ["ADMIN", "SYSTEM"].includes(currentUser.role ?? "") && <a className="icon-tool-button" href="/admin" title="Agent 管理" aria-label="Agent 管理"><Settings size={18} /></a>}
           <button className="icon-tool-button" onClick={() => { setHistoryOpen(!historyOpen); if (!historyOpen) void refreshConversations(); }} title="历史会话" aria-label="历史会话"><History size={18} /></button>
           {currentUser?.auth_enabled && <button className="user-menu-button" onClick={() => void logout()} title="退出登录"><span>{currentUser.display_name}</span><LogOut size={15} /></button>}
           <button className="reset-button" onClick={reset} title="清空当前页面并新建调查">

@@ -5,13 +5,23 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_session
 from app.models.database import (
+    AgentDefinition,
+    AgentNodeBinding,
+    AgentToolBinding,
     AgentVersion,
     ModelConnection,
     ModelConnectionRevision,
     ModelProfile,
     ModelProfileRevision,
+    PromptRevision,
 )
 from app.schemas.admin import (
+    AgentDefinitionDetailResponse,
+    AgentDefinitionSummaryResponse,
+    AgentNodeBindingResponse,
+    AgentRuntimeConfigRequest,
+    AgentToolBindingResponse,
+    AgentVersionDetailResponse,
     AgentVersionResponse,
     ConnectionTestResponse,
     ModelConnectionCreate,
@@ -24,6 +34,8 @@ from app.schemas.admin import (
     SecretRotateRequest,
 )
 from app.services.agent_config.models import ModelConfigService
+from app.services.agent_config.mcp import McpConfigService
+from app.services.agent_config.registry import NODE_REGISTRY
 from app.services.agent_config.service import AgentConfigService, SYSTEM_TENANT_ID
 from app.services.auth import Principal, get_current_principal
 
@@ -42,6 +54,67 @@ router = APIRouter(
     tags=["agent-admin"],
     dependencies=[Depends(require_agent_admin)],
 )
+
+
+@router.get("/agents", response_model=list[AgentDefinitionSummaryResponse])
+def list_agents(
+    session: Session = Depends(get_session),
+) -> list[AgentDefinitionSummaryResponse]:
+    AgentConfigService(session, settings).ensure_default_agent()
+    definitions = list(
+        session.scalars(
+            select(AgentDefinition)
+            .where(AgentDefinition.tenant_id == SYSTEM_TENANT_ID)
+            .order_by(AgentDefinition.name)
+        )
+    )
+    return [_definition_summary(session, item) for item in definitions]
+
+
+@router.get(
+    "/agents/{agent_definition_id}", response_model=AgentDefinitionDetailResponse
+)
+def get_agent(
+    agent_definition_id: str,
+    session: Session = Depends(get_session),
+) -> AgentDefinitionDetailResponse:
+    AgentConfigService(session, settings).ensure_default_agent()
+    definition = session.get(AgentDefinition, agent_definition_id)
+    if definition is None or definition.tenant_id != SYSTEM_TENANT_ID:
+        raise HTTPException(status_code=404, detail="Agent definition not found")
+    published = session.get(AgentVersion, definition.published_version_id)
+    if published is None:
+        raise HTTPException(status_code=409, detail="Agent has no published version")
+    draft = _latest_draft(session, definition.id)
+    return AgentDefinitionDetailResponse(
+        id=definition.id,
+        name=definition.name,
+        slug=definition.slug,
+        status=definition.status,
+        published_version=_version_detail(session, published),
+        draft_version=_version_detail(session, draft) if draft else None,
+    )
+
+
+@router.post(
+    "/agent-versions/{agent_version_id}/runtime-config",
+    response_model=AgentVersionResponse,
+)
+def update_agent_runtime_config(
+    agent_version_id: str,
+    payload: AgentRuntimeConfigRequest,
+    session: Session = Depends(get_session),
+) -> AgentVersionResponse:
+    try:
+        version = AgentConfigService(session, settings).set_draft_runtime_config(
+            agent_version_id,
+            loop=payload.loop.model_dump(),
+            output=payload.output.model_dump(),
+        )
+    except (KeyError, ValueError) as exc:
+        session.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _version_response(version)
 
 
 @router.post("/model-connections", response_model=ModelConnectionResponse)
@@ -285,4 +358,98 @@ def _version_response(version: AgentVersion) -> AgentVersionResponse:
         version=version.version,
         status=version.status,
         config_hash=version.config_hash,
+    )
+
+
+def _definition_summary(
+    session: Session, definition: AgentDefinition
+) -> AgentDefinitionSummaryResponse:
+    published = session.get(AgentVersion, definition.published_version_id)
+    if published is None:
+        raise HTTPException(status_code=409, detail="Agent has no published version")
+    draft = _latest_draft(session, definition.id)
+    return AgentDefinitionSummaryResponse(
+        id=definition.id,
+        name=definition.name,
+        slug=definition.slug,
+        status=definition.status,
+        published_version=_version_response(published),
+        draft_version=_version_response(draft) if draft else None,
+    )
+
+
+def _latest_draft(session: Session, agent_definition_id: str) -> AgentVersion | None:
+    return session.scalar(
+        select(AgentVersion)
+        .where(
+            AgentVersion.agent_definition_id == agent_definition_id,
+            AgentVersion.status == "DRAFT",
+        )
+        .order_by(AgentVersion.version.desc())
+        .limit(1)
+    )
+
+
+def _version_detail(
+    session: Session, version: AgentVersion
+) -> AgentVersionDetailResponse:
+    service = AgentConfigService(session, settings)
+    behavior = service.behavior_for_version(version.id)
+    bindings = list(
+        session.scalars(
+            select(AgentNodeBinding)
+            .where(AgentNodeBinding.agent_version_id == version.id)
+            .order_by(AgentNodeBinding.node_key)
+        )
+    )
+    nodes = []
+    for binding in bindings:
+        node = behavior["nodes"][binding.node_key]
+        prompt_revision = (
+            session.get(PromptRevision, binding.prompt_revision_id)
+            if binding.prompt_revision_id
+            else None
+        )
+        spec = NODE_REGISTRY[binding.node_key]
+        nodes.append(
+            AgentNodeBindingResponse(
+                node_key=binding.node_key,
+                output_schema=spec.output_schema,
+                conditional=spec.conditional,
+                allows_tools=spec.allows_tools,
+                model_profile_revision_id=binding.model_profile_revision_id,
+                model_id=node["model"].get("model_id", ""),
+                provider=node["model"].get("provider", ""),
+                prompt_revision_id=binding.prompt_revision_id,
+                prompt_version=prompt_revision.version if prompt_revision else None,
+                prompt_source=node["prompt"].get("source"),
+                allowed_tools=node.get("allowed_tools", []),
+            )
+        )
+    tools = []
+    mcp_service = McpConfigService(session, settings)
+    for binding in session.scalars(
+        select(AgentToolBinding)
+        .where(AgentToolBinding.agent_version_id == version.id)
+        .order_by(AgentToolBinding.logical_tool_key)
+    ):
+        mapping = mcp_service.resolve_mapping_revision(
+            binding.tool_mapping_revision_id
+        )
+        tools.append(
+            AgentToolBindingResponse(
+                logical_tool_key=binding.logical_tool_key,
+                tool_mapping_revision_id=binding.tool_mapping_revision_id,
+                remote_tool_name=mapping["remote_tool_name"],
+                adapter_key=mapping["adapter_key"],
+                allowed_nodes=binding.allowed_nodes,
+            )
+        )
+    return AgentVersionDetailResponse(
+        **_version_response(version).model_dump(),
+        config_schema_version=version.config_schema_version,
+        loop=behavior["loop"],
+        output=behavior["output"],
+        nodes=nodes,
+        tools=tools,
     )
