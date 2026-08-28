@@ -14,7 +14,14 @@
 - 管理后台：`http://localhost:3000/admin`
 - 后端 API 文档：`http://localhost:8000/docs`
 
-登录页支持使用账号或邮箱登录。当前本地管理员账号由部署人员维护；首次登录后应避免在共享环境中继续使用弱密码。
+登录页支持使用账号或邮箱登录。系统首次初始化数据库时会创建默认管理员：
+
+```text
+账号：admin
+初始密码：123456
+```
+
+默认密码只适合本地演示。正式或共享环境应在首次启动前通过 `.env` 中的 `DEFAULT_ADMIN_USERNAME`、`DEFAULT_ADMIN_PASSWORD` 和 `DEFAULT_ADMIN_DISPLAY_NAME` 覆盖默认值。Seed 重复运行不会重置已存在账号的密码。
 
 角色权限：
 
@@ -218,6 +225,9 @@ AUTH_ALLOW_REGISTRATION=true
 AGENT_ADMIN_ENABLED=true
 AGENT_SECRET_KEY=<固定的 Fernet 密钥>
 AGENT_TRUSTED_MODEL_HOSTS=model.example.com
+DEFAULT_ADMIN_USERNAME=admin
+DEFAULT_ADMIN_PASSWORD=<部署环境的初始密码>
+DEFAULT_ADMIN_DISPLAY_NAME=管理员
 ```
 
 生成 `AGENT_SECRET_KEY`：

@@ -98,10 +98,22 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      seed-admin:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
       mcp-server:
         condition: service_healthy
+
+  seed-admin:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: python /app/seed/seed_admin.py
+    env_file: .env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
 
   worker:
     build:
