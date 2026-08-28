@@ -14,6 +14,7 @@ class ModelConnectionCreate(BaseModel):
 
 
 class ModelConnectionRevisionCreate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
     provider: Literal["openai", "openai_compatible"]
     base_url: str = Field(min_length=8, max_length=500)
     secret_ref: str = Field(min_length=4, max_length=255)
@@ -46,6 +47,7 @@ class ModelProfileCreate(BaseModel):
 
 
 class ModelProfileRevisionCreate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
     connection_revision_id: str
     model_id: str = Field(min_length=1, max_length=200)
     api_mode: Literal["chat_completions", "responses"]

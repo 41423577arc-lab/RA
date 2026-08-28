@@ -68,6 +68,14 @@ class AgentConfigService:
             )
             for node_key, revision in default_prompts.items()
         }
+        from app.services.agent_config.models import ModelConfigService
+
+        model_service = ModelConfigService(self.session, self.settings)
+        default_models = model_service.ensure_defaults()
+        model_configs = {
+            node_key: model_service.resolve_profile_revision(revision.id)
+            for node_key, revision in default_models.items()
+        }
         mcp_service = McpConfigService(self.session, self.settings)
         default_server, default_tools = mcp_service.ensure_defaults(SYSTEM_TENANT_ID)
         mcp_server_configs = [mcp_service.resolve_server_revision(default_server.id)]
@@ -83,12 +91,24 @@ class AgentConfigService:
             mcp_server_configs=mcp_server_configs,
             mcp_tool_configs=mcp_tool_configs,
         )
+        for node_key, model_config in model_configs.items():
+            behavior["nodes"][node_key]["model"] = model_config
         behavior_hash = canonical_hash(behavior)
         published = (
             self.session.get(AgentVersion, definition.published_version_id)
             if definition.published_version_id
             else None
         )
+        if published is not None and any(
+            binding.model_profile_revision_id is None
+            for binding in self._bindings(published.id)
+        ):
+            published = self._migrate_legacy_model_bindings(
+                definition,
+                published,
+                model_service,
+                default_models,
+            )
         if (
             published is not None
             and (published.config or {}).get("management", {}).get("source")
@@ -125,6 +145,7 @@ class AgentConfigService:
                 AgentNodeBinding(
                     agent_version_id=version.id,
                     node_key=node_key,
+                    model_profile_revision_id=default_models[node_key].id,
                     prompt_revision_id=default_prompts[node_key].id,
                     model_config=node["model"],
                     prompt_config=node["prompt"],
@@ -141,6 +162,90 @@ class AgentConfigService:
                 )
             )
         definition.published_version_id = version.id
+        self.session.commit()
+        self.session.refresh(version)
+        return version
+
+    def _migrate_legacy_model_bindings(
+        self,
+        definition: AgentDefinition,
+        source: AgentVersion,
+        model_service,
+        default_models: dict[str, ModelProfileRevision],
+    ) -> AgentVersion:
+        next_version = (
+            self.session.scalar(
+                select(func.max(AgentVersion.version)).where(
+                    AgentVersion.agent_definition_id == definition.id
+                )
+            )
+            or 0
+        ) + 1
+        version = AgentVersion(
+            agent_definition_id=definition.id,
+            version=next_version,
+            status="PUBLISHED",
+            config_schema_version=source.config_schema_version,
+            config=deepcopy(source.config),
+            config_hash=source.config_hash,
+            release_note="Migrate model bindings to database revisions",
+            published_at=datetime.now(timezone.utc),
+        )
+        self.session.add(version)
+        self.session.flush()
+        for binding in self._bindings(source.id):
+            revision = (
+                self.session.get(
+                    ModelProfileRevision, binding.model_profile_revision_id
+                )
+                if binding.model_profile_revision_id
+                else default_models[binding.node_key]
+            )
+            if revision is None:
+                raise ValueError(f"Model profile revision is missing: {binding.node_key}")
+            self.session.add(
+                AgentNodeBinding(
+                    agent_version_id=version.id,
+                    node_key=binding.node_key,
+                    model_profile_revision_id=revision.id,
+                    prompt_revision_id=binding.prompt_revision_id,
+                    model_config=model_service.resolve_profile_revision(revision.id),
+                    prompt_config=deepcopy(binding.prompt_config),
+                    allowed_tools=deepcopy(binding.allowed_tools),
+                )
+            )
+        for binding in self._tool_bindings(source.id):
+            self.session.add(
+                AgentToolBinding(
+                    agent_version_id=version.id,
+                    logical_tool_key=binding.logical_tool_key,
+                    tool_mapping_revision_id=binding.tool_mapping_revision_id,
+                    allowed_nodes=deepcopy(binding.allowed_nodes),
+                )
+            )
+        self.session.flush()
+        version.config_hash = canonical_hash(self._behavior_for_version(version))
+        definition.published_version_id = version.id
+
+        drafts = list(
+            self.session.scalars(
+                select(AgentVersion).where(
+                    AgentVersion.agent_definition_id == definition.id,
+                    AgentVersion.status == "DRAFT",
+                )
+            )
+        )
+        for draft in drafts:
+            for binding in self._bindings(draft.id):
+                if binding.model_profile_revision_id is not None:
+                    continue
+                revision = default_models[binding.node_key]
+                binding.model_profile_revision_id = revision.id
+                binding.model_config = model_service.resolve_profile_revision(
+                    revision.id
+                )
+            self.session.flush()
+            draft.config_hash = canonical_hash(self._behavior_for_version(draft))
         self.session.commit()
         self.session.refresh(version)
         return version

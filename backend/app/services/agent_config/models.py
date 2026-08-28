@@ -17,9 +17,10 @@ from app.services.agent_config.provider_adapters import (
     ProviderAdapterRegistry,
     validate_model_base_url,
 )
+from app.services.agent_config.registry import NODE_REGISTRY
 from app.services.agent_config.secrets import ALLOWED_ENV_SECRET_REFS, SecretStore
 from app.services.agent_config.service import SYSTEM_TENANT_ID
-from app.services.agent_config.snapshot import canonical_hash
+from app.services.agent_config.snapshot import LONG_NODES, REVIEW_NODES, canonical_hash
 
 
 SLUG_PATTERN = re.compile(r"^[a-z][a-z0-9-]{1,62}[a-z0-9]$")
@@ -47,6 +48,143 @@ class ModelConfigService:
         self.settings = settings
         self.adapters = adapters or ProviderAdapterRegistry()
         self.secrets = SecretStore(session, settings)
+
+    def ensure_defaults(self) -> dict[str, ModelProfileRevision]:
+        connection = self.session.scalar(
+            select(ModelConnection).where(
+                ModelConnection.tenant_id == SYSTEM_TENANT_ID,
+                ModelConnection.slug == "default-model-connection",
+            )
+        )
+        if connection is None:
+            connection = ModelConnection(
+                tenant_id=SYSTEM_TENANT_ID,
+                name="Default Model Connection",
+                slug="default-model-connection",
+            )
+            self.session.add(connection)
+            self.session.flush()
+        connection_revision = (
+            self.session.get(
+                ModelConnectionRevision, connection.active_revision_id
+            )
+            if connection.active_revision_id
+            else None
+        )
+        if connection_revision is None:
+            adapter = self.adapters.get(self.settings.model_provider)
+            payload = {
+                "provider": adapter.provider_key,
+                "base_url": validate_model_base_url(
+                    self.settings.openai_base_url,
+                    allow_private=self.settings.agent_allow_private_model_urls,
+                ),
+                "authentication_type": "api_key",
+                "secret_ref": self._secret_reference(
+                    connection_id=connection.id,
+                    name=connection.slug,
+                    api_key=(
+                        self.settings.openai_api_key
+                        if self.settings.agent_secret_key
+                        and self.settings.openai_api_key
+                        else None
+                    ),
+                    secret_ref=(
+                        None
+                        if self.settings.agent_secret_key
+                        and self.settings.openai_api_key
+                        else "env:OPENAI_API_KEY"
+                    ),
+                ),
+            }
+            connection_revision = ModelConnectionRevision(
+                model_connection_id=connection.id,
+                version=1,
+                **payload,
+                config_hash=canonical_hash(payload),
+                published_at=datetime.now(timezone.utc),
+            )
+            self.session.add(connection_revision)
+            self.session.flush()
+            connection.active_revision_id = connection_revision.id
+
+        common_parameters = {
+            "reasoning_effort": self.settings.llm_reasoning_effort,
+            "timeout_seconds": self.settings.llm_timeout_seconds,
+            "max_retries": self.settings.llm_max_retries,
+            "store": False,
+            "enabled": self.settings.llm_enabled,
+            "response_storage_disabled": self.settings.llm_disable_response_storage,
+        }
+        specs = {
+            "default": (
+                "Default Model",
+                self.settings.llm_model,
+                {**common_parameters, "max_output_tokens": 8000},
+            ),
+            "long": (
+                "Default Long Output Model",
+                self.settings.llm_model,
+                {**common_parameters, "max_output_tokens": 16000},
+            ),
+        }
+        if self.settings.llm_review_model != self.settings.llm_model:
+            specs["review"] = (
+                "Default Review Model",
+                self.settings.llm_review_model,
+                {**common_parameters, "max_output_tokens": 8000},
+            )
+        revisions: dict[str, ModelProfileRevision] = {}
+        for key, (name, model_id, parameters) in specs.items():
+            slug = f"default-{key}-model"
+            profile = self.session.scalar(
+                select(ModelProfile).where(
+                    ModelProfile.tenant_id == SYSTEM_TENANT_ID,
+                    ModelProfile.slug == slug,
+                )
+            )
+            if profile is None:
+                profile = ModelProfile(
+                    tenant_id=SYSTEM_TENANT_ID,
+                    name=name,
+                    slug=slug,
+                )
+                self.session.add(profile)
+                self.session.flush()
+            revision = (
+                self.session.get(ModelProfileRevision, profile.active_revision_id)
+                if profile.active_revision_id
+                else None
+            )
+            if revision is None:
+                payload = {
+                    "connection_revision_id": connection_revision.id,
+                    "model_id": model_id,
+                    "api_mode": self.settings.llm_api_mode,
+                    "parameters": self._validate_parameters(parameters),
+                }
+                revision = ModelProfileRevision(
+                    model_profile_id=profile.id,
+                    version=1,
+                    **payload,
+                    config_hash=canonical_hash(payload),
+                    published_at=datetime.now(timezone.utc),
+                )
+                self.session.add(revision)
+                self.session.flush()
+                profile.active_revision_id = revision.id
+            revisions[key] = revision
+
+        return {
+            node_key: revisions[
+                "long"
+                if node_key in LONG_NODES
+                else "review"
+                if node_key in REVIEW_NODES and "review" in revisions
+                else "default"
+            ]
+            for node_key in NODE_REGISTRY
+        }
 
     def create_connection(
         self,
@@ -108,11 +246,14 @@ class ModelConfigService:
         self,
         connection_id: str,
         *,
+        name: str | None = None,
         provider: str,
         base_url: str,
         secret_ref: str,
     ) -> ModelConnectionRevision:
         connection = self._connection(connection_id)
+        if name is not None:
+            connection.name = name.strip()
         adapter = self.adapters.get(provider)
         normalized_url = validate_model_base_url(
             base_url, allow_private=self.settings.agent_allow_private_model_urls
@@ -201,12 +342,15 @@ class ModelConfigService:
         self,
         profile_id: str,
         *,
+        name: str | None = None,
         connection_revision_id: str,
         model_id: str,
         api_mode: str,
         parameters: dict,
     ) -> ModelProfileRevision:
         profile = self._profile(profile_id)
+        if name is not None:
+            profile.name = name.strip()
         self._connection_revision(connection_revision_id)
         params = self._validate_parameters(parameters)
         if api_mode not in {"chat_completions", "responses"}:

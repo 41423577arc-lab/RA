@@ -25,6 +25,7 @@ from app.models.database import (
     Tenant,
 )
 from app.services.agent_config.registry import NODE_REGISTRY
+from app.services.agent_config.models import ModelConfigService
 from app.services.agent_config.service import (
     DEFAULT_AGENT_DEFINITION_ID,
     SYSTEM_TENANT_ID,
@@ -280,19 +281,25 @@ def test_published_history_restore_copies_complete_version_to_draft(session) -> 
     old_snapshot = deepcopy(old_run.resolved_config_snapshot)
 
     draft_v2 = service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
-    changed_binding = session.scalar(
-        select(AgentNodeBinding).where(
-            AgentNodeBinding.agent_version_id == draft_v2.id,
-            AgentNodeBinding.node_key == "intake_chat",
-        )
+    model_service = ModelConfigService(session, _settings())
+    _, connection_revision = model_service.create_connection(
+        name="History Model Connection",
+        slug="history-model-connection",
+        provider="openai_compatible",
+        base_url="https://history-model.example/v1",
+        secret_ref="env:OPENAI_API_KEY",
     )
-    assert changed_binding is not None
-    changed_binding.model_config = {
-        **changed_binding.model_config,
-        "model_id": "published-v2-model",
-    }
-    draft_v2.config_hash = canonical_hash(service.behavior_for_version(draft_v2.id))
-    session.commit()
+    _, profile_revision = model_service.create_profile(
+        name="History Model",
+        slug="history-model",
+        connection_revision_id=connection_revision.id,
+        model_id="published-v2-model",
+        api_mode="chat_completions",
+        parameters={},
+    )
+    service.set_draft_node_model(
+        draft_v2.id, "intake_chat", profile_revision.id
+    )
     published_v2 = service.publish_draft(draft_v2.id, release_note="second stable")
     working = service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
 
@@ -356,16 +363,23 @@ def test_simple_diff_reports_prompt_model_and_tool_changes(session) -> None:
         "analysis_chat",
         content="# Diff Analysis Chat\n\nDIFF_PROMPT_MARKER",
     )
-    binding = session.scalar(
-        select(AgentNodeBinding).where(
-            AgentNodeBinding.agent_version_id == draft.id,
-            AgentNodeBinding.node_key == "intake_chat",
-        )
+    model_service = ModelConfigService(session, _settings())
+    _, connection_revision = model_service.create_connection(
+        name="Diff Model Connection",
+        slug="diff-model-connection",
+        provider="openai_compatible",
+        base_url="https://diff-model.example/v1",
+        secret_ref="env:OPENAI_API_KEY",
     )
-    assert binding is not None
-    binding.model_config = {**binding.model_config, "model_id": "diff-model"}
-    draft.config_hash = canonical_hash(service.behavior_for_version(draft.id))
-    session.commit()
+    _, profile_revision = model_service.create_profile(
+        name="Diff Model",
+        slug="diff-model",
+        connection_revision_id=connection_revision.id,
+        model_id="diff-model",
+        api_mode="chat_completions",
+        parameters={},
+    )
+    service.set_draft_node_model(draft.id, "intake_chat", profile_revision.id)
 
     diff = service.diff_draft_to_published()
 
@@ -411,7 +425,7 @@ def test_secret_rotation_does_not_change_agent_version(session) -> None:
     assert "env:OPENAI_API_KEY" in serialized
 
 
-def test_behavior_change_publishes_new_version_without_changing_old_run(session) -> None:
+def test_environment_model_change_does_not_replace_database_configuration(session) -> None:
     first_service = AgentConfigService(session, _settings(llm_model="model-v1"))
     first_service.ensure_default_agent()
     old_run = first_service.ensure_intake_run("intake-1")
@@ -424,8 +438,8 @@ def test_behavior_change_publishes_new_version_without_changing_old_run(session)
     second_version = second_service.ensure_default_agent()
     new_run = second_service.ensure_intake_run("intake-2")
 
-    assert second_version.version == 2
-    assert old_run.agent_version_id != new_run.agent_version_id
+    assert second_version.version == 1
+    assert old_run.agent_version_id == new_run.agent_version_id
     assert second_service.get_for_task("task-1").id == old_run.id
     assert old_run.resolved_config_snapshot == old_snapshot
     assert old_run.resolved_config_snapshot["nodes"]["intake_chat"]["model"][
@@ -433,7 +447,7 @@ def test_behavior_change_publishes_new_version_without_changing_old_run(session)
     ] == "model-v1"
     assert new_run.resolved_config_snapshot["nodes"]["intake_chat"]["model"][
         "model_id"
-    ] == "model-v2"
+    ] == "model-v1"
     assert session.get(Tenant, SYSTEM_TENANT_ID) is not None
     assert session.scalar(select(func.count()).select_from(AgentRun)) == 2
 

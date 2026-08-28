@@ -6,13 +6,18 @@ from uuid import uuid4
 import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.config import Settings, settings
 from app.main import app
-from app.models.database import AgentNodeBinding, Base, ConfigSecret
+from app.models.database import (
+    AgentNodeBinding,
+    Base,
+    ConfigSecret,
+    ModelProfileRevision,
+)
 from app.schemas.task import WebSearchPlan, WebSearchQuery
 from app.services.agent_config.models import ModelConfigService
 from app.services.agent_config.provider_adapters import (
@@ -74,7 +79,7 @@ def test_api_key_is_encrypted_and_rotation_does_not_create_config_revision(sessi
         base_url="http://model.internal/v1",
         api_key="first-sensitive-api-key",
     )
-    secret = session.scalar(select(ConfigSecret))
+    secret = session.get(ConfigSecret, revision.secret_ref.removeprefix("db:"))
 
     assert secret is not None
     assert "first-sensitive-api-key" not in secret.ciphertext
@@ -88,6 +93,21 @@ def test_api_key_is_encrypted_and_rotation_does_not_create_config_revision(sessi
     assert revision.config_hash == revision_hash
     assert service.secrets.resolve(revision.secret_ref) == "rotated-sensitive-api-key"
     assert secret.version == 2
+
+
+def test_default_agent_binds_every_llm_node_to_database_profile(session) -> None:
+    config = _settings()
+    service = AgentConfigService(session, config)
+    published = service.ensure_default_agent()
+    bindings = service._bindings(published.id)
+
+    assert bindings
+    assert all(binding.model_profile_revision_id for binding in bindings)
+    model_service = ModelConfigService(session, config)
+    for binding in bindings:
+        assert model_service.resolve_profile_revision(
+            binding.model_profile_revision_id
+        ) == binding.model_config
 
 
 def test_model_profile_draft_binding_changes_only_new_runs_without_publish(session) -> None:
@@ -117,7 +137,13 @@ def test_model_profile_draft_binding_changes_only_new_runs_without_publish(sessi
             "max_retries": 2,
         },
     )
+    revision_count = session.scalar(
+        select(func.count()).select_from(ModelProfileRevision)
+    )
     draft = agent_service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+    agent_service.set_draft_node_model(
+        draft.id, "intake_chat", profile_revision.id
+    )
     agent_service.set_draft_node_model(
         draft.id, "intake_chat", profile_revision.id
     )
@@ -146,6 +172,9 @@ def test_model_profile_draft_binding_changes_only_new_runs_without_publish(sessi
         )
     )
     assert binding.model_profile_revision_id == profile_revision.id
+    assert session.scalar(
+        select(func.count()).select_from(ModelProfileRevision)
+    ) == revision_count
 
 
 class _FakeChatCompletions:
