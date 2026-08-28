@@ -16,10 +16,13 @@ from app.models.database import (
     AgentNodeBinding,
     Base,
     ConfigSecret,
+    ModelConnection,
+    ModelProfile,
     ModelProfileRevision,
 )
 from app.schemas.task import WebSearchPlan, WebSearchQuery
 from app.services.agent_config.models import ModelConfigService
+from app.services.agent_config.model_imports import parse_model_configuration
 from app.services.agent_config.provider_adapters import (
     ModelProviderConfigurationError,
     OpenAIProviderAdapter,
@@ -93,6 +96,185 @@ def test_api_key_is_encrypted_and_rotation_does_not_create_config_revision(sessi
     assert revision.config_hash == revision_hash
     assert service.secrets.resolve(revision.secret_ref) == "rotated-sensitive-api-key"
     assert secret.version == 2
+
+
+def test_model_import_parses_generic_toml_and_ignores_unrelated_fields() -> None:
+    preview = parse_model_configuration(
+        '''
+model_provider = "OpenAI"
+model = "gpt-5.5"
+review_model = "gpt-5.5"
+model_reasoning_effort = "xhigh"
+disable_response_storage = true
+network_access = "enabled"
+windows_wsl_setup_acknowledged = true
+
+[model_providers.OpenAI]
+name = "OpenAI"
+base_url = "[https://vftsub.vf-tech.cn](https://vftsub.vf-tech.cn)"
+wire_api = "responses"
+requires_openai_auth = true
+
+[features]
+goals = true
+'''
+    )
+
+    assert preview.source_format == "toml"
+    assert preview.provider == "openai"
+    assert preview.base_url == "https://vftsub.vf-tech.cn"
+    assert preview.api_mode == "responses"
+    assert preview.parameters == {
+        "reasoning_effort": "xhigh",
+        "store": False,
+        "response_storage_disabled": True,
+    }
+    assert [(item.role, item.model_id) for item in preview.profiles] == [
+        ("primary", "gpt-5.5")
+    ]
+    assert preview.ignored_fields == (
+        "features.goals",
+        "network_access",
+        "windows_wsl_setup_acknowledged",
+    )
+
+
+@pytest.mark.parametrize(
+    ("content", "source_format"),
+    [
+        (
+            json.dumps(
+                {
+                    "model_provider": "openai_compatible",
+                    "model": "customer-model",
+                    "base_url": "https://models.example/v1",
+                    "api_mode": "chat_completions",
+                    "parameters": {
+                        "reasoning_effort": "high",
+                        "max_output_tokens": 4096,
+                        "store": False,
+                    },
+                }
+            ),
+            "json",
+        ),
+        (
+            "\n".join(
+                [
+                    "MODEL_PROVIDER=openai_compatible",
+                    "LLM_MODEL=customer-model",
+                    "OPENAI_BASE_URL=https://models.example/v1",
+                    "LLM_API_MODE=chat_completions",
+                    "LLM_REASONING_EFFORT=high",
+                    "OPENAI_API_KEY=must-not-import-from-content",
+                ]
+            ),
+            "env",
+        ),
+    ],
+)
+def test_model_import_parses_json_and_env(content: str, source_format: str) -> None:
+    preview = parse_model_configuration(content)
+
+    assert preview.source_format == source_format
+    assert preview.provider == "openai_compatible"
+    assert preview.base_url == "https://models.example/v1"
+    assert preview.api_mode == "chat_completions"
+    assert preview.parameters["reasoning_effort"] == "high"
+    if source_format == "json":
+        assert preview.parameters["max_output_tokens"] == 4096
+    else:
+        assert "openai_api_key" in preview.ignored_fields
+        assert "must-not-import-from-content" not in repr(preview)
+    assert preview.profiles[0].model_id == "customer-model"
+
+
+def test_model_import_atomically_creates_connection_profiles_and_secret(session) -> None:
+    config = _settings()
+    AgentConfigService(session, config).ensure_default_agent()
+    service = ModelConfigService(session, config)
+    content = '''
+model_provider = "OpenAI"
+model = "primary-model"
+review_model = "review-model"
+model_reasoning_effort = "xhigh"
+disable_response_storage = true
+
+[model_providers.OpenAI]
+name = "Customer OpenAI"
+base_url = "https://models.example/v1"
+wire_api = "responses"
+requires_openai_auth = true
+'''
+
+    connection, connection_revision, profiles = service.import_configuration(
+        content,
+        api_key="imported-plaintext-secret",
+        connection_name="Customer OpenAI",
+        connection_slug="customer-openai-connection",
+        profiles=[
+            {"role": "primary", "name": "Primary Model", "slug": "primary-model"},
+            {"role": "review", "name": "Review Model", "slug": "review-model"},
+        ],
+    )
+
+    assert connection.active_revision_id == connection_revision.id
+    assert connection_revision.provider == "openai"
+    assert connection_revision.secret_ref.startswith("db:")
+    secret = session.get(
+        ConfigSecret, connection_revision.secret_ref.removeprefix("db:")
+    )
+    assert secret is not None
+    assert "imported-plaintext-secret" not in secret.ciphertext
+    assert service.secrets.resolve(connection_revision.secret_ref) == (
+        "imported-plaintext-secret"
+    )
+    assert len(profiles) == 2
+    assert {profile.slug for profile, _ in profiles} == {
+        "primary-model",
+        "review-model",
+    }
+    for _, revision in profiles:
+        assert revision.connection_revision_id == connection_revision.id
+        assert revision.api_mode == "responses"
+        assert revision.parameters["reasoning_effort"] == "xhigh"
+        assert revision.parameters["store"] is False
+    assert session.scalar(
+        select(func.count()).select_from(ModelConnection)
+    ) >= 2
+    assert session.scalar(select(func.count()).select_from(ModelProfile)) >= 4
+
+
+def test_model_import_rolls_back_secret_and_connection_when_profile_slug_exists(
+    session,
+) -> None:
+    config = _settings()
+    AgentConfigService(session, config).ensure_default_agent()
+    service = ModelConfigService(session, config)
+    before_connections = session.scalar(
+        select(func.count()).select_from(ModelConnection)
+    )
+    before_secrets = session.scalar(select(func.count()).select_from(ConfigSecret))
+
+    with pytest.raises(ValueError, match="profile slug already exists"):
+        service.import_configuration(
+            'model_provider="OpenAI"\nmodel="gpt-5.5"\nbase_url="https://models.example/v1"',
+            api_key="must-not-persist",
+            connection_name="Duplicate Test",
+            connection_slug="duplicate-test-connection",
+            profiles=[
+                {
+                    "role": "primary",
+                    "name": "Duplicate",
+                    "slug": "default-default-model",
+                }
+            ],
+        )
+
+    assert session.scalar(select(func.count()).select_from(ModelConnection)) == (
+        before_connections
+    )
+    assert session.scalar(select(func.count()).select_from(ConfigSecret)) == before_secrets
 
 
 def test_default_agent_binds_every_llm_node_to_database_profile(session) -> None:

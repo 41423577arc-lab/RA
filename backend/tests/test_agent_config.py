@@ -49,6 +49,7 @@ def _settings(**updates) -> Settings:
         "detailed_report_template": ROOT / "backend/templates/detailed_report.md.j2",
         "action_brief_template": ROOT / "backend/templates/action_brief.md.j2",
         "openai_api_key": "test-secret-that-must-not-be-snapshotted",
+        "agent_secret_key": "",
         **updates,
     }
     return Settings(_env_file=None, **values)

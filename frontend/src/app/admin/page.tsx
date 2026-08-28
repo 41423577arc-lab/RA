@@ -6,6 +6,7 @@ import {
   Check,
   ChevronRight,
   FileText,
+  FileInput,
   Gauge,
   History,
   KeyRound,
@@ -20,6 +21,7 @@ import {
   SlidersHorizontal,
   TestTube2,
   Trash2,
+  X,
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import styles from "./admin.module.css";
@@ -36,6 +38,8 @@ type VersionDetail = Version & { config_schema_version: number; nodes: NodeBindi
 type AgentDetail = { id: string; name: string; slug: string; status: string; published_version: VersionDetail; draft_version?: VersionDetail };
 type ModelConnection = { id: string; name: string; slug: string; active_revision_id: string; revision_version: number; provider: string; base_url: string; secret_ref: string };
 type ModelProfile = { id: string; name: string; slug: string; active_revision_id: string; revision_version: number; connection_revision_id: string; model_id: string; api_mode: string; parameters: Record<string, unknown> };
+type ModelImportProfile = { role: "primary" | "review"; name: string; slug: string; model_id: string };
+type ModelImportPreview = { source_format: "toml" | "json" | "env"; connection_name: string; connection_slug: string; provider: "openai" | "openai_compatible"; base_url: string; api_mode: "chat_completions" | "responses"; parameters: Record<string, unknown>; profiles: ModelImportProfile[]; ignored_fields: string[] };
 type PromptSkill = { revision_id: string; name: string; content_hash: string; content: string };
 type PromptValidation = { valid?: boolean; node_key?: string; output_schema?: string; output_schema_boundary?: string; required_variables?: string[]; skill_names?: string[] };
 type PromptConfig = { prompt_definition_id?: string; revision_id?: string; base_revision_id?: string; version?: number; node_key?: string; content: string; content_hash: string; config_hash?: string; required_variables: string[]; skills: PromptSkill[]; validation_report: PromptValidation; smoke_test_status?: string; source?: string; working?: boolean };
@@ -185,7 +189,7 @@ export default function AdminPage() {
           {notice && <div className={styles.notice}><Check size={15} />{notice}</div>}
           {tab === "overview" && <Overview agent={agent} active={active} connections={connections} profiles={profiles} prompts={prompts} />}
           {tab === "nodes" && <NodesPanel version={active} draft={draft} profiles={profiles} prompts={prompts} busy={busy} mutate={mutate} />}
-          {tab === "models" && <ModelsPanel connections={connections} profiles={profiles} busy={busy} mutate={mutate} />}
+          {tab === "models" && <ModelsPanel connections={connections} profiles={profiles} busy={busy} mutate={mutate} reload={loadResources} />}
           {tab === "prompts" && <PromptsPanel version={active} draft={draft} prompts={prompts} busy={busy} mutate={mutate} />}
           {tab === "versions" && <VersionsPanel agent={agent} busy={busy} mutate={mutate} />}
         </section>
@@ -254,9 +258,10 @@ function NodesPanel({ version, draft, profiles, prompts, busy, mutate }: { versi
   })}</tbody></table></div></section>;
 }
 
-function ModelsPanel({ connections, profiles, busy, mutate }: { connections: ModelConnection[]; profiles: ModelProfile[]; busy: string; mutate: (label: string, action: () => Promise<unknown>, refresh?: boolean) => Promise<void> }) {
+function ModelsPanel({ connections, profiles, busy, mutate, reload }: { connections: ModelConnection[]; profiles: ModelProfile[]; busy: string; mutate: (label: string, action: () => Promise<unknown>, refresh?: boolean) => Promise<void>; reload: () => Promise<void> }) {
   const [connection, setConnection] = useState({ name: "", slug: "", provider: "openai_compatible", base_url: "", api_key: "" });
   const [profile, setProfile] = useState({ name: "", slug: "", connection_revision_id: connections[0]?.active_revision_id ?? "", model_id: "", api_mode: "chat_completions" });
+  const [importOpen, setImportOpen] = useState(false);
   const [connectionEdits, setConnectionEdits] = useState<Record<string, { name: string; provider: string; base_url: string }>>({});
   const [profileEdits, setProfileEdits] = useState<Record<string, { name: string; connection_revision_id: string; model_id: string; api_mode: string }>>({});
   const [secretEdits, setSecretEdits] = useState<Record<string, string>>({});
@@ -273,13 +278,72 @@ function ModelsPanel({ connections, profiles, busy, mutate }: { connections: Mod
   const rotateSecret = (item: ModelConnection) => { const apiKey = secretEdits[item.id]?.trim(); if (!apiKey) return; void mutate("轮换 API Key", () => jsonRequest(`/api/v1/admin/model-connections/${item.id}/rotate-secret`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ api_key: apiKey }) }), true).then(() => setSecretEdits((values) => ({ ...values, [item.id]: "" }))); };
   const saveProfile = (item: ModelProfile) => { const edit = profileEdits[item.id]; if (!edit) return; void mutate("保存模型配置", () => jsonRequest(`/api/v1/admin/model-profiles/${item.id}/revisions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...edit, parameters: item.parameters }) }), true); };
   return <div className={styles.stack}>
-    <section className={styles.section}><div className={styles.sectionHeading}><div><span className={styles.eyebrow}>Connections</span><h2>模型供应商连接</h2></div><p>API Key 只写入 Secret Store，页面不会回显明文。</p></div>
+    <section className={styles.section}><div className={styles.sectionHeading}><div><span className={styles.eyebrow}>Connections</span><h2>模型供应商连接</h2></div><div className={styles.actions}><p>API Key 只写入 Secret Store，页面不会回显明文。</p><button className={styles.secondaryButton} type="button" onClick={() => setImportOpen(true)}><FileInput size={16} />导入配置</button></div></div>
       <div className={styles.stack}>{connections.map((item) => { const edit = connectionEdits[item.id]; if (!edit) return null; const secretIsManaged = item.secret_ref.startsWith("db:"); return <form key={item.id} className={styles.formGrid} onSubmit={(event) => { event.preventDefault(); saveConnection(item); }}><input required aria-label="连接名称" value={edit.name} onChange={(event) => setConnectionEdits({ ...connectionEdits, [item.id]: { ...edit, name: event.target.value } })} /><select aria-label="Provider" value={edit.provider} onChange={(event) => setConnectionEdits({ ...connectionEdits, [item.id]: { ...edit, provider: event.target.value } })}><option value="openai_compatible">OpenAI Compatible</option><option value="openai">OpenAI</option></select><input required aria-label="Base URL" value={edit.base_url} onChange={(event) => setConnectionEdits({ ...connectionEdits, [item.id]: { ...edit, base_url: event.target.value } })} /><input type="password" disabled={!secretIsManaged} placeholder={secretIsManaged ? "输入新 API Key 进行轮换" : "环境变量密钥在部署配置中轮换"} value={secretEdits[item.id] ?? ""} onChange={(event) => setSecretEdits({ ...secretEdits, [item.id]: event.target.value })} /><div className={styles.actions}><button className={styles.iconButton} type="button" disabled={Boolean(busy)} title="测试连接" onClick={() => void mutate("测试连接", () => jsonRequest(`/api/v1/admin/model-connections/${item.id}/test`, { method: "POST" }))}><TestTube2 size={16} /></button><button className={styles.secondaryButton} type="button" disabled={Boolean(busy) || !secretIsManaged || !secretEdits[item.id]?.trim()} onClick={() => rotateSecret(item)}><KeyRound size={15} />轮换密钥</button><button className={styles.secondaryButton} disabled={Boolean(busy)}><Save size={15} />保存连接</button></div><small>连接 Revision v{item.revision_version} · {item.secret_ref}</small></form>; })}</div>
       <form className={styles.inlineForm} onSubmit={createConnection}><input required placeholder="连接名称" value={connection.name} onChange={(e) => setConnection({ ...connection, name: e.target.value })} /><input required placeholder="slug" value={connection.slug} onChange={(e) => setConnection({ ...connection, slug: e.target.value })} /><select value={connection.provider} onChange={(e) => setConnection({ ...connection, provider: e.target.value })}><option value="openai_compatible">OpenAI Compatible</option><option value="openai">OpenAI</option></select><input required placeholder="Base URL" value={connection.base_url} onChange={(e) => setConnection({ ...connection, base_url: e.target.value })} /><input required type="password" placeholder="API Key" value={connection.api_key} onChange={(e) => setConnection({ ...connection, api_key: e.target.value })} /><button className={styles.secondaryButton} disabled={Boolean(busy)}><Plus size={15} />添加连接</button></form>
     </section>
     <section className={styles.section}><div className={styles.sectionHeading}><div><span className={styles.eyebrow}>Profiles</span><h2>可选模型</h2></div><p>节点只切换已配置模型，不创建新的模型 Revision。</p></div>
       <div className={styles.stack}>{profiles.map((item) => { const edit = profileEdits[item.id]; if (!edit) return null; const activeIds = new Set(connections.map((connectionItem) => connectionItem.active_revision_id)); return <form key={item.id} className={styles.formGrid} onSubmit={(event) => { event.preventDefault(); saveProfile(item); }}><input required aria-label="模型名称" value={edit.name} onChange={(event) => setProfileEdits({ ...profileEdits, [item.id]: { ...edit, name: event.target.value } })} /><select value={edit.connection_revision_id} onChange={(event) => setProfileEdits({ ...profileEdits, [item.id]: { ...edit, connection_revision_id: event.target.value } })}>{!activeIds.has(edit.connection_revision_id) && <option value={edit.connection_revision_id}>当前历史连接 Revision</option>}{connections.map((connectionItem) => <option key={connectionItem.id} value={connectionItem.active_revision_id}>{connectionItem.name}</option>)}</select><input required aria-label="模型 ID" value={edit.model_id} onChange={(event) => setProfileEdits({ ...profileEdits, [item.id]: { ...edit, model_id: event.target.value } })} /><button className={styles.secondaryButton} disabled={Boolean(busy)}><Save size={15} />保存模型</button><small>Profile Revision v{item.revision_version}</small></form>; })}</div>
       <form className={styles.inlineForm} onSubmit={createProfile}><input required placeholder="模型名称" value={profile.name} onChange={(e) => setProfile({ ...profile, name: e.target.value })} /><input required placeholder="slug" value={profile.slug} onChange={(e) => setProfile({ ...profile, slug: e.target.value })} /><select required value={profile.connection_revision_id} onChange={(e) => setProfile({ ...profile, connection_revision_id: e.target.value })}>{connections.map((item) => <option key={item.id} value={item.active_revision_id}>{item.name}</option>)}</select><input required placeholder="模型 ID" value={profile.model_id} onChange={(e) => setProfile({ ...profile, model_id: e.target.value })} /><button className={styles.secondaryButton} disabled={Boolean(busy)}><Plus size={15} />添加模型</button></form>
+    </section>
+    {importOpen && <ModelImportDialog onClose={() => setImportOpen(false)} onImported={reload} />}
+  </div>;
+}
+
+function ModelImportDialog({ onClose, onImported }: { onClose: () => void; onImported: () => Promise<void> }) {
+  const [content, setContent] = useState("");
+  const [preview, setPreview] = useState<ModelImportPreview>();
+  const [connectionName, setConnectionName] = useState("");
+  const [connectionSlug, setConnectionSlug] = useState("");
+  const [profileEdits, setProfileEdits] = useState<ModelImportProfile[]>([]);
+  const [apiKey, setApiKey] = useState("");
+  const [working, setWorking] = useState("");
+  const [error, setError] = useState("");
+
+  const recognize = async () => {
+    setWorking("recognize"); setError("");
+    try {
+      const result = await jsonRequest<ModelImportPreview>("/api/v1/admin/model-config-import/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content }) });
+      setPreview(result); setConnectionName(result.connection_name); setConnectionSlug(result.connection_slug); setProfileEdits(result.profiles);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "配置识别失败"); }
+    finally { setWorking(""); }
+  };
+  const saveImport = async () => {
+    if (!preview) return;
+    setWorking("save"); setError("");
+    try {
+      await jsonRequest("/api/v1/admin/model-config-import", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content, api_key: apiKey, connection_name: connectionName, connection_slug: connectionSlug, profiles: profileEdits.map(({ role, name, slug }) => ({ role, name, slug })) }) });
+      await onImported(); onClose();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "模型配置导入失败"); }
+    finally { setWorking(""); }
+  };
+  const updateProfile = (role: ModelImportProfile["role"], field: "name" | "slug", value: string) => setProfileEdits((items) => items.map((item) => item.role === role ? { ...item, [field]: value } : item));
+  const providerLabel = preview?.provider === "openai" ? "OpenAI" : "OpenAI Compatible";
+  const modelLabel = preview?.profiles.map((item) => item.model_id).join(" / ");
+
+  return <div className={styles.modalBackdrop} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className={styles.importDialog} role="dialog" aria-modal="true" aria-labelledby="model-import-title">
+      <header className={styles.dialogHeader}><div><span className={styles.eyebrow}>Configuration Import</span><h2 id="model-import-title">导入模型配置</h2></div><button className={styles.iconButton} type="button" title="关闭" aria-label="关闭" onClick={onClose}><X size={18} /></button></header>
+      <div className={styles.dialogBody}>
+        {error && <div className={styles.error}>{error}</div>}
+        <label className={styles.fieldLabel}>TOML / JSON / ENV 配置<textarea className={styles.importSource} value={content} onChange={(event) => { setContent(event.target.value); setPreview(undefined); }} placeholder={'model_provider = "OpenAI"\nmodel = "gpt-5.5"\n\n[model_providers.OpenAI]\nbase_url = "https://example.com/v1"\nwire_api = "responses"'} /></label>
+        {!preview && <div className={styles.dialogActions}><button className={styles.primaryButton} type="button" disabled={!content.trim() || Boolean(working)} onClick={() => void recognize()}><FileInput size={16} />{working ? "识别中" : "识别配置"}</button></div>}
+        {preview && <>
+          <div className={styles.importSummary}><span>{preview.source_format.toUpperCase()}</span><strong>将创建 {providerLabel} / {modelLabel}</strong></div>
+          <div className={styles.importGrid}>
+            <label className={styles.fieldLabel}>连接名称<input required value={connectionName} onChange={(event) => setConnectionName(event.target.value)} /></label>
+            <label className={styles.fieldLabel}>连接 slug<input required value={connectionSlug} onChange={(event) => setConnectionSlug(event.target.value)} /></label>
+            <div><span>Provider</span><strong>{providerLabel}</strong></div>
+            <div><span>API Mode</span><strong>{preview.api_mode}</strong></div>
+            <div className={styles.wideField}><span>Base URL</span><strong>{preview.base_url}</strong></div>
+          </div>
+          <div className={styles.importProfiles}>{profileEdits.map((item) => <div key={item.role}><div><span>{item.role === "primary" ? "主模型" : "Review 模型"}</span><strong>{item.model_id}</strong></div><label className={styles.fieldLabel}>名称<input value={item.name} onChange={(event) => updateProfile(item.role, "name", event.target.value)} /></label><label className={styles.fieldLabel}>slug<input value={item.slug} onChange={(event) => updateProfile(item.role, "slug", event.target.value)} /></label></div>)}</div>
+          <dl className={styles.importParameters}>{Object.entries(preview.parameters).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{String(value)}</dd></div>)}</dl>
+          {preview.ignored_fields.length > 0 && <p className={styles.ignoredFields}>已忽略非模型运行字段：{preview.ignored_fields.join("、")}</p>}
+          <label className={styles.fieldLabel}>API Key<input required type="password" autoComplete="new-password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="单独填写，不会保存到配置 Snapshot" /></label>
+          <div className={styles.dialogActions}><button className={styles.secondaryButton} type="button" disabled={Boolean(working)} onClick={() => setPreview(undefined)}>重新识别</button><button className={styles.primaryButton} type="button" disabled={!apiKey.trim() || !connectionName.trim() || !connectionSlug.trim() || profileEdits.some((item) => !item.name.trim() || !item.slug.trim()) || Boolean(working)} onClick={() => void saveImport()}><Save size={16} />{working ? "保存中" : "确认并保存"}</button></div>
+        </>}
+      </div>
     </section>
   </div>;
 }

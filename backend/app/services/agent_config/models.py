@@ -17,6 +17,10 @@ from app.services.agent_config.provider_adapters import (
     ProviderAdapterRegistry,
     validate_model_base_url,
 )
+from app.services.agent_config.model_imports import (
+    ModelImportPreview,
+    parse_model_configuration,
+)
 from app.services.agent_config.registry import NODE_REGISTRY
 from app.services.agent_config.secrets import ALLOWED_ENV_SECRET_REFS, SecretStore
 from app.services.agent_config.service import SYSTEM_TENANT_ID
@@ -185,6 +189,135 @@ class ModelConfigService:
             ]
             for node_key in NODE_REGISTRY
         }
+
+    def preview_import(self, content: str) -> ModelImportPreview:
+        preview = parse_model_configuration(content)
+        self.adapters.get(preview.provider)
+        validate_model_base_url(
+            preview.base_url,
+            allow_private=self.settings.agent_allow_private_model_urls,
+        )
+        self._validate_parameters(preview.parameters)
+        return preview
+
+    def import_configuration(
+        self,
+        content: str,
+        *,
+        api_key: str,
+        connection_name: str,
+        connection_slug: str,
+        profiles: list[dict],
+    ) -> tuple[
+        ModelConnection,
+        ModelConnectionRevision,
+        list[tuple[ModelProfile, ModelProfileRevision]],
+    ]:
+        try:
+            preview = self.preview_import(content)
+            self._validate_slug(connection_slug)
+            if self.session.scalar(
+                select(ModelConnection).where(
+                    ModelConnection.tenant_id == SYSTEM_TENANT_ID,
+                    ModelConnection.slug == connection_slug,
+                )
+            ):
+                raise ValueError(
+                    f"Model connection slug already exists: {connection_slug}"
+                )
+            expected_roles = {item.role for item in preview.profiles}
+            overrides = {str(item["role"]): item for item in profiles}
+            if set(overrides) != expected_roles or len(overrides) != len(profiles):
+                raise ValueError("Imported model profile overrides do not match the preview")
+            for item in overrides.values():
+                self._validate_slug(str(item["slug"]))
+            slugs = [str(item["slug"]) for item in overrides.values()]
+            if len(slugs) != len(set(slugs)):
+                raise ValueError("Imported model profile slugs must be unique")
+            if self.session.scalar(
+                select(ModelProfile).where(
+                    ModelProfile.tenant_id == SYSTEM_TENANT_ID,
+                    ModelProfile.slug.in_(slugs),
+                )
+            ):
+                raise ValueError("An imported model profile slug already exists")
+
+            adapter = self.adapters.get(preview.provider)
+            normalized_url = validate_model_base_url(
+                preview.base_url,
+                allow_private=self.settings.agent_allow_private_model_urls,
+            )
+            # Secret、Connection 和全部 Profile 由当前方法统一提交，失败时整体回滚。
+            connection_id = str(uuid4())
+            secret_ref = self._secret_reference(
+                connection_id=connection_id,
+                name=connection_slug,
+                api_key=api_key,
+                secret_ref=None,
+            )
+            connection = ModelConnection(
+                id=connection_id,
+                tenant_id=SYSTEM_TENANT_ID,
+                name=connection_name.strip(),
+                slug=connection_slug,
+            )
+            connection_payload = {
+                "provider": adapter.provider_key,
+                "base_url": normalized_url,
+                "authentication_type": "api_key",
+                "secret_ref": secret_ref,
+            }
+            connection_revision = ModelConnectionRevision(
+                model_connection_id=connection.id,
+                version=1,
+                **connection_payload,
+                config_hash=canonical_hash(connection_payload),
+                published_at=datetime.now(timezone.utc),
+            )
+            self.session.add_all([connection, connection_revision])
+            self.session.flush()
+            connection.active_revision_id = connection_revision.id
+
+            parameters = self._validate_parameters(preview.parameters)
+            created_profiles: list[
+                tuple[ModelProfile, ModelProfileRevision]
+            ] = []
+            for imported in preview.profiles:
+                override = overrides[imported.role]
+                profile = ModelProfile(
+                    id=str(uuid4()),
+                    tenant_id=SYSTEM_TENANT_ID,
+                    name=str(override["name"]).strip(),
+                    slug=str(override["slug"]),
+                )
+                profile_payload = {
+                    "connection_revision_id": connection_revision.id,
+                    "model_id": imported.model_id,
+                    "api_mode": preview.api_mode,
+                    "parameters": parameters,
+                }
+                profile_revision = ModelProfileRevision(
+                    model_profile_id=profile.id,
+                    version=1,
+                    **profile_payload,
+                    config_hash=canonical_hash(profile_payload),
+                    published_at=datetime.now(timezone.utc),
+                )
+                self.session.add_all([profile, profile_revision])
+                self.session.flush()
+                profile.active_revision_id = profile_revision.id
+                created_profiles.append((profile, profile_revision))
+
+            self.session.commit()
+            self.session.refresh(connection)
+            self.session.refresh(connection_revision)
+            for profile, revision in created_profiles:
+                self.session.refresh(profile)
+                self.session.refresh(revision)
+            return connection, connection_revision, created_profiles
+        except Exception:
+            self.session.rollback()
+            raise
 
     def create_connection(
         self,

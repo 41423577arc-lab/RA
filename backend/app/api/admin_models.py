@@ -1,3 +1,5 @@
+from dataclasses import asdict
+
 from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -26,6 +28,10 @@ from app.schemas.admin import (
     ModelConnectionCreate,
     ModelConnectionResponse,
     ModelConnectionRevisionCreate,
+    ModelConfigImportPreviewRequest,
+    ModelConfigImportPreviewResponse,
+    ModelConfigImportRequest,
+    ModelConfigImportResponse,
     ModelProfileCreate,
     ModelProfileResponse,
     ModelProfileRevisionCreate,
@@ -129,6 +135,45 @@ def restore_default_agent_version(
         session.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return _version_response(version)
+
+
+@router.post(
+    "/model-config-import/preview",
+    response_model=ModelConfigImportPreviewResponse,
+)
+def preview_model_configuration_import(
+    payload: ModelConfigImportPreviewRequest,
+    session: Session = Depends(get_session),
+) -> ModelConfigImportPreviewResponse:
+    try:
+        preview = ModelConfigService(session, settings).preview_import(payload.content)
+    except (KeyError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return ModelConfigImportPreviewResponse.model_validate(asdict(preview))
+
+
+@router.post("/model-config-import", response_model=ModelConfigImportResponse)
+def import_model_configuration(
+    payload: ModelConfigImportRequest,
+    session: Session = Depends(get_session),
+) -> ModelConfigImportResponse:
+    try:
+        connection, revision, profiles = ModelConfigService(
+            session, settings
+        ).import_configuration(
+            payload.content,
+            api_key=payload.api_key,
+            connection_name=payload.connection_name,
+            connection_slug=payload.connection_slug,
+            profiles=[item.model_dump() for item in payload.profiles],
+        )
+    except (KeyError, ValueError, RuntimeError) as exc:
+        session.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return ModelConfigImportResponse(
+        connection=_connection_response(connection, revision),
+        profiles=[_profile_response(profile, item) for profile, item in profiles],
+    )
 
 
 @router.post("/model-connections", response_model=ModelConnectionResponse)

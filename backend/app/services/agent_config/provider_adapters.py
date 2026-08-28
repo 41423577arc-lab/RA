@@ -102,10 +102,9 @@ class OpenAIProviderAdapter:
 
 class ProviderAdapterRegistry:
     def __init__(self):
-        adapter = OpenAIProviderAdapter("openai_compatible")
         self._adapters = {
-            "openai": adapter,
-            "openai_compatible": adapter,
+            "openai": OpenAIProviderAdapter("openai"),
+            "openai_compatible": OpenAIProviderAdapter("openai_compatible"),
         }
 
     def get(self, provider: str) -> OpenAIProviderAdapter:

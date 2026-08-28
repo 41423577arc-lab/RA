@@ -72,6 +72,47 @@ class ConnectionTestResponse(BaseModel):
     models: list[str] = Field(default_factory=list)
 
 
+class ModelImportProfilePreview(BaseModel):
+    role: Literal["primary", "review"]
+    name: str
+    slug: str
+    model_id: str
+
+
+class ModelConfigImportPreviewRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=100_000)
+
+
+class ModelConfigImportPreviewResponse(BaseModel):
+    source_format: Literal["toml", "json", "env"]
+    connection_name: str
+    connection_slug: str
+    provider: Literal["openai", "openai_compatible"]
+    base_url: str
+    api_mode: Literal["chat_completions", "responses"]
+    parameters: dict
+    profiles: list[ModelImportProfilePreview]
+    ignored_fields: list[str] = Field(default_factory=list)
+
+
+class ModelImportProfileOverride(BaseModel):
+    role: Literal["primary", "review"]
+    name: str = Field(min_length=1, max_length=100)
+    slug: str = Field(min_length=3, max_length=64)
+
+
+class ModelConfigImportRequest(ModelConfigImportPreviewRequest):
+    api_key: str = Field(min_length=1, max_length=1000)
+    connection_name: str = Field(min_length=1, max_length=100)
+    connection_slug: str = Field(min_length=3, max_length=64)
+    profiles: list[ModelImportProfileOverride] = Field(min_length=1, max_length=2)
+
+
+class ModelConfigImportResponse(BaseModel):
+    connection: ModelConnectionResponse
+    profiles: list[ModelProfileResponse]
+
+
 class AgentVersionResponse(BaseModel):
     id: str
     agent_definition_id: str
