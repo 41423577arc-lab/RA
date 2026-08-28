@@ -216,6 +216,53 @@ def test_invalid_working_prompt_cannot_be_saved(session) -> None:
         )
 
 
+def test_discard_working_prompt_restores_base_without_changing_history(session) -> None:
+    config = _settings()
+    agent_service = AgentConfigService(session, config)
+    agent_service.ensure_default_agent()
+    draft = agent_service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+    binding = session.scalar(
+        select(AgentNodeBinding).where(
+            AgentNodeBinding.agent_version_id == draft.id,
+            AgentNodeBinding.node_key == "analysis_chat",
+        )
+    )
+    assert binding is not None
+    definition = session.get(
+        PromptDefinition, binding.prompt_config["prompt_definition_id"]
+    )
+    assert definition is not None
+    active_revision_id = definition.active_revision_id
+    revision_count = session.scalar(select(func.count()).select_from(PromptRevision))
+    base_prompt = PromptConfigService(session, config).resolve_revision(
+        binding.prompt_revision_id,
+        expected_node_key="analysis_chat",
+    )
+    original_hash = draft.config_hash
+
+    agent_service.save_draft_node_prompt_working_copy(
+        draft.id,
+        "analysis_chat",
+        content="# Temporary Analysis Chat\n\nDISCARD_THIS_MARKER",
+    )
+    working_hash = draft.config_hash
+    agent_service.discard_draft_node_prompt_working_copy(
+        draft.id, "analysis_chat"
+    )
+
+    session.refresh(binding)
+    assert original_hash != working_hash
+    assert draft.config_hash == original_hash
+    assert binding.prompt_config == base_prompt
+    assert binding.prompt_config.get("working") is not True
+    assert session.scalar(select(func.count()).select_from(PromptRevision)) == revision_count
+    assert definition.active_revision_id == active_revision_id
+    run = agent_service.ensure_task_run(
+        "discarded-working-task", initiator_role="ADMIN"
+    )
+    assert run.resolved_config_snapshot["nodes"]["analysis_chat"]["prompt"] == base_prompt
+
+
 def test_historical_revision_can_become_immediately_runnable_working_prompt(session) -> None:
     config = _settings()
     agent_service = AgentConfigService(session, config)

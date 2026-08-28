@@ -405,6 +405,38 @@ class AgentConfigService:
         self.session.refresh(version)
         return version
 
+    def discard_draft_node_prompt_working_copy(
+        self,
+        agent_version_id: str,
+        node_key: str,
+    ) -> AgentVersion:
+        if node_key not in NODE_REGISTRY:
+            raise ValueError(f"Unknown Agent node: {node_key}")
+        version = self.session.get(AgentVersion, agent_version_id)
+        if version is None or version.status != "DRAFT":
+            raise ValueError("Only draft Agent versions can be edited")
+        binding = self.session.scalar(
+            select(AgentNodeBinding).where(
+                AgentNodeBinding.agent_version_id == version.id,
+                AgentNodeBinding.node_key == node_key,
+            )
+        )
+        if binding is None:
+            raise ValueError(f"Draft is missing node binding: {node_key}")
+        if binding.prompt_revision_id is None:
+            raise ValueError(f"Draft node has no base Prompt revision: {node_key}")
+        binding.prompt_config = PromptConfigService(
+            self.session, self.settings
+        ).resolve_revision(
+            binding.prompt_revision_id,
+            expected_node_key=node_key,
+        )
+        self.session.flush()
+        version.config_hash = canonical_hash(self._behavior_for_version(version))
+        self.session.commit()
+        self.session.refresh(version)
+        return version
+
     def set_draft_tool_mapping(
         self,
         agent_version_id: str,

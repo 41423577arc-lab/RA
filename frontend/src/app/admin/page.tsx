@@ -17,6 +17,7 @@ import {
   Save,
   SlidersHorizontal,
   TestTube2,
+  Trash2,
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import styles from "./admin.module.css";
@@ -286,6 +287,15 @@ function PromptsPanel({ version, draft, prompts, busy, mutate }: { version: Vers
     setSelectedRevisionId("working");
     setEditing(false);
   };
+  const discardWorkingCopy = async () => {
+    if (!draft || !node || !currentPrompt?.working) return;
+    if (!window.confirm("将丢弃当前未发布的 Prompt 修改并恢复到稳定版本。")) return;
+    await mutate("丢弃工作稿", () => jsonRequest(`/api/v1/admin/agent-versions/${draft.id}/nodes/${node.node_key}/prompt-working-copy/discard`, {
+      method: "POST",
+    }));
+    setSelectedRevisionId("working");
+    setEditing(false);
+  };
 
   if (!node || !definition) return <section className={styles.section}>暂无可管理的 Prompt。</section>;
 
@@ -332,6 +342,7 @@ function PromptsPanel({ version, draft, prompts, busy, mutate }: { version: Vers
             {!showingWorking && selectedRevision && <button className={styles.secondaryButton} disabled={Boolean(busy)} onClick={() => void mutate("校验稳定 Revision", () => jsonRequest(`/api/v1/admin/prompt-revisions/${selectedRevision.id}/validate`, { method: "POST" }))}><TestTube2 size={15} />重新校验</button>}
             {showingWorking && !editing && <button className={styles.secondaryButton} disabled={!draft || Boolean(busy)} onClick={() => setEditing(true)}><Pencil size={15} />编辑工作稿</button>}
             {showingWorking && editing && <button className={styles.primaryButton} disabled={!draft || Boolean(busy) || content === currentPrompt?.content} onClick={() => void saveWorkingCopy()}><Save size={15} />保存工作稿</button>}
+            {showingWorking && currentPrompt?.working && <button className={styles.secondaryButton} disabled={!draft || Boolean(busy)} onClick={() => void discardWorkingCopy()}><Trash2 size={15} />丢弃工作稿</button>}
             {!showingWorking && selectedRevision && <button className={styles.primaryButton} title={draft ? "复制此稳定 Revision 到当前工作稿" : "请先创建 Agent Draft"} disabled={!draft || Boolean(busy)} onClick={() => void useRevisionAsWorkingCopy(selectedRevision)}><Link2 size={15} />以此版本建立工作稿</button>}
           </div>
         </>}

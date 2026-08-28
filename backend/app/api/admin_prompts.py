@@ -176,6 +176,31 @@ def save_node_prompt_working_copy(
     )
 
 
+@router.post(
+    "/agent-versions/{agent_version_id}/nodes/{node_key}/prompt-working-copy/discard",
+    response_model=AgentVersionResponse,
+)
+def discard_node_prompt_working_copy(
+    agent_version_id: str,
+    node_key: str,
+    session: Session = Depends(get_session),
+) -> AgentVersionResponse:
+    try:
+        version = AgentConfigService(
+            session, settings
+        ).discard_draft_node_prompt_working_copy(agent_version_id, node_key)
+    except (KeyError, ValueError) as exc:
+        session.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return AgentVersionResponse(
+        id=version.id,
+        agent_definition_id=version.agent_definition_id,
+        version=version.version,
+        status=version.status,
+        config_hash=version.config_hash,
+    )
+
+
 def _definition_response(
     definition: PromptDefinition,
     revision: PromptRevision,
