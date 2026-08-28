@@ -861,6 +861,14 @@ class AgentConfigService:
             if set(behavior["nodes"]) != set(NODE_REGISTRY):
                 raise ValueError("Draft does not contain the complete Node Registry")
             version.config_hash = canonical_hash(behavior)
+            max_other_version = self.session.scalar(
+                select(func.max(AgentVersion.version)).where(
+                    AgentVersion.agent_definition_id == definition.id,
+                    AgentVersion.id != version.id,
+                )
+            )
+            if max_other_version is not None and version.version <= max_other_version:
+                version.version = max_other_version + 1
             version.status = "PUBLISHED"
             version.published_at = datetime.now(timezone.utc)
             version.release_note = release_note.strip() if release_note else None

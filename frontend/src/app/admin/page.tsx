@@ -123,6 +123,9 @@ export default function AdminPage() {
 
   const draft = agent?.draft_version;
   const active = draft ?? agent?.published_version;
+  const publishVersion = draft && agent
+    ? Math.max(draft.version, agent.published_version.version + 1)
+    : undefined;
   const mutate = async (label: string, action: () => Promise<unknown>, refreshResources = false) => {
     if (!agent) return;
     setBusy(label); setError(""); setNotice("");
@@ -175,7 +178,7 @@ export default function AdminPage() {
             <div><span className={styles.eyebrow}>{TABS.find((item) => item.key === tab)?.label}</span><h1>{agent.name}</h1><p>当前草稿用于下一次新任务，已经开始的任务继续使用原 Snapshot。</p></div>
             <div className={styles.actions}>
               {!draft && <button className={styles.secondaryButton} disabled={Boolean(busy)} onClick={() => void mutate("创建草稿", () => jsonRequest(`/api/v1/admin/agents/${agent.id}/drafts`, { method: "POST" }))}><Plus size={16} />创建草稿</button>}
-              {draft && <button className={styles.primaryButton} title="冻结当前工作配置并发布为稳定版本" disabled={Boolean(busy)} onClick={() => void publishDraft()}><Rocket size={16} />发布 v{draft.version}</button>}
+              {draft && <button className={styles.primaryButton} title="冻结当前工作配置并发布为稳定版本" disabled={Boolean(busy)} onClick={() => void publishDraft()}><Rocket size={16} />发布为 v{publishVersion}</button>}
             </div>
           </div>
           {error && <div className={styles.error}>{error}</div>}

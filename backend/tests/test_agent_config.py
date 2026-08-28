@@ -276,6 +276,23 @@ def test_agent_admin_routes_expose_fixed_agent_without_runtime_editor() -> None:
     )
 
 
+def test_publish_renumbers_a_stale_draft_after_a_newer_published_version(
+    session,
+) -> None:
+    service = AgentConfigService(session, _settings())
+    published = service.ensure_default_agent()
+    draft = service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+    draft.version = 0
+    session.commit()
+
+    result = service.publish_draft(draft.id)
+
+    definition = session.get(AgentDefinition, DEFAULT_AGENT_DEFINITION_ID)
+    assert result.version == published.version + 1
+    assert definition is not None
+    assert definition.published_version_id == result.id
+
+
 def test_published_history_restore_copies_complete_version_to_draft(session) -> None:
     service = AgentConfigService(session, _settings())
     published_v1 = service.ensure_default_agent()
