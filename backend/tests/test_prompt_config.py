@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from uuid import uuid4
 
@@ -95,7 +96,7 @@ def test_default_agent_does_not_read_prompt_files_after_initial_import(session, 
     assert restarted.id == initial.id
 
 
-def test_prompt_revision_publish_changes_only_new_runs(session) -> None:
+def test_prompt_revision_draft_binding_changes_only_new_runs_without_publish(session) -> None:
     config = _settings()
     agent_service = AgentConfigService(session, config)
     agent_service.ensure_default_agent()
@@ -111,9 +112,14 @@ def test_prompt_revision_publish_changes_only_new_runs(session) -> None:
         definition.id,
         content="# Custom Intake Chat\n\nPROMPT_REVISION_TWO_MARKER",
     )
+    published_before_draft, _ = agent_service.resolve_published(
+        DEFAULT_AGENT_DEFINITION_ID
+    )
+    assert published_before_draft["nodes"]["intake_chat"]["prompt"][
+        "revision_id"
+    ] != revision.id
     draft = agent_service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
     agent_service.set_draft_node_prompt(draft.id, "intake_chat", revision.id)
-    published = agent_service.publish_draft(draft.id)
     new_run = agent_service.ensure_intake_run("new-prompt-run")
 
     old_prompt = old_run.resolved_config_snapshot["nodes"]["intake_chat"]["prompt"]
@@ -121,9 +127,218 @@ def test_prompt_revision_publish_changes_only_new_runs(session) -> None:
     assert "PROMPT_REVISION_TWO_MARKER" not in old_prompt["content"]
     assert new_prompt["revision_id"] == revision.id
     assert "PROMPT_REVISION_TWO_MARKER" in new_prompt["content"]
-    assert new_run.agent_version_id == published.id
+    assert new_run.agent_version_id == draft.id
     assert old_run.agent_version_id != new_run.agent_version_id
     assert revision.smoke_test_status == "NOT_RUN"
+
+
+def test_working_prompt_can_be_saved_repeatedly_without_creating_revisions(session) -> None:
+    config = _settings()
+    agent_service = AgentConfigService(session, config)
+    agent_service.ensure_default_agent()
+    old_run = agent_service.ensure_intake_run("working-prompt-old-run")
+    old_snapshot = json.loads(json.dumps(old_run.resolved_config_snapshot))
+    old_config_hash = old_run.config_hash
+    draft = agent_service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+    definition = session.scalar(
+        select(PromptDefinition).where(
+            PromptDefinition.tenant_id == SYSTEM_TENANT_ID,
+            PromptDefinition.node_key == "analysis_chat",
+        )
+    )
+    assert definition is not None
+    active_revision_id = definition.active_revision_id
+    revision_count = session.scalar(select(func.count()).select_from(PromptRevision))
+    hashes = {draft.config_hash}
+
+    for iteration in range(10):
+        agent_service.save_draft_node_prompt_working_copy(
+            draft.id,
+            "analysis_chat",
+            content=f"# Working Analysis Chat\n\nWORKING_ITERATION_{iteration}",
+        )
+        hashes.add(draft.config_hash)
+
+    assert len(hashes) == 11
+    assert session.scalar(select(func.count()).select_from(PromptRevision)) == revision_count
+    assert definition.active_revision_id == active_revision_id
+    binding = session.scalar(
+        select(AgentNodeBinding).where(
+            AgentNodeBinding.agent_version_id == draft.id,
+            AgentNodeBinding.node_key == "analysis_chat",
+        )
+    )
+    assert binding is not None
+    assert binding.prompt_config["working"] is True
+    assert binding.prompt_config["base_revision_id"] == binding.prompt_revision_id
+    assert binding.prompt_config["content_hash"] == canonical_hash(
+        binding.prompt_config["content"]
+    )
+
+    new_run = agent_service.ensure_intake_run("working-prompt-new-run")
+    new_prompt = new_run.resolved_config_snapshot["nodes"]["analysis_chat"]["prompt"]
+    assert new_run.agent_version_id == draft.id
+    assert "WORKING_ITERATION_9" in new_prompt["content"]
+    assert new_prompt["content_hash"] == canonical_hash(new_prompt["content"])
+    assert new_prompt["config_hash"] == binding.prompt_config["config_hash"]
+    assert old_run.resolved_config_snapshot == old_snapshot
+    assert old_run.config_hash == old_config_hash
+
+
+def test_invalid_working_prompt_cannot_be_saved(session) -> None:
+    config = _settings()
+    agent_service = AgentConfigService(session, config)
+    agent_service.ensure_default_agent()
+    draft = agent_service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+
+    with pytest.raises(ValueError, match="placeholders"):
+        agent_service.save_draft_node_prompt_working_copy(
+            draft.id,
+            "analysis_chat",
+            content="# Invalid Placeholder\n\n{{not_owned_by_node}}",
+        )
+    with pytest.raises(ValueError, match="code-owned section"):
+        agent_service.save_draft_node_prompt_working_copy(
+            draft.id,
+            "analysis_chat",
+            content="# Invalid Contract\n\n## 最终输出契约",
+        )
+    with pytest.raises(ValueError, match="complete code-owned Skill set"):
+        agent_service.save_draft_node_prompt_working_copy(
+            draft.id,
+            "intake_agent",
+            content="# Invalid Intake Skills\n\nKeep collecting context.",
+            skills=[],
+        )
+
+
+def test_historical_revision_can_become_immediately_runnable_working_prompt(session) -> None:
+    config = _settings()
+    agent_service = AgentConfigService(session, config)
+    published = agent_service.ensure_default_agent()
+    definition = session.scalar(
+        select(PromptDefinition).where(
+            PromptDefinition.tenant_id == SYSTEM_TENANT_ID,
+            PromptDefinition.node_key == "analysis_chat",
+        )
+    )
+    assert definition is not None
+    historical_revision_id = definition.active_revision_id
+    PromptConfigService(session, config).revise_definition(
+        definition.id,
+        content="# New Stable Analysis Chat\n\nLATEST_STABLE_MARKER",
+    )
+    active_revision_id = definition.active_revision_id
+    assert historical_revision_id != active_revision_id
+    draft = agent_service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+
+    agent_service.set_draft_node_prompt(
+        draft.id,
+        "analysis_chat",
+        historical_revision_id,
+    )
+    agent_service.save_draft_node_prompt_working_copy(
+        draft.id,
+        "analysis_chat",
+        content="# Historical Working Analysis Chat\n\nHISTORICAL_WORKING_MARKER",
+    )
+    run = agent_service.ensure_task_run("historical-working-task")
+
+    prompt = run.resolved_config_snapshot["nodes"]["analysis_chat"]["prompt"]
+    assert published.id != draft.id
+    assert run.agent_version_id == draft.id
+    assert prompt["working"] is True
+    assert prompt["base_revision_id"] == historical_revision_id
+    assert "HISTORICAL_WORKING_MARKER" in prompt["content"]
+    assert definition.active_revision_id == active_revision_id
+
+
+def test_published_version_rejects_working_prompt_even_with_matching_agent_hash(session) -> None:
+    config = _settings()
+    agent_service = AgentConfigService(session, config)
+    published = agent_service.ensure_default_agent()
+    behavior = agent_service.behavior_for_version(published.id)
+    binding = session.scalar(
+        select(AgentNodeBinding).where(
+            AgentNodeBinding.agent_version_id == published.id,
+            AgentNodeBinding.node_key == "analysis_chat",
+        )
+    )
+    assert binding is not None
+    working = PromptConfigService(session, config).build_working_copy(
+        binding.prompt_revision_id,
+        expected_node_key="analysis_chat",
+        content="# Invalid Published Working Prompt\n\nMUST_BE_REJECTED",
+    )
+    binding.prompt_config = working
+    behavior["nodes"]["analysis_chat"]["prompt"] = working
+    published.config_hash = canonical_hash(behavior)
+    session.commit()
+
+    with pytest.raises(ValueError, match="Prompt binding failed integrity"):
+        agent_service.resolve_published(DEFAULT_AGENT_DEFINITION_ID)
+
+
+def test_working_prompt_cannot_create_an_invalid_published_version(session) -> None:
+    config = _settings()
+    agent_service = AgentConfigService(session, config)
+    agent_service.ensure_default_agent()
+    draft = agent_service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+    agent_service.save_draft_node_prompt_working_copy(
+        draft.id,
+        "analysis_chat",
+        content="# Working Prompt\n\nNOT_FROZEN_YET",
+    )
+
+    with pytest.raises(ValueError, match="must be frozen as stable revisions"):
+        agent_service.publish_draft(draft.id)
+
+    assert draft.status == "DRAFT"
+
+
+def test_prompt_history_preserves_old_revision_and_allows_draft_binding(session) -> None:
+    config = _settings()
+    agent_service = AgentConfigService(session, config)
+    published = agent_service.ensure_default_agent()
+    definition = session.scalar(
+        select(PromptDefinition).where(
+            PromptDefinition.tenant_id == SYSTEM_TENANT_ID,
+            PromptDefinition.node_key == "analysis_chat",
+        )
+    )
+    assert definition is not None
+    original = session.get(PromptRevision, definition.active_revision_id)
+    assert original is not None
+    original_content = original.content
+
+    latest = PromptConfigService(session, config).revise_definition(
+        definition.id,
+        content="# Analysis Chat Revision Two\n\nSECOND_REVISION_MARKER",
+    )
+    history = PromptConfigService(session, config).list_revisions(definition.id)
+
+    assert [item.id for item in history[:2]] == [latest.id, original.id]
+    assert original.content == original_content
+    published_binding = session.scalar(
+        select(AgentNodeBinding).where(
+            AgentNodeBinding.agent_version_id == published.id,
+            AgentNodeBinding.node_key == "analysis_chat",
+        )
+    )
+    assert published_binding is not None
+    assert published_binding.prompt_revision_id == original.id
+
+    draft = agent_service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+    agent_service.set_draft_node_prompt(draft.id, "analysis_chat", latest.id)
+    agent_service.set_draft_node_prompt(draft.id, "analysis_chat", original.id)
+    draft_binding = session.scalar(
+        select(AgentNodeBinding).where(
+            AgentNodeBinding.agent_version_id == draft.id,
+            AgentNodeBinding.node_key == "analysis_chat",
+        )
+    )
+    assert draft_binding is not None
+    assert draft_binding.prompt_revision_id == original.id
 
 
 def test_prompt_static_validation_enforces_placeholders_boundaries_and_skills(session) -> None:
@@ -250,13 +465,38 @@ def test_prompt_admin_api_create_list_and_validate(monkeypatch) -> None:
         )
         assert created.status_code == 200, created.text
         revision_id = created.json()["active_revision"]["id"]
+        revised = client.post(
+            f"/api/v1/admin/prompts/{created.json()['id']}/revisions",
+            json={
+                "content": "# Managed Analysis Chat V2\n\nPROMPT_HISTORY_MARKER"
+            },
+        )
+        history = client.get(
+            f"/api/v1/admin/prompts/{created.json()['id']}/revisions"
+        )
         validated = client.post(
             f"/api/v1/admin/prompt-revisions/{revision_id}/validate"
         )
         listed = client.get("/api/v1/admin/prompts?node_key=analysis_chat")
+        agent_detail = client.get("/api/v1/admin/agent")
 
+    assert revised.status_code == 200, revised.text
+    assert history.status_code == 200, history.text
+    assert [item["version"] for item in history.json()[:2]] == [2, 1]
+    assert history.json()[0]["content"].endswith("PROMPT_HISTORY_MARKER\n")
+    assert history.json()[0]["validation_report"]["valid"] is True
+    assert history.json()[1]["id"] == revision_id
     assert validated.status_code == 200, validated.text
     assert validated.json()["valid"] is True
     assert validated.json()["output_schema"] == "TaskChatResult"
     assert listed.status_code == 200, listed.text
     assert any(item["slug"] == slug for item in listed.json())
+    assert agent_detail.status_code == 200, agent_detail.text
+    assert all(
+        node["prompt_definition_id"]
+        for node in agent_detail.json()["published_version"]["nodes"]
+    )
+    assert all(
+        node["prompt_config"]["content_hash"]
+        for node in agent_detail.json()["published_version"]["nodes"]
+    )

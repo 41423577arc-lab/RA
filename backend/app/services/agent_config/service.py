@@ -150,19 +150,71 @@ class AgentConfigService:
         version = self.session.get(AgentVersion, definition.published_version_id)
         if version is None or version.status != "PUBLISHED":
             raise ValueError(f"Agent definition {agent_definition_id} has an invalid published version")
+        return self.resolve_version(
+            agent_definition_id,
+            version.id,
+            allowed_statuses={"PUBLISHED"},
+        )
+
+    def resolve_version(
+        self,
+        agent_definition_id: str,
+        agent_version_id: str,
+        *,
+        allowed_statuses: set[str] | None = None,
+    ) -> tuple[dict, str]:
+        definition = self.session.get(AgentDefinition, agent_definition_id)
+        if definition is None or definition.status != "ACTIVE":
+            raise KeyError(f"Agent definition {agent_definition_id} not found or inactive")
+        version = self.session.get(AgentVersion, agent_version_id)
+        if version is None or version.agent_definition_id != definition.id:
+            raise KeyError(f"Agent version {agent_version_id} does not belong to the agent")
+        if allowed_statuses is not None and version.status not in allowed_statuses:
+            raise ValueError(
+                f"AgentVersion {agent_version_id} has unsupported status: {version.status}"
+            )
         if version.config_schema_version != CONFIG_SCHEMA_VERSION:
             raise ValueError(
                 f"Unsupported agent config schema version: {version.config_schema_version}"
             )
+        self._validate_version_bindings(version)
         behavior = self._behavior_for_version(version)
         if canonical_hash(behavior) != version.config_hash:
-            raise ValueError(f"Published AgentVersion {version.id} failed integrity validation")
+            raise ValueError(f"AgentVersion {version.id} failed integrity validation")
         snapshot = resolved_snapshot(
             behavior,
             agent_definition_id=definition.id,
             agent_version_id=version.id,
         )
         return snapshot, canonical_hash(snapshot)
+
+    def resolve_for_new_run(self) -> tuple[dict, str]:
+        definition = self.session.get(AgentDefinition, DEFAULT_AGENT_DEFINITION_ID)
+        if definition is None or definition.status != "ACTIVE":
+            raise KeyError(
+                f"Agent definition {DEFAULT_AGENT_DEFINITION_ID} not found or inactive"
+            )
+        drafts = list(
+            self.session.scalars(
+                select(AgentVersion)
+                .where(
+                    AgentVersion.agent_definition_id == definition.id,
+                    AgentVersion.status == "DRAFT",
+                )
+                .order_by(AgentVersion.version)
+            )
+        )
+        if len(drafts) > 1:
+            raise ValueError(
+                f"Agent definition {definition.id} has multiple draft versions"
+            )
+        if drafts:
+            return self.resolve_version(
+                definition.id,
+                drafts[0].id,
+                allowed_statuses={"DRAFT"},
+            )
+        return self.resolve_published(definition.id)
 
     def create_draft(self, agent_definition_id: str) -> AgentVersion:
         definition = self.session.get(AgentDefinition, agent_definition_id)
@@ -223,6 +275,8 @@ class AgentConfigService:
                     allowed_nodes=binding.allowed_nodes,
                 )
             )
+        self.session.flush()
+        draft.config_hash = canonical_hash(self._behavior_for_version(draft))
         self.session.commit()
         self.session.refresh(draft)
         return draft
@@ -272,7 +326,10 @@ class AgentConfigService:
             raise ValueError("Only draft Agent versions can be edited")
         prompt_config = PromptConfigService(
             self.session, self.settings
-        ).resolve_revision(prompt_revision_id, expected_node_key=node_key)
+        ).build_working_copy(
+            prompt_revision_id,
+            expected_node_key=node_key,
+        )
         binding = self.session.scalar(
             select(AgentNodeBinding).where(
                 AgentNodeBinding.agent_version_id == version.id,
@@ -283,6 +340,44 @@ class AgentConfigService:
             raise ValueError(f"Draft is missing node binding: {node_key}")
         binding.prompt_revision_id = prompt_revision_id
         binding.prompt_config = prompt_config
+        self.session.flush()
+        version.config_hash = canonical_hash(self._behavior_for_version(version))
+        self.session.commit()
+        self.session.refresh(version)
+        return version
+
+    def save_draft_node_prompt_working_copy(
+        self,
+        agent_version_id: str,
+        node_key: str,
+        *,
+        content: str,
+        skills: list[dict] | None = None,
+    ) -> AgentVersion:
+        if node_key not in NODE_REGISTRY:
+            raise ValueError(f"Unknown Agent node: {node_key}")
+        version = self.session.get(AgentVersion, agent_version_id)
+        if version is None or version.status != "DRAFT":
+            raise ValueError("Only draft Agent versions can be edited")
+        binding = self.session.scalar(
+            select(AgentNodeBinding).where(
+                AgentNodeBinding.agent_version_id == version.id,
+                AgentNodeBinding.node_key == node_key,
+            )
+        )
+        if binding is None:
+            raise ValueError(f"Draft is missing node binding: {node_key}")
+        if binding.prompt_revision_id is None:
+            raise ValueError(f"Draft node has no base Prompt revision: {node_key}")
+        current_skills = binding.prompt_config.get("skills", [])
+        binding.prompt_config = PromptConfigService(
+            self.session, self.settings
+        ).build_working_copy(
+            binding.prompt_revision_id,
+            expected_node_key=node_key,
+            content=content,
+            skills=current_skills if skills is None else skills,
+        )
         self.session.flush()
         version.config_hash = canonical_hash(self._behavior_for_version(version))
         self.session.commit()
@@ -331,35 +426,6 @@ class AgentConfigService:
         self.session.refresh(version)
         return version
 
-    def set_draft_runtime_config(
-        self,
-        agent_version_id: str,
-        *,
-        loop: dict,
-        output: dict,
-    ) -> AgentVersion:
-        version = self.session.get(AgentVersion, agent_version_id)
-        if version is None or version.status != "DRAFT":
-            raise ValueError("Only draft Agent versions can be edited")
-        current_output = dict((version.config or {}).get("output", {}))
-        version.config = {
-            **version.config,
-            "management": {"source": "admin"},
-            "loop": dict(loop),
-            "output": {
-                **current_output,
-                "formats": sorted(set(output["formats"])),
-                "evidence_validation_required": bool(
-                    output["evidence_validation_required"]
-                ),
-            },
-        }
-        self.session.flush()
-        version.config_hash = canonical_hash(self._behavior_for_version(version))
-        self.session.commit()
-        self.session.refresh(version)
-        return version
-
     def behavior_for_version(self, agent_version_id: str) -> dict:
         version = self.session.get(AgentVersion, agent_version_id)
         if version is None:
@@ -373,6 +439,13 @@ class AgentConfigService:
         definition = self.session.get(AgentDefinition, version.agent_definition_id)
         if definition is None:
             raise ValueError("Agent definition does not exist")
+        if any(
+            binding.prompt_config.get("working") is True
+            for binding in self._bindings(version.id)
+        ):
+            raise ValueError(
+                "Working Prompts must be frozen as stable revisions before publishing"
+            )
         behavior = self._behavior_for_version(version)
         if set(behavior["nodes"]) != set(NODE_REGISTRY):
             raise ValueError("Draft does not contain the complete Node Registry")
@@ -407,7 +480,7 @@ class AgentConfigService:
         if existing is not None:
             return existing
         self.ensure_default_agent()
-        snapshot, config_hash = self.resolve_published(DEFAULT_AGENT_DEFINITION_ID)
+        snapshot, config_hash = self.resolve_for_new_run()
         run = AgentRun(
             tenant_id=tenant_id,
             owner_id=owner_id,
@@ -440,7 +513,7 @@ class AgentConfigService:
         if existing is not None:
             return existing
         self.ensure_default_agent()
-        snapshot, config_hash = self.resolve_published(DEFAULT_AGENT_DEFINITION_ID)
+        snapshot, config_hash = self.resolve_for_new_run()
         run = AgentRun(
             tenant_id=tenant_id,
             owner_id=owner_id,
@@ -505,17 +578,11 @@ class AgentConfigService:
         prompt_service = PromptConfigService(self.session, self.settings)
         nodes = {}
         for binding in self._bindings(version.id):
-            prompt_config = binding.prompt_config
-            if binding.prompt_revision_id:
-                resolved_prompt = prompt_service.resolve_revision(
-                    binding.prompt_revision_id,
-                    expected_node_key=binding.node_key,
-                )
-                if canonical_hash(prompt_config) != canonical_hash(resolved_prompt):
-                    raise ValueError(
-                        f"Prompt binding failed integrity validation: {binding.node_key}"
-                    )
-                prompt_config = resolved_prompt
+            prompt_config = self._resolve_bound_prompt(
+                version,
+                binding,
+                prompt_service,
+            )
             nodes[binding.node_key] = {
                 "model": binding.model_config,
                 "prompt": prompt_config,
@@ -545,6 +612,83 @@ class AgentConfigService:
             tool_mappings, key=lambda item: item["logical_tool_key"]
         )
         return config
+
+    def _validate_version_bindings(self, version: AgentVersion) -> None:
+        from app.services.agent_config.models import ModelConfigService
+
+        bindings = self._bindings(version.id)
+        node_keys = [binding.node_key for binding in bindings]
+        if len(node_keys) != len(set(node_keys)) or set(node_keys) != set(NODE_REGISTRY):
+            raise ValueError("AgentVersion does not contain the complete Node Registry")
+
+        prompt_service = PromptConfigService(self.session, self.settings)
+        model_service = ModelConfigService(self.session, self.settings)
+        for binding in bindings:
+            if binding.prompt_revision_id is None:
+                raise ValueError(
+                    f"AgentVersion node has no Prompt revision: {binding.node_key}"
+                )
+            self._resolve_bound_prompt(version, binding, prompt_service)
+            if binding.model_profile_revision_id:
+                model = model_service.resolve_profile_revision(
+                    binding.model_profile_revision_id
+                )
+                if canonical_hash(model) != canonical_hash(binding.model_config):
+                    raise ValueError(
+                        f"Model binding failed integrity validation: {binding.node_key}"
+                    )
+
+        tool_bindings = self._tool_bindings(version.id)
+        tool_keys = [binding.logical_tool_key for binding in tool_bindings]
+        if len(tool_keys) != len(set(tool_keys)):
+            raise ValueError("AgentVersion contains duplicate logical tool bindings")
+        missing_tools = set(DEFAULT_TOOL_MAPPINGS) - set(tool_keys)
+        if missing_tools:
+            raise ValueError(
+                "AgentVersion is missing required logical tools: "
+                + ", ".join(sorted(missing_tools))
+            )
+        allowed_callers = {*NODE_REGISTRY, "research_pipeline"}
+        mcp_service = McpConfigService(self.session, self.settings)
+        for binding in tool_bindings:
+            allowed_nodes = set(binding.allowed_nodes)
+            if not allowed_nodes or allowed_nodes - allowed_callers:
+                raise ValueError(
+                    f"Logical tool has invalid allowed nodes: {binding.logical_tool_key}"
+                )
+            mapping = mcp_service.resolve_mapping_revision(
+                binding.tool_mapping_revision_id
+            )
+            if mapping["logical_tool_key"] != binding.logical_tool_key:
+                raise ValueError(
+                    f"Tool mapping revision does not match: {binding.logical_tool_key}"
+                )
+
+    @staticmethod
+    def _resolve_bound_prompt(
+        version: AgentVersion,
+        binding: AgentNodeBinding,
+        prompt_service: PromptConfigService,
+    ) -> dict:
+        if binding.prompt_revision_id is None:
+            raise ValueError(
+                f"AgentVersion node has no Prompt revision: {binding.node_key}"
+            )
+        if version.status == "DRAFT" and binding.prompt_config.get("working") is True:
+            return prompt_service.resolve_working_copy(
+                binding.prompt_config,
+                base_revision_id=binding.prompt_revision_id,
+                expected_node_key=binding.node_key,
+            )
+        prompt = prompt_service.resolve_revision(
+            binding.prompt_revision_id,
+            expected_node_key=binding.node_key,
+        )
+        if canonical_hash(prompt) != canonical_hash(binding.prompt_config):
+            raise ValueError(
+                f"Prompt binding failed integrity validation: {binding.node_key}"
+            )
+        return prompt
 
     def _bindings(self, agent_version_id: str) -> list[AgentNodeBinding]:
         return list(

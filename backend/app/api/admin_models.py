@@ -17,9 +17,7 @@ from app.models.database import (
 )
 from app.schemas.admin import (
     AgentDefinitionDetailResponse,
-    AgentDefinitionSummaryResponse,
     AgentNodeBindingResponse,
-    AgentRuntimeConfigRequest,
     AgentToolBindingResponse,
     AgentVersionDetailResponse,
     AgentVersionResponse,
@@ -36,7 +34,11 @@ from app.schemas.admin import (
 from app.services.agent_config.models import ModelConfigService
 from app.services.agent_config.mcp import McpConfigService
 from app.services.agent_config.registry import NODE_REGISTRY
-from app.services.agent_config.service import AgentConfigService, SYSTEM_TENANT_ID
+from app.services.agent_config.service import (
+    DEFAULT_AGENT_DEFINITION_ID,
+    AgentConfigService,
+    SYSTEM_TENANT_ID,
+)
 from app.services.auth import Principal, get_current_principal
 
 
@@ -56,30 +58,12 @@ router = APIRouter(
 )
 
 
-@router.get("/agents", response_model=list[AgentDefinitionSummaryResponse])
-def list_agents(
-    session: Session = Depends(get_session),
-) -> list[AgentDefinitionSummaryResponse]:
-    AgentConfigService(session, settings).ensure_default_agent()
-    definitions = list(
-        session.scalars(
-            select(AgentDefinition)
-            .where(AgentDefinition.tenant_id == SYSTEM_TENANT_ID)
-            .order_by(AgentDefinition.name)
-        )
-    )
-    return [_definition_summary(session, item) for item in definitions]
-
-
-@router.get(
-    "/agents/{agent_definition_id}", response_model=AgentDefinitionDetailResponse
-)
-def get_agent(
-    agent_definition_id: str,
+@router.get("/agent", response_model=AgentDefinitionDetailResponse)
+def get_default_agent(
     session: Session = Depends(get_session),
 ) -> AgentDefinitionDetailResponse:
     AgentConfigService(session, settings).ensure_default_agent()
-    definition = session.get(AgentDefinition, agent_definition_id)
+    definition = session.get(AgentDefinition, DEFAULT_AGENT_DEFINITION_ID)
     if definition is None or definition.tenant_id != SYSTEM_TENANT_ID:
         raise HTTPException(status_code=404, detail="Agent definition not found")
     published = session.get(AgentVersion, definition.published_version_id)
@@ -94,27 +78,6 @@ def get_agent(
         published_version=_version_detail(session, published),
         draft_version=_version_detail(session, draft) if draft else None,
     )
-
-
-@router.post(
-    "/agent-versions/{agent_version_id}/runtime-config",
-    response_model=AgentVersionResponse,
-)
-def update_agent_runtime_config(
-    agent_version_id: str,
-    payload: AgentRuntimeConfigRequest,
-    session: Session = Depends(get_session),
-) -> AgentVersionResponse:
-    try:
-        version = AgentConfigService(session, settings).set_draft_runtime_config(
-            agent_version_id,
-            loop=payload.loop.model_dump(),
-            output=payload.output.model_dump(),
-        )
-    except (KeyError, ValueError) as exc:
-        session.rollback()
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return _version_response(version)
 
 
 @router.post("/model-connections", response_model=ModelConnectionResponse)
@@ -361,23 +324,6 @@ def _version_response(version: AgentVersion) -> AgentVersionResponse:
     )
 
 
-def _definition_summary(
-    session: Session, definition: AgentDefinition
-) -> AgentDefinitionSummaryResponse:
-    published = session.get(AgentVersion, definition.published_version_id)
-    if published is None:
-        raise HTTPException(status_code=409, detail="Agent has no published version")
-    draft = _latest_draft(session, definition.id)
-    return AgentDefinitionSummaryResponse(
-        id=definition.id,
-        name=definition.name,
-        slug=definition.slug,
-        status=definition.status,
-        published_version=_version_response(published),
-        draft_version=_version_response(draft) if draft else None,
-    )
-
-
 def _latest_draft(session: Session, agent_definition_id: str) -> AgentVersion | None:
     return session.scalar(
         select(AgentVersion)
@@ -420,9 +366,13 @@ def _version_detail(
                 model_profile_revision_id=binding.model_profile_revision_id,
                 model_id=node["model"].get("model_id", ""),
                 provider=node["model"].get("provider", ""),
+                prompt_definition_id=(
+                    prompt_revision.prompt_definition_id if prompt_revision else None
+                ),
                 prompt_revision_id=binding.prompt_revision_id,
                 prompt_version=prompt_revision.version if prompt_revision else None,
                 prompt_source=node["prompt"].get("source"),
+                prompt_config=node["prompt"],
                 allowed_tools=node.get("allowed_tools", []),
             )
         )
@@ -448,8 +398,6 @@ def _version_detail(
     return AgentVersionDetailResponse(
         **_version_response(version).model_dump(),
         config_schema_version=version.config_schema_version,
-        loop=behavior["loop"],
-        output=behavior["output"],
         nodes=nodes,
         tools=tools,
     )

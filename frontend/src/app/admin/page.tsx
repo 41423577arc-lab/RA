@@ -5,20 +5,20 @@ import {
   Bot,
   Check,
   ChevronRight,
-  Database,
   FileText,
   Gauge,
+  History,
+  Link2,
   LoaderCircle,
   Network,
+  Pencil,
   Plus,
   Rocket,
   Save,
-  Server,
-  Settings,
   SlidersHorizontal,
   TestTube2,
 } from "lucide-react";
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useState } from "react";
 import styles from "./admin.module.css";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
@@ -27,19 +27,18 @@ const apiFetch = (path: string, init?: RequestInit) =>
 
 type User = { user_id?: string; display_name?: string; role?: string; agent_admin_enabled: boolean };
 type Version = { id: string; agent_definition_id: string; version: number; status: string; config_hash: string };
-type NodeBinding = { node_key: string; output_schema: string; conditional: boolean; allows_tools: boolean; model_profile_revision_id?: string; model_id: string; provider: string; prompt_revision_id?: string; prompt_version?: number; prompt_source?: string; allowed_tools: string[] };
+type NodeBinding = { node_key: string; output_schema: string; conditional: boolean; allows_tools: boolean; model_profile_revision_id?: string; model_id: string; provider: string; prompt_definition_id?: string; prompt_revision_id?: string; prompt_version?: number; prompt_source?: string; prompt_config: PromptConfig; allowed_tools: string[] };
 type ToolBinding = { logical_tool_key: string; tool_mapping_revision_id: string; remote_tool_name: string; adapter_key: string; allowed_nodes: string[] };
-type VersionDetail = Version & { config_schema_version: number; loop: Record<string, number | boolean>; output: { formats: string[]; evidence_validation_required: boolean; templates?: { name: string; path: string }[] }; nodes: NodeBinding[]; tools: ToolBinding[] };
-type AgentSummary = { id: string; name: string; slug: string; status: string; published_version: Version; draft_version?: Version };
+type VersionDetail = Version & { config_schema_version: number; nodes: NodeBinding[]; tools: ToolBinding[] };
 type AgentDetail = { id: string; name: string; slug: string; status: string; published_version: VersionDetail; draft_version?: VersionDetail };
 type ModelConnection = { id: string; name: string; slug: string; active_revision_id: string; revision_version: number; provider: string; base_url: string; secret_ref: string };
 type ModelProfile = { id: string; name: string; slug: string; active_revision_id: string; revision_version: number; connection_revision_id: string; model_id: string; api_mode: string; parameters: Record<string, unknown> };
-type PromptRevision = { id: string; version: number; content: string; validation_report: Record<string, unknown>; status: string };
+type PromptSkill = { revision_id: string; name: string; content_hash: string; content: string };
+type PromptValidation = { valid?: boolean; node_key?: string; output_schema?: string; output_schema_boundary?: string; required_variables?: string[]; skill_names?: string[] };
+type PromptConfig = { prompt_definition_id?: string; revision_id?: string; base_revision_id?: string; version?: number; node_key?: string; content: string; content_hash: string; config_hash?: string; required_variables: string[]; skills: PromptSkill[]; validation_report: PromptValidation; smoke_test_status?: string; source?: string; working?: boolean };
+type PromptRevision = { id: string; prompt_definition_id: string; version: number; content: string; content_hash: string; required_variables: string[]; skills: PromptSkill[]; validation_report: PromptValidation; smoke_test_status: string; source: string; status: string };
 type PromptDefinition = { id: string; name: string; slug: string; node_key: string; active_revision: PromptRevision };
-type McpServer = { id: string; name: string; slug: string; active_revision_id: string; revision_version: number; url: string; authentication_type: string; secret_ref?: string; timeout_seconds: number };
-type ToolMapping = { id: string; name: string; logical_tool_key: string; active_revision_id: string; revision_version: number; mcp_server_revision_id: string; remote_tool_name: string; adapter_key: string; input_mapping: Record<string, unknown>; output_mapping: Record<string, unknown>; timeout_seconds: number };
-type DiscoveredTool = { name: string; description?: string; input_schema: Record<string, unknown> };
-type Tab = "overview" | "nodes" | "models" | "prompts" | "mcp" | "runtime";
+type Tab = "overview" | "nodes" | "models" | "prompts";
 
 const NODE_LABELS: Record<string, string> = {
   intake_chat: "Intake 对话",
@@ -55,13 +54,11 @@ const NODE_LABELS: Record<string, string> = {
   analysis_chat: "报告对话",
 };
 
-const TABS: { key: Tab; label: string; icon: typeof Settings }[] = [
+const TABS: { key: Tab; label: string; icon: typeof Gauge }[] = [
   { key: "overview", label: "概览", icon: Gauge },
   { key: "nodes", label: "节点配置", icon: Network },
   { key: "models", label: "模型", icon: SlidersHorizontal },
   { key: "prompts", label: "Prompt", icon: FileText },
-  { key: "mcp", label: "MCP / Tools", icon: Server },
-  { key: "runtime", label: "Loop / 输出", icon: Settings },
 ];
 
 async function jsonRequest<T>(path: string, init?: RequestInit): Promise<T> {
@@ -73,36 +70,29 @@ async function jsonRequest<T>(path: string, init?: RequestInit): Promise<T> {
 
 export default function AdminPage() {
   const [user, setUser] = useState<User | null>(null);
-  const [agents, setAgents] = useState<AgentSummary[]>([]);
   const [agent, setAgent] = useState<AgentDetail | null>(null);
   const [connections, setConnections] = useState<ModelConnection[]>([]);
   const [profiles, setProfiles] = useState<ModelProfile[]>([]);
   const [prompts, setPrompts] = useState<PromptDefinition[]>([]);
-  const [servers, setServers] = useState<McpServer[]>([]);
-  const [mappings, setMappings] = useState<ToolMapping[]>([]);
   const [tab, setTab] = useState<Tab>("overview");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
-  const loadAgent = useCallback(async (agentId: string) => {
-    setAgent(await jsonRequest<AgentDetail>(`/api/v1/admin/agents/${agentId}`));
+  const loadAgent = useCallback(async () => {
+    setAgent(await jsonRequest<AgentDetail>("/api/v1/admin/agent"));
   }, []);
 
   const loadResources = useCallback(async () => {
-    const [nextConnections, nextProfiles, nextPrompts, nextServers, nextMappings] = await Promise.all([
+    const [nextConnections, nextProfiles, nextPrompts] = await Promise.all([
       jsonRequest<ModelConnection[]>("/api/v1/admin/model-connections"),
       jsonRequest<ModelProfile[]>("/api/v1/admin/model-profiles"),
       jsonRequest<PromptDefinition[]>("/api/v1/admin/prompts"),
-      jsonRequest<McpServer[]>("/api/v1/admin/mcp-servers"),
-      jsonRequest<ToolMapping[]>("/api/v1/admin/tool-mappings"),
     ]);
     setConnections(nextConnections);
     setProfiles(nextProfiles);
     setPrompts(nextPrompts);
-    setServers(nextServers);
-    setMappings(nextMappings);
   }, []);
 
   const load = useCallback(async () => {
@@ -114,9 +104,7 @@ export default function AdminPage() {
       if (!me.agent_admin_enabled || !["ADMIN", "SYSTEM"].includes(me.role ?? "")) {
         throw new Error("当前账户没有 Agent 管理权限");
       }
-      const nextAgents = await jsonRequest<AgentSummary[]>("/api/v1/admin/agents");
-      setAgents(nextAgents);
-      if (nextAgents[0]) await Promise.all([loadAgent(nextAgents[0].id), loadResources()]);
+      await Promise.all([loadAgent(), loadResources()]);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "管理配置加载失败");
     } finally {
@@ -128,6 +116,9 @@ export default function AdminPage() {
 
   const draft = agent?.draft_version;
   const active = draft ?? agent?.published_version;
+  const draftHasWorkingPrompt = Boolean(
+    draft?.nodes.some((node) => node.prompt_config.working)
+  );
 
   const mutate = async (label: string, action: () => Promise<unknown>, refreshResources = false) => {
     if (!agent) return;
@@ -135,9 +126,7 @@ export default function AdminPage() {
     try {
       await action();
       if (refreshResources) await loadResources();
-      const nextAgents = await jsonRequest<AgentSummary[]>("/api/v1/admin/agents");
-      setAgents(nextAgents);
-      await loadAgent(agent.id);
+      await loadAgent();
       setNotice(`${label}完成`);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : `${label}失败`);
@@ -159,10 +148,6 @@ export default function AdminPage() {
 
       <div className={styles.layout}>
         <aside className={styles.sidebar}>
-          <label className={styles.agentSelectLabel}>Agent</label>
-          <select value={agent.id} onChange={(event) => void loadAgent(event.target.value)}>
-            {agents.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-          </select>
           <nav className={styles.nav}>
             {TABS.map((item) => { const Icon = item.icon; return <button key={item.key} className={tab === item.key ? styles.activeNav : ""} onClick={() => setTab(item.key)}><Icon size={17} /><span>{item.label}</span><ChevronRight size={14} /></button>; })}
           </nav>
@@ -174,39 +159,38 @@ export default function AdminPage() {
 
         <section className={styles.content}>
           <div className={styles.pageHeading}>
-            <div><span className={styles.eyebrow}>{TABS.find((item) => item.key === tab)?.label}</span><h1>{agent.name}</h1><p>配置只在发布后影响新任务，运行中的任务继续使用原 Snapshot。</p></div>
+            <div><span className={styles.eyebrow}>{TABS.find((item) => item.key === tab)?.label}</span><h1>{agent.name}</h1><p>当前草稿用于下一次新任务，已经开始的任务继续使用原 Snapshot。</p></div>
             <div className={styles.actions}>
               {!draft && <button className={styles.secondaryButton} disabled={Boolean(busy)} onClick={() => void mutate("创建草稿", () => jsonRequest(`/api/v1/admin/agents/${agent.id}/drafts`, { method: "POST" }))}><Plus size={16} />创建草稿</button>}
-              {draft && <button className={styles.primaryButton} disabled={Boolean(busy)} onClick={() => void mutate("发布", () => jsonRequest(`/api/v1/admin/agent-versions/${draft.id}/publish`, { method: "POST" }))}><Rocket size={16} />发布 v{draft.version}</button>}
+              {draft && <button className={styles.primaryButton} title={draftHasWorkingPrompt ? "工作稿冻结为稳定 Revision 将在下一阶段实现" : "发布当前稳定配置"} disabled={Boolean(busy) || draftHasWorkingPrompt} onClick={() => void mutate("发布", () => jsonRequest(`/api/v1/admin/agent-versions/${draft.id}/publish`, { method: "POST" }))}><Rocket size={16} />发布 v{draft.version}</button>}
             </div>
           </div>
           {error && <div className={styles.error}>{error}</div>}
           {notice && <div className={styles.notice}><Check size={15} />{notice}</div>}
-          {tab === "overview" && <Overview agent={agent} active={active} connections={connections} profiles={profiles} prompts={prompts} servers={servers} mappings={mappings} />}
+          {tab === "overview" && <Overview agent={agent} active={active} connections={connections} profiles={profiles} prompts={prompts} />}
           {tab === "nodes" && <NodesPanel version={active} draft={draft} profiles={profiles} prompts={prompts} busy={busy} mutate={mutate} />}
           {tab === "models" && <ModelsPanel connections={connections} profiles={profiles} busy={busy} mutate={mutate} />}
-          {tab === "prompts" && <PromptsPanel prompts={prompts} busy={busy} mutate={mutate} />}
-          {tab === "mcp" && <McpPanel servers={servers} mappings={mappings} version={active} draft={draft} busy={busy} mutate={mutate} />}
-          {tab === "runtime" && <RuntimePanel version={active} draft={draft} busy={busy} mutate={mutate} />}
+          {tab === "prompts" && <PromptsPanel version={active} draft={draft} prompts={prompts} busy={busy} mutate={mutate} />}
         </section>
       </div>
     </main>
   );
 }
 
-function Overview({ agent, active, connections, profiles, prompts, servers, mappings }: { agent: AgentDetail; active: VersionDetail; connections: ModelConnection[]; profiles: ModelProfile[]; prompts: PromptDefinition[]; servers: McpServer[]; mappings: ToolMapping[] }) {
-  const metrics = [["节点", active.nodes.length], ["模型配置", profiles.length], ["Prompt", prompts.length], ["MCP Server", servers.length], ["Logical Tool", mappings.length]];
+function Overview({ agent, active, connections, profiles, prompts }: { agent: AgentDetail; active: VersionDetail; connections: ModelConnection[]; profiles: ModelProfile[]; prompts: PromptDefinition[] }) {
+  const metrics = [["节点", active.nodes.length], ["模型配置", profiles.length], ["Prompt", prompts.length], ["固定 Logical Tool", active.tools.length]];
   return <div className={styles.stack}>
     <section className={styles.metricBand}>{metrics.map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}</strong></div>)}</section>
     <section className={styles.section}><div className={styles.sectionHeading}><div><span className={styles.eyebrow}>Definition</span><h2>版本状态</h2></div></div><dl className={styles.definitionGrid}><div><dt>Slug</dt><dd>{agent.slug}</dd></div><div><dt>Schema</dt><dd>v{active.config_schema_version}</dd></div><div><dt>已发布版本</dt><dd>v{agent.published_version.version}</dd></div><div><dt>草稿版本</dt><dd>{agent.draft_version ? `v${agent.draft_version.version}` : "无"}</dd></div><div><dt>模型连接</dt><dd>{connections.length}</dd></div><div><dt>配置哈希</dt><dd className={styles.mono}>{active.config_hash}</dd></div></dl></section>
     <section className={styles.section}><div className={styles.sectionHeading}><div><span className={styles.eyebrow}>Topology</span><h2>节点拓扑</h2></div></div><div className={styles.nodeStrip}>{active.nodes.map((node) => <div key={node.node_key}><strong>{NODE_LABELS[node.node_key] ?? node.node_key}</strong><span>{node.model_id}</span></div>)}</div></section>
+    <section className={styles.section}><div className={styles.sectionHeading}><div><span className={styles.eyebrow}>Logical Tools</span><h2>固定工具绑定</h2></div><p>工具注册与权限由代码和现有配置底座管理，此处仅展示当前版本。</p></div><div className={styles.resourceList}>{active.tools.map((tool) => <div key={tool.logical_tool_key}><div><strong>{tool.logical_tool_key}</strong><span>{tool.adapter_key}</span></div><div><code>{tool.remote_tool_name}</code><small>{tool.allowed_nodes.map((node) => NODE_LABELS[node] ?? node).join("、")}</small></div></div>)}</div></section>
   </div>;
 }
 
 function NodesPanel({ version, draft, profiles, prompts, busy, mutate }: { version: VersionDetail; draft?: VersionDetail; profiles: ModelProfile[]; prompts: PromptDefinition[]; busy: string; mutate: (label: string, action: () => Promise<unknown>) => Promise<void> }) {
-  return <section className={styles.section}><div className={styles.sectionHeading}><div><span className={styles.eyebrow}>Node Registry</span><h2>节点模型与 Prompt</h2></div><p>{draft ? "修改会写入当前草稿。" : "创建草稿后才能修改绑定。"}</p></div><div className={styles.tableWrap}><table><thead><tr><th>节点</th><th>输出</th><th>模型</th><th>Prompt</th></tr></thead><tbody>{version.nodes.map((node) => {
-    const nodePrompts = prompts.filter((item) => item.node_key === node.node_key);
-    return <tr key={node.node_key}><td><strong>{NODE_LABELS[node.node_key] ?? node.node_key}</strong><small>{node.conditional ? "按需调用" : "固定能力"}</small></td><td className={styles.mono}>{node.output_schema}</td><td><select disabled={!draft || Boolean(busy)} value={node.model_profile_revision_id ?? ""} onChange={(event) => void mutate("绑定模型", () => jsonRequest(`/api/v1/admin/agent-versions/${draft!.id}/nodes/${node.node_key}/model`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model_profile_revision_id: event.target.value }) }))}><option value="">环境默认 · {node.model_id}</option>{profiles.map((profile) => <option key={profile.id} value={profile.active_revision_id}>{profile.name} · {profile.model_id}</option>)}</select></td><td><select disabled={!draft || Boolean(busy)} value={node.prompt_revision_id ?? ""} onChange={(event) => void mutate("绑定 Prompt", () => jsonRequest(`/api/v1/admin/agent-versions/${draft!.id}/nodes/${node.node_key}/prompt`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt_revision_id: event.target.value }) }))}>{nodePrompts.map((prompt) => <option key={prompt.id} value={prompt.active_revision.id}>{prompt.name} · v{prompt.active_revision.version}</option>)}</select></td></tr>;
+  return <section className={styles.section}><div className={styles.sectionHeading}><div><span className={styles.eyebrow}>Node Registry</span><h2>节点模型与 Prompt</h2></div><p>{draft ? "模型修改会写入当前草稿。" : "创建草稿后才能修改模型绑定。"}</p></div><div className={styles.tableWrap}><table><thead><tr><th>节点</th><th>输出</th><th>模型</th><th>Prompt</th></tr></thead><tbody>{version.nodes.map((node) => {
+    const prompt = prompts.find((item) => item.id === node.prompt_definition_id);
+    return <tr key={node.node_key}><td><strong>{NODE_LABELS[node.node_key] ?? node.node_key}</strong><small>{node.conditional ? "按需调用" : "固定能力"}</small></td><td className={styles.mono}>{node.output_schema}</td><td><select disabled={!draft || Boolean(busy)} value={node.model_profile_revision_id ?? ""} onChange={(event) => void mutate("绑定模型", () => jsonRequest(`/api/v1/admin/agent-versions/${draft!.id}/nodes/${node.node_key}/model`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model_profile_revision_id: event.target.value }) }))}><option value="">环境默认 · {node.model_id}</option>{profiles.map((profile) => <option key={profile.id} value={profile.active_revision_id}>{profile.name} · {profile.model_id}</option>)}</select></td><td><div className={styles.promptBinding}><strong>{prompt?.name ?? "固定节点 Prompt"}</strong><small>{node.prompt_config.working ? "工作稿" : "稳定副本"} · 基于 v{node.prompt_version ?? "-"}</small></div></td></tr>;
   })}</tbody></table></div></section>;
 }
 
@@ -220,44 +204,138 @@ function ModelsPanel({ connections, profiles, busy, mutate }: { connections: Mod
   <section className={styles.section}><div className={styles.sectionHeading}><div><span className={styles.eyebrow}>Profiles</span><h2>模型调用配置</h2></div></div><div className={styles.resourceList}>{profiles.map((item) => <div key={item.id}><div><strong>{item.name}</strong><span>revision {item.revision_version}</span></div><div><code>{item.model_id}</code><small>{item.api_mode} · {JSON.stringify(item.parameters)}</small></div></div>)}</div><form className={styles.formGrid} onSubmit={createProfile}><input required placeholder="配置名称" value={profile.name} onChange={(e) => setProfile({ ...profile, name: e.target.value })} /><input required placeholder="slug" value={profile.slug} onChange={(e) => setProfile({ ...profile, slug: e.target.value })} /><select value={profile.connection_revision_id} onChange={(e) => setProfile({ ...profile, connection_revision_id: e.target.value })}>{connections.map((item) => <option key={item.id} value={item.active_revision_id}>{item.name}</option>)}</select><input required placeholder="模型 ID" value={profile.model_id} onChange={(e) => setProfile({ ...profile, model_id: e.target.value })} /><textarea value={profile.parameters} onChange={(e) => setProfile({ ...profile, parameters: e.target.value })} /><button className={styles.secondaryButton} disabled={Boolean(busy)}><Plus size={15} />添加模型配置</button></form></section></div>;
 }
 
-function PromptsPanel({ prompts, busy, mutate }: { prompts: PromptDefinition[]; busy: string; mutate: (label: string, action: () => Promise<unknown>, refresh?: boolean) => Promise<void> }) {
-  const [selectedId, setSelectedId] = useState(prompts[0]?.id ?? "");
-  const selected = prompts.find((item) => item.id === selectedId) ?? prompts[0];
-  const [content, setContent] = useState(selected?.active_revision.content ?? "");
-  useEffect(() => { if (selected) setContent(selected.active_revision.content); }, [selected]);
-  if (!selected) return <section className={styles.section}>暂无 Prompt。</section>;
-  return <section className={styles.section}><div className={styles.sectionHeading}><div><span className={styles.eyebrow}>Versioned Prompts</span><h2>Prompt 编辑与校验</h2></div><select value={selected.id} onChange={(e) => setSelectedId(e.target.value)}>{prompts.map((item) => <option key={item.id} value={item.id}>{NODE_LABELS[item.node_key] ?? item.node_key} · {item.name}</option>)}</select></div><div className={styles.promptMeta}><span>节点 <code>{selected.node_key}</code></span><span>当前版本 v{selected.active_revision.version}</span><span>状态 {selected.active_revision.status}</span></div><textarea className={styles.promptEditor} value={content} onChange={(e) => setContent(e.target.value)} spellCheck={false} /><div className={styles.actions}><button className={styles.secondaryButton} disabled={Boolean(busy)} onClick={() => void mutate("静态校验", () => jsonRequest(`/api/v1/admin/prompt-revisions/${selected.active_revision.id}/validate`, { method: "POST" }))}><TestTube2 size={15} />校验当前版本</button><button className={styles.primaryButton} disabled={Boolean(busy) || content === selected.active_revision.content} onClick={() => void mutate("保存 Prompt 版本", () => jsonRequest(`/api/v1/admin/prompts/${selected.id}/revisions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content }) }), true)}><Save size={15} />保存新版本</button></div></section>;
-}
+function PromptsPanel({ version, draft, prompts, busy, mutate }: { version: VersionDetail; draft?: VersionDetail; prompts: PromptDefinition[]; busy: string; mutate: (label: string, action: () => Promise<unknown>, refresh?: boolean) => Promise<void> }) {
+  const [selectedNodeKey, setSelectedNodeKey] = useState(version.nodes[0]?.node_key ?? "");
+  const [selectedDefinitionId, setSelectedDefinitionId] = useState("");
+  const [revisions, setRevisions] = useState<PromptRevision[]>([]);
+  const [selectedRevisionId, setSelectedRevisionId] = useState("working");
+  const [content, setContent] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
 
-function McpPanel({ servers, mappings, version, draft, busy, mutate }: { servers: McpServer[]; mappings: ToolMapping[]; version: VersionDetail; draft?: VersionDetail; busy: string; mutate: (label: string, action: () => Promise<unknown>, refresh?: boolean) => Promise<void> }) {
-  const [server, setServer] = useState({ name: "", slug: "", url: "", authentication_type: "none", api_token: "", timeout_seconds: 10 });
-  const [mapping, setMapping] = useState({ name: "", logical_tool_key: "", mcp_server_revision_id: servers[0]?.active_revision_id ?? "", remote_tool_name: "", adapter_key: "declarative", input_mapping: "{}", output_mapping: "{}", timeout_seconds: 10 });
-  const [discovered, setDiscovered] = useState<DiscoveredTool[]>([]);
-  const [discoverError, setDiscoverError] = useState("");
-  useEffect(() => { if (!mapping.mcp_server_revision_id && servers[0]) setMapping((item) => ({ ...item, mcp_server_revision_id: servers[0].active_revision_id })); }, [servers, mapping.mcp_server_revision_id]);
-  const createServer = (event: FormEvent) => { event.preventDefault(); void mutate("添加 MCP Server", () => jsonRequest("/api/v1/admin/mcp-servers", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...server, api_token: server.api_token || null }) }), true); };
-  const createMapping = (event: FormEvent) => { event.preventDefault(); let input_mapping; let output_mapping; try { input_mapping = JSON.parse(mapping.input_mapping); output_mapping = JSON.parse(mapping.output_mapping); } catch { return; } void mutate("添加 Tool Mapping", () => jsonRequest("/api/v1/admin/tool-mappings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...mapping, input_mapping, output_mapping }) }), true); };
-  const discover = async (serverId: string) => { setDiscoverError(""); try { setDiscovered(await jsonRequest<DiscoveredTool[]>(`/api/v1/admin/mcp-servers/${serverId}/discover-tools`, { method: "POST" })); } catch (reason) { setDiscoverError(reason instanceof Error ? reason.message : "工具发现失败"); } };
-  return <div className={styles.stack}><section className={styles.section}><div className={styles.sectionHeading}><div><span className={styles.eyebrow}>Registry</span><h2>MCP Server</h2></div></div><div className={styles.resourceList}>{servers.map((item) => <div key={item.id}><div><strong>{item.name}</strong><span>{item.authentication_type} · {item.timeout_seconds}s</span></div><div><code>{item.url}</code><small>{item.secret_ref ?? "无认证"}</small></div><button className={styles.secondaryButton} disabled={Boolean(busy)} onClick={() => void discover(item.id)}><Database size={15} />发现工具</button></div>)}</div>{discoverError && <div className={styles.error}>{discoverError}</div>}{discovered.length > 0 && <div className={styles.discovered}>{discovered.map((tool) => <button key={tool.name} onClick={() => setMapping({ ...mapping, remote_tool_name: tool.name })}><strong>{tool.name}</strong><span>{tool.description}</span></button>)}</div>}<form className={styles.formGrid} onSubmit={createServer}><input required placeholder="Server 名称" value={server.name} onChange={(e) => setServer({ ...server, name: e.target.value })} /><input required placeholder="slug" value={server.slug} onChange={(e) => setServer({ ...server, slug: e.target.value })} /><input required placeholder="MCP URL" value={server.url} onChange={(e) => setServer({ ...server, url: e.target.value })} /><select value={server.authentication_type} onChange={(e) => setServer({ ...server, authentication_type: e.target.value })}><option value="none">无认证</option><option value="bearer">Bearer Token</option></select><input type="password" placeholder="Token（可选）" value={server.api_token} onChange={(e) => setServer({ ...server, api_token: e.target.value })} /><button className={styles.secondaryButton} disabled={Boolean(busy)}><Plus size={15} />添加 Server</button></form></section>
-  <section className={styles.section}><div className={styles.sectionHeading}><div><span className={styles.eyebrow}>Logical Tools</span><h2>Tool Mapping 与节点权限</h2></div></div><div className={styles.resourceList}>{mappings.map((item) => <ToolBindingEditor key={item.id} mapping={item} binding={version.tools.find((tool) => tool.logical_tool_key === item.logical_tool_key)} callers={[...version.nodes.map((node) => node.node_key), "research_pipeline"]} draft={draft} busy={busy} mutate={mutate} />)}</div><form className={styles.formGrid} onSubmit={createMapping}><input required placeholder="Mapping 名称" value={mapping.name} onChange={(e) => setMapping({ ...mapping, name: e.target.value })} /><input required placeholder="Logical Tool Key" value={mapping.logical_tool_key} onChange={(e) => setMapping({ ...mapping, logical_tool_key: e.target.value })} /><select value={mapping.mcp_server_revision_id} onChange={(e) => setMapping({ ...mapping, mcp_server_revision_id: e.target.value })}>{servers.map((item) => <option key={item.id} value={item.active_revision_id}>{item.name}</option>)}</select><input required placeholder="远端 Tool 名称" value={mapping.remote_tool_name} onChange={(e) => setMapping({ ...mapping, remote_tool_name: e.target.value })} /><textarea value={mapping.input_mapping} onChange={(e) => setMapping({ ...mapping, input_mapping: e.target.value })} /><textarea value={mapping.output_mapping} onChange={(e) => setMapping({ ...mapping, output_mapping: e.target.value })} /><button className={styles.secondaryButton} disabled={Boolean(busy)}><Plus size={15} />添加 Mapping</button></form></section></div>;
-}
+  useEffect(() => {
+    if (!version.nodes.some((item) => item.node_key === selectedNodeKey)) {
+      setSelectedNodeKey(version.nodes[0]?.node_key ?? "");
+    }
+  }, [selectedNodeKey, version.nodes]);
 
-function ToolBindingEditor({ mapping, binding, callers, draft, busy, mutate }: { mapping: ToolMapping; binding?: ToolBinding; callers: string[]; draft?: VersionDetail; busy: string; mutate: (label: string, action: () => Promise<unknown>) => Promise<void> }) {
-  const [allowed, setAllowed] = useState<string[]>(binding?.allowed_nodes ?? ["research_pipeline"]);
-  useEffect(() => setAllowed(binding?.allowed_nodes ?? ["research_pipeline"]), [binding]);
-  return <div><div><strong>{mapping.logical_tool_key}</strong><span>{mapping.name} · revision {mapping.revision_version}</span></div><div><code>{mapping.remote_tool_name}</code><select multiple className={styles.multiSelect} disabled={!draft} value={allowed} onChange={(event) => setAllowed(Array.from(event.target.selectedOptions, (option) => option.value))}>{callers.map((caller) => <option key={caller} value={caller}>{NODE_LABELS[caller] ?? caller}</option>)}</select></div><button className={styles.secondaryButton} disabled={!draft || Boolean(busy) || allowed.length === 0} onClick={() => void mutate("绑定 Tool", () => jsonRequest(`/api/v1/admin/agent-versions/${draft!.id}/tools/${mapping.logical_tool_key}/binding`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool_mapping_revision_id: mapping.active_revision_id, allowed_nodes: allowed }) }))}><Save size={15} />绑定</button></div>;
-}
+  const node = version.nodes.find((item) => item.node_key === selectedNodeKey) ?? version.nodes[0];
+  const nodeDefinitions = prompts.filter((item) => item.node_key === node?.node_key);
+  const boundDefinition = nodeDefinitions.find((item) => item.id === node?.prompt_definition_id);
+  const currentPrompt = node?.prompt_config;
 
-function RuntimePanel({ version, draft, busy, mutate }: { version: VersionDetail; draft?: VersionDetail; busy: string; mutate: (label: string, action: () => Promise<unknown>) => Promise<void> }) {
-  const [loop, setLoop] = useState(version.loop);
-  const [formats, setFormats] = useState(version.output.formats);
-  const [evidence, setEvidence] = useState(version.output.evidence_validation_required);
-  useEffect(() => { setLoop(version.loop); setFormats(version.output.formats); setEvidence(version.output.evidence_validation_required); }, [version]);
-  const numberField = (key: string, label: string, min: number, max: number, step = 1) => <label><span>{label}</span><input type="number" min={min} max={max} step={step} value={Number(loop[key])} disabled={!draft} onChange={(e) => setLoop({ ...loop, [key]: Number(e.target.value) })} /></label>;
-  const toggle = (key: string, label: string) => <label className={styles.toggle}><input type="checkbox" checked={Boolean(loop[key])} disabled={!draft} onChange={(e) => setLoop({ ...loop, [key]: e.target.checked })} /><span>{label}</span></label>;
-  return <div className={styles.stack}><section className={styles.section}><div className={styles.sectionHeading}><div><span className={styles.eyebrow}>Agent Loop</span><h2>循环与决策边界</h2></div></div><div className={styles.runtimeGrid}>{numberField("max_loops", "最大循环轮次", 1, 50)}{numberField("max_tool_calls", "最大 Tool 调用", 1, 100)}{numberField("max_repeated_actions", "重复动作上限", 1, 20)}{numberField("identity_auto_accept_threshold", "身份自动接受阈值", 0, 1, 0.01)}</div><div className={styles.toggleGrid}>{toggle("intake_agent_v2_enabled", "Intake Agent V2")}{toggle("intake_entity_resolution_enabled", "身份解析")}{toggle("intake_react_enabled", "ReAct Loop")}</div></section><section className={styles.section}><div className={styles.sectionHeading}><div><span className={styles.eyebrow}>Output</span><h2>输出与证据策略</h2></div></div><div className={styles.toggleGrid}><label className={styles.toggle}><input type="checkbox" disabled={!draft} checked={formats.includes("detailed_markdown")} onChange={(e) => setFormats(changeList(formats, "detailed_markdown", e.target.checked))} /><span>详细 Markdown 报告</span></label><label className={styles.toggle}><input type="checkbox" disabled={!draft} checked={formats.includes("action_brief_markdown")} onChange={(e) => setFormats(changeList(formats, "action_brief_markdown", e.target.checked))} /><span>行动简报</span></label><label className={styles.toggle}><input type="checkbox" disabled={!draft} checked={evidence} onChange={(e) => setEvidence(e.target.checked)} /><span>发布前要求证据校验</span></label></div><div className={styles.templateList}>{version.output.templates?.map((template) => <div key={template.name}><strong>{template.name}</strong><code>{template.path}</code></div>)}</div></section><div className={styles.actions}><button className={styles.primaryButton} disabled={!draft || Boolean(busy) || formats.length === 0} onClick={() => void mutate("保存运行配置", () => jsonRequest(`/api/v1/admin/agent-versions/${draft!.id}/runtime-config`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ loop, output: { formats, evidence_validation_required: evidence } }) }))}><Save size={15} />保存到草稿</button></div></div>;
-}
+  useEffect(() => {
+    const preferredDefinition = boundDefinition ?? nodeDefinitions[0];
+    setSelectedDefinitionId(preferredDefinition?.id ?? "");
+    setSelectedRevisionId("working");
+    setEditing(false);
+  }, [boundDefinition, node?.node_key, prompts]);
 
-function changeList(items: string[], value: string, enabled: boolean) {
-  return enabled ? Array.from(new Set([...items, value])) : items.filter((item) => item !== value);
+  const definition = nodeDefinitions.find((item) => item.id === selectedDefinitionId) ?? boundDefinition ?? nodeDefinitions[0];
+
+  useEffect(() => {
+    if (!definition) {
+      setRevisions([]);
+      return;
+    }
+    let cancelled = false;
+    setHistoryLoading(true);
+    setHistoryError("");
+    void jsonRequest<PromptRevision[]>(`/api/v1/admin/prompts/${definition.id}/revisions`)
+      .then((items) => { if (!cancelled) setRevisions(items); })
+      .catch((reason) => { if (!cancelled) setHistoryError(reason instanceof Error ? reason.message : "Prompt 历史加载失败"); })
+      .finally(() => { if (!cancelled) setHistoryLoading(false); });
+    return () => { cancelled = true; };
+  }, [definition]);
+
+  useEffect(() => {
+    if (selectedRevisionId === "working") setContent(currentPrompt?.content ?? "");
+  }, [currentPrompt?.content, currentPrompt?.content_hash, selectedRevisionId]);
+
+  const selectedRevision = revisions.find((item) => item.id === selectedRevisionId);
+  const showingWorking = selectedRevisionId === "working";
+  const selectRevision = (revision: PromptRevision) => {
+    setSelectedRevisionId(revision.id);
+    setContent(revision.content);
+    setEditing(false);
+  };
+  const showWorkingCopy = () => {
+    setSelectedRevisionId("working");
+    setContent(currentPrompt?.content ?? "");
+    setEditing(false);
+  };
+  const saveWorkingCopy = async () => {
+    if (!draft || !node) return;
+    await mutate("保存工作稿", () => jsonRequest(`/api/v1/admin/agent-versions/${draft.id}/nodes/${node.node_key}/prompt-working-copy`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+    }));
+    setSelectedRevisionId("working");
+    setEditing(false);
+  };
+  const useRevisionAsWorkingCopy = async (revision: PromptRevision) => {
+    if (!draft || !node) return;
+    await mutate("建立工作稿", () => jsonRequest(`/api/v1/admin/agent-versions/${draft.id}/nodes/${node.node_key}/prompt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt_revision_id: revision.id }),
+    }));
+    setSelectedDefinitionId(revision.prompt_definition_id);
+    setSelectedRevisionId("working");
+    setEditing(false);
+  };
+
+  if (!node || !definition) return <section className={styles.section}>暂无可管理的 Prompt。</section>;
+
+  const promptDetail = showingWorking ? currentPrompt : selectedRevision;
+  const validation = promptDetail?.validation_report;
+  const skills = promptDetail?.skills ?? [];
+  const requiredVariables = promptDetail?.required_variables ?? [];
+  return <section className={styles.section}>
+    <div className={styles.sectionHeading}>
+      <div><span className={styles.eyebrow}>Prompt Experiments</span><h2>Prompt 工作稿与稳定历史</h2></div>
+      {nodeDefinitions.length > 1 && <label className={styles.compatDefinition}><span>兼容 Definition</span><select value={definition.id} onChange={(event) => { setSelectedDefinitionId(event.target.value); setSelectedRevisionId(event.target.value === boundDefinition?.id ? "working" : ""); setEditing(false); }}>{nodeDefinitions.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>}
+    </div>
+    <div className={styles.promptWorkspace}>
+      <div className={styles.promptNodeRail}>
+        <span className={styles.railLabel}>固定节点</span>
+        {version.nodes.map((item) => <button key={item.node_key} className={item.node_key === node.node_key ? styles.selectedRailItem : ""} onClick={() => { setSelectedNodeKey(item.node_key); setSelectedRevisionId("working"); setEditing(false); }}><strong>{NODE_LABELS[item.node_key] ?? item.node_key}</strong><small>{item.prompt_config.working ? "工作稿" : "稳定副本"} · 基于 v{item.prompt_version ?? "-"}</small></button>)}
+      </div>
+      <div className={styles.promptRevisionRail}>
+        <div className={styles.railHeading}><History size={15} /><div><strong>{definition.name}</strong><small>{definition.slug}</small></div></div>
+        {definition.id === boundDefinition?.id && <button className={`${styles.revisionItem} ${showingWorking ? styles.selectedRevision : ""}`} onClick={showWorkingCopy}><span><strong>{draft ? "当前工作稿" : "当前已发布"}</strong>{currentPrompt?.working && <em>Working</em>}</span><small>基于稳定 Revision v{node.prompt_version ?? "-"}</small></button>}
+        {historyLoading && <div className={styles.railState}><LoaderCircle className={styles.spin} size={17} /></div>}
+        {historyError && <div className={styles.railError}>{historyError}</div>}
+        {!historyLoading && revisions.map((revision) => <button key={revision.id} className={`${styles.revisionItem} ${revision.id === selectedRevision?.id ? styles.selectedRevision : ""}`} onClick={() => selectRevision(revision)}><span><strong>稳定 v{revision.version}</strong>{revision.id === node.prompt_revision_id && <em>工作稿基线</em>}</span><small>{revision.id === definition.active_revision.id ? "当前稳定 Revision" : revision.source}</small></button>)}
+      </div>
+      <div className={styles.promptRevisionDetail}>
+        {promptDetail && <>
+          <div className={styles.revisionHeader}>
+            <div><span className={styles.eyebrow}>{showingWorking ? "Working Prompt" : `Stable Revision v${selectedRevision?.version}`}</span><h3>{NODE_LABELS[node.node_key] ?? node.node_key}</h3></div>
+            <div className={styles.revisionStatus}><span>{showingWorking ? (draft ? "DRAFT" : "PUBLISHED") : "READ ONLY"}</span>{showingWorking && currentPrompt?.working && <strong>工作稿</strong>}</div>
+          </div>
+          <dl className={styles.promptRevisionMeta}>
+            <div><dt>Content Hash</dt><dd className={styles.mono}>{promptDetail.content_hash}</dd></div>
+            <div><dt>基线</dt><dd>Revision v{showingWorking ? node.prompt_version : selectedRevision?.version}</dd></div>
+            <div><dt>静态校验</dt><dd>{validation?.valid ? "通过" : "未通过"}</dd></div>
+            <div><dt>输出契约</dt><dd>{validation?.output_schema ?? node.output_schema}</dd></div>
+            <div><dt>契约边界</dt><dd>{validation?.output_schema_boundary ?? "code_owned"}</dd></div>
+            <div><dt>Placeholder</dt><dd>{requiredVariables.length ? requiredVariables.join("、") : "无"}</dd></div>
+            <div><dt>Skills</dt><dd>{skills.length ? skills.map((skill) => skill.name).join("、") : "无"}</dd></div>
+            <div><dt>状态</dt><dd>{showingWorking ? "下一次新任务直接使用" : "稳定历史只读"}</dd></div>
+          </dl>
+          <textarea className={styles.promptEditor} value={content} readOnly={!showingWorking || !editing} onChange={(event) => setContent(event.target.value)} spellCheck={false} />
+          {skills.length > 0 && <div className={styles.promptSkills}><h3>代码约束 Skills</h3>{skills.map((skill) => <details key={skill.revision_id}><summary>{skill.name}</summary><pre>{skill.content}</pre></details>)}</div>}
+          <div className={styles.actions}>
+            {!showingWorking && selectedRevision && <button className={styles.secondaryButton} disabled={Boolean(busy)} onClick={() => void mutate("校验稳定 Revision", () => jsonRequest(`/api/v1/admin/prompt-revisions/${selectedRevision.id}/validate`, { method: "POST" }))}><TestTube2 size={15} />重新校验</button>}
+            {showingWorking && !editing && <button className={styles.secondaryButton} disabled={!draft || Boolean(busy)} onClick={() => setEditing(true)}><Pencil size={15} />编辑工作稿</button>}
+            {showingWorking && editing && <button className={styles.primaryButton} disabled={!draft || Boolean(busy) || content === currentPrompt?.content} onClick={() => void saveWorkingCopy()}><Save size={15} />保存工作稿</button>}
+            {!showingWorking && selectedRevision && <button className={styles.primaryButton} title={draft ? "复制此稳定 Revision 到当前工作稿" : "请先创建 Agent Draft"} disabled={!draft || Boolean(busy)} onClick={() => void useRevisionAsWorkingCopy(selectedRevision)}><Link2 size={15} />以此版本建立工作稿</button>}
+          </div>
+        </>}
+      </div>
+    </div>
+  </section>;
 }

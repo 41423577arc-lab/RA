@@ -13,6 +13,7 @@ from app.schemas.admin_prompts import (
     PromptRevisionCreate,
     PromptRevisionResponse,
     PromptValidationResponse,
+    PromptWorkingCopyUpdate,
 )
 from app.services.agent_config.prompts import PromptConfigService
 from app.services.agent_config.service import (
@@ -132,6 +133,36 @@ def bind_node_prompt(
             agent_version_id,
             node_key,
             payload.prompt_revision_id,
+        )
+    except (KeyError, ValueError) as exc:
+        session.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return AgentVersionResponse(
+        id=version.id,
+        agent_definition_id=version.agent_definition_id,
+        version=version.version,
+        status=version.status,
+        config_hash=version.config_hash,
+    )
+
+
+@router.put(
+    "/agent-versions/{agent_version_id}/nodes/{node_key}/prompt-working-copy",
+    response_model=AgentVersionResponse,
+)
+def save_node_prompt_working_copy(
+    agent_version_id: str,
+    node_key: str,
+    payload: PromptWorkingCopyUpdate,
+    session: Session = Depends(get_session),
+) -> AgentVersionResponse:
+    try:
+        version = AgentConfigService(
+            session, settings
+        ).save_draft_node_prompt_working_copy(
+            agent_version_id,
+            node_key,
+            **payload.model_dump(),
         )
     except (KeyError, ValueError) as exc:
         session.rollback()

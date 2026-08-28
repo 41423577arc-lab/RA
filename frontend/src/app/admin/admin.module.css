@@ -8,10 +8,9 @@
 .iconButton { width: 38px; height: 38px; padding: 0; display: grid; place-items: center; color: #12345c; border: 1px solid #b7c1cf; border-radius: 5px; background: #fff; cursor: pointer; text-decoration: none; }
 .layout { min-height: calc(100vh - 68px); display: grid; grid-template-columns: 238px minmax(0, 1fr); }
 .sidebar { position: sticky; top: 68px; height: calc(100vh - 68px); padding: 24px 14px; display: flex; flex-direction: column; border-right: 1px solid #cbd3dd; background: #eef1f4; }
-.agentSelectLabel, .eyebrow { color: #617087; font-size: 11px; font-weight: 750; text-transform: uppercase; }
-.sidebar select, .section select, .content input, .content textarea { min-width: 0; color: #152237; border: 1px solid #b8c3d0; border-radius: 4px; background: #fff; outline: none; }
-.sidebar select { width: 100%; height: 40px; margin-top: 7px; padding: 0 9px; }
-.nav { margin-top: 22px; display: grid; gap: 3px; }
+.eyebrow { color: #617087; font-size: 11px; font-weight: 750; text-transform: uppercase; }
+.section select, .content input, .content textarea { min-width: 0; color: #152237; border: 1px solid #b8c3d0; border-radius: 4px; background: #fff; outline: none; }
+.nav { display: grid; gap: 3px; }
 .nav button { width: 100%; min-height: 42px; padding: 0 10px; display: grid; grid-template-columns: 22px 1fr 16px; align-items: center; gap: 8px; color: #445064; text-align: left; border: 0; border-radius: 4px; background: transparent; cursor: pointer; }
 .nav button:hover, .nav .activeNav { color: #003f7f; background: #dbe8f8; }
 .nav .activeNav { font-weight: 700; box-shadow: inset 3px 0 #07559d; }
@@ -31,7 +30,7 @@
 .sectionHeading { min-height: 46px; margin-bottom: 18px; display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
 .sectionHeading h2 { margin: 4px 0 0; font-size: 19px; }
 .sectionHeading > select { min-width: 260px; height: 40px; padding: 0 9px; }
-.metricBand { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border-top: 1px solid #bfc9d5; border-bottom: 1px solid #bfc9d5; background: #fff; }
+.metricBand { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid #bfc9d5; border-bottom: 1px solid #bfc9d5; background: #fff; }
 .metricBand div { min-height: 88px; padding: 18px; display: grid; gap: 8px; border-right: 1px solid #d5dce4; }
 .metricBand div:last-child { border-right: 0; }
 .metricBand span { color: #667184; font-size: 11px; }
@@ -53,31 +52,58 @@
 .tableWrap td:first-child strong, .tableWrap td:first-child small { display: block; }
 .tableWrap td:first-child small { margin-top: 4px; color: #7b8492; }
 .tableWrap select { width: 100%; height: 38px; padding: 0 8px; }
+.promptBinding { display: grid; gap: 5px; }
+.promptBinding small { color: #6d7888; }
 .resourceList { border-top: 1px solid #cbd3dd; }
 .resourceList > div { min-height: 68px; padding: 12px 8px; display: grid; grid-template-columns: minmax(160px, .7fr) minmax(260px, 1.3fr) auto; align-items: center; gap: 16px; border-bottom: 1px solid #d8dee5; }
 .resourceList > div > div { min-width: 0; display: grid; gap: 5px; }
 .resourceList strong { font-size: 13px; }
 .resourceList span, .resourceList small { color: #6d7888; font-size: 10px; }
-.resourceList code, .templateList code { overflow: hidden; color: #273950; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.resourceList .multiSelect { min-height: 76px; margin-top: 7px; padding: 5px; }
+.resourceList code { overflow: hidden; color: #273950; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .inlineForm, .formGrid { margin-top: 20px; display: grid; gap: 10px; }
 .inlineForm { grid-template-columns: 1fr 1fr 1.5fr 1.2fr auto; }
 .formGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .content input, .content select { min-height: 40px; padding: 8px 10px; }
 .content textarea { min-height: 84px; padding: 10px; resize: vertical; }
-.promptMeta { margin-bottom: 10px; display: flex; flex-wrap: wrap; gap: 18px; color: #657184; font-size: 11px; }
 .promptEditor { width: 100%; min-height: 480px !important; padding: 18px !important; font: 12px/1.65 Consolas, "Courier New", monospace !important; }
-.promptMeta + .promptEditor + .actions { margin-top: 14px; justify-content: flex-end; }
-.runtimeGrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
-.runtimeGrid label { display: grid; gap: 7px; color: #536074; font-size: 11px; }
-.toggleGrid { margin-top: 18px; display: flex; flex-wrap: wrap; gap: 10px; }
-.toggle { min-height: 42px; padding: 0 13px; display: inline-flex; align-items: center; gap: 8px; border: 1px solid #c2ccd7; background: #fff; font-size: 12px; }
-.toggle input { min-height: auto; }
-.templateList { margin-top: 18px; display: grid; border-top: 1px solid #d4dbe3; }
-.templateList div { padding: 11px 4px; display: grid; grid-template-columns: 150px minmax(0, 1fr); border-bottom: 1px solid #d4dbe3; }
-.discovered { margin: 12px 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); border: 1px solid #cbd3dd; }
-.discovered button { padding: 12px; display: grid; gap: 4px; text-align: left; border: 0; border-right: 1px solid #dce1e7; background: #fff; cursor: pointer; }
-.discovered span { color: #667184; font-size: 10px; }
+.promptEditor[readonly] { color: #354258; background: #f8f9fb; }
+.compatDefinition { display: grid; gap: 5px; color: #667184; font-size: 10px; }
+.compatDefinition select { min-width: 240px; }
+.promptWorkspace { min-height: 690px; display: grid; grid-template-columns: 190px 230px minmax(0, 1fr); border: 1px solid #c5ced9; background: #fff; }
+.promptNodeRail, .promptRevisionRail { min-width: 0; border-right: 1px solid #d4dbe3; }
+.promptNodeRail { padding: 12px 0; background: #f2f4f6; }
+.railLabel { padding: 0 13px 10px; display: block; color: #6b7686; font-size: 10px; font-weight: 750; }
+.promptNodeRail > button, .revisionItem { width: 100%; padding: 11px 13px; display: grid; gap: 5px; text-align: left; border: 0; background: transparent; cursor: pointer; }
+.promptNodeRail > button { min-height: 54px; border-left: 3px solid transparent; }
+.promptNodeRail > button:hover, .promptNodeRail > .selectedRailItem { color: #003f7f; background: #dfeafa; border-left-color: #07559d; }
+.promptNodeRail strong, .revisionItem strong { font-size: 12px; }
+.promptNodeRail small, .revisionItem small, .railHeading small { color: #6c7787; font-size: 10px; }
+.railHeading { min-height: 62px; padding: 12px; display: flex; align-items: center; gap: 9px; border-bottom: 1px solid #d4dbe3; }
+.railHeading div { min-width: 0; display: grid; gap: 4px; }
+.railHeading strong, .railHeading small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.revisionItem { min-height: 61px; border-bottom: 1px solid #e0e5ea; }
+.revisionItem:hover, .selectedRevision { background: #edf4fc; }
+.revisionItem > span { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.revisionItem em { padding: 2px 5px; color: #075d31; background: #e7f5ec; font-size: 9px; font-style: normal; }
+.railState, .railError { padding: 18px 12px; color: #687487; font-size: 11px; }
+.railError { color: #9a1f28; }
+.promptRevisionDetail { min-width: 0; padding: 24px; }
+.revisionHeader { margin-bottom: 18px; display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
+.revisionHeader h3 { margin: 5px 0 0; font-size: 20px; }
+.revisionStatus { display: flex; align-items: center; gap: 7px; }
+.revisionStatus span, .revisionStatus strong { padding: 4px 7px; font-size: 9px; }
+.revisionStatus span { color: #536074; background: #edf1f4; }
+.revisionStatus strong { color: #075d31; background: #e7f5ec; }
+.promptRevisionMeta { margin: 0 0 18px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid #d4dbe3; border-left: 1px solid #d4dbe3; }
+.promptRevisionMeta div { min-width: 0; padding: 10px; border-right: 1px solid #d4dbe3; border-bottom: 1px solid #d4dbe3; }
+.promptRevisionMeta dt { color: #697587; font-size: 9px; }
+.promptRevisionMeta dd { margin: 5px 0 0; overflow-wrap: anywhere; font-size: 11px; }
+.promptRevisionDetail > .actions { margin-top: 14px; justify-content: flex-end; flex-wrap: wrap; }
+.promptSkills { margin-top: 18px; border-top: 1px solid #d4dbe3; }
+.promptSkills h3 { margin: 15px 0 8px; font-size: 13px; }
+.promptSkills details { border-bottom: 1px solid #dce2e8; }
+.promptSkills summary { padding: 10px 2px; cursor: pointer; font-size: 11px; font-weight: 700; }
+.promptSkills pre { max-height: 320px; margin: 0 0 12px; padding: 12px; overflow: auto; color: #354258; background: #f5f7f9; font: 11px/1.6 Consolas, "Courier New", monospace; white-space: pre-wrap; }
 .notice, .error { margin: 0 0 16px; padding: 10px 12px; display: flex; align-items: center; gap: 8px; font-size: 12px; }
 .notice { color: #075d31; border-left: 3px solid #14834a; background: #eef8f2; }
 .error { color: #9a1f28; border-left: 3px solid #c51f2a; background: #fff0f1; }
@@ -90,26 +116,36 @@
   .layout { grid-template-columns: 190px minmax(0, 1fr); }
   .content { padding: 24px 20px 60px; }
   .metricBand { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .runtimeGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .inlineForm { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .promptWorkspace { grid-template-columns: 165px 205px minmax(0, 1fr); }
+  .promptRevisionDetail { padding: 20px; }
 }
 
 @media (max-width: 700px) {
   .topbar { height: 62px; padding: 0 14px; }
   .layout { display: block; }
   .sidebar { position: static; width: 100%; height: auto; padding: 12px; border-right: 0; border-bottom: 1px solid #cbd3dd; }
-  .agentSelectLabel, .sidebar > select, .versionPanel { display: none; }
+  .versionPanel { display: none; }
   .nav { margin: 0; display: flex; overflow-x: auto; }
   .nav button { min-width: 112px; grid-template-columns: 20px 1fr; }
   .nav button svg:last-child { display: none; }
   .content { padding: 20px 14px 56px; }
   .pageHeading { display: grid; }
   .metricBand { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .definitionGrid, .formGrid, .runtimeGrid { grid-template-columns: 1fr; }
+  .definitionGrid, .formGrid { grid-template-columns: 1fr; }
   .resourceList > div { grid-template-columns: 1fr; gap: 7px; }
   .inlineForm { grid-template-columns: 1fr; }
   .sectionHeading { display: grid; }
   .sectionHeading > select { width: 100%; min-width: 0; }
+  .compatDefinition select { width: 100%; min-width: 0; }
+  .promptWorkspace { min-height: 0; grid-template-columns: 1fr; }
+  .promptNodeRail { display: flex; overflow-x: auto; border-right: 0; border-bottom: 1px solid #d4dbe3; }
+  .promptNodeRail .railLabel { display: none; }
+  .promptNodeRail > button { min-width: 145px; border-left: 0; border-bottom: 3px solid transparent; }
+  .promptNodeRail > button:hover, .promptNodeRail > .selectedRailItem { border-bottom-color: #07559d; }
+  .promptRevisionRail { max-height: 260px; overflow-y: auto; border-right: 0; border-bottom: 1px solid #d4dbe3; }
+  .promptRevisionDetail { padding: 18px 14px; }
+  .promptRevisionMeta { grid-template-columns: 1fr; }
   .promptEditor { min-height: 360px !important; }
   .headerActions .user { display: none; }
 }

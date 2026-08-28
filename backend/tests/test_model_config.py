@@ -90,11 +90,13 @@ def test_api_key_is_encrypted_and_rotation_does_not_create_config_revision(sessi
     assert secret.version == 2
 
 
-def test_model_profile_draft_publish_only_changes_new_runs(session) -> None:
+def test_model_profile_draft_binding_changes_only_new_runs_without_publish(session) -> None:
     config = _settings()
     agent_service = AgentConfigService(session, config)
     agent_service.ensure_default_agent()
     old_run = agent_service.ensure_intake_run("old-intake")
+    old_snapshot = json.loads(json.dumps(old_run.resolved_config_snapshot))
+    old_config_hash = old_run.config_hash
     model_service = ModelConfigService(session, config)
     _, connection_revision = model_service.create_connection(
         name="Second Gateway",
@@ -119,14 +121,15 @@ def test_model_profile_draft_publish_only_changes_new_runs(session) -> None:
     agent_service.set_draft_node_model(
         draft.id, "intake_chat", profile_revision.id
     )
-    published = agent_service.publish_draft(draft.id)
     new_run = agent_service.ensure_intake_run("new-intake")
 
-    assert old_run.agent_version_id != published.id
+    assert old_run.agent_version_id != draft.id
+    assert old_run.resolved_config_snapshot == old_snapshot
+    assert old_run.config_hash == old_config_hash
     assert old_run.resolved_config_snapshot["nodes"]["intake_chat"]["model"][
         "model_id"
     ] != "customer-fast-model"
-    assert new_run.agent_version_id == published.id
+    assert new_run.agent_version_id == draft.id
     configured = new_run.resolved_config_snapshot["nodes"]["intake_chat"]["model"]
     assert configured["model_id"] == "customer-fast-model"
     assert configured["temperature"] == 0.2
@@ -136,7 +139,7 @@ def test_model_profile_draft_publish_only_changes_new_runs(session) -> None:
     ] == config.llm_model
     binding = session.scalar(
         select(AgentNodeBinding).where(
-            AgentNodeBinding.agent_version_id == published.id,
+            AgentNodeBinding.agent_version_id == draft.id,
             AgentNodeBinding.node_key == "intake_chat",
         )
     )

@@ -58,9 +58,8 @@ app.add_middleware(
 
     allow_credentials=True,
 
-    # 只允许前端使用 GET 和 POST 请求。
-    # GET 通常用于查询数据，POST 通常用于提交数据。
-    allow_methods=["GET", "POST"],
+    # 管理后台使用 PUT 保存可反复覆盖的工作稿。
+    allow_methods=["GET", "POST", "PUT"],
 
     # 允许前端请求携带任意请求头。
     # 请求头中可能包含身份信息、数据格式等内容。

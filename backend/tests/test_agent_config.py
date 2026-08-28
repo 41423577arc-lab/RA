@@ -11,13 +11,14 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.config import Settings
-from app.api.admin_models import get_agent, list_agents
+from app.api.admin_models import get_default_agent
 from app.database import SessionLocal
 from app.main import app
 from app.models.database import (
     AgentDefinition,
     AgentNodeBinding,
     AgentRun,
+    AgentToolBinding,
     AgentVersion,
     Base,
     Tenant,
@@ -143,23 +144,116 @@ def test_default_agent_seed_is_idempotent(session) -> None:
     assert definition.published_version_id == first.id
 
 
+def test_new_runs_use_published_version_when_no_draft_exists(session) -> None:
+    service = AgentConfigService(session, _settings())
+    published = service.ensure_default_agent()
+
+    intake_run = service.ensure_intake_run("published-intake")
+    task_run = service.ensure_task_run("published-task")
+
+    assert intake_run.agent_version_id == published.id
+    assert task_run.agent_version_id == published.id
+
+
+def test_new_runs_use_single_draft_and_existing_intake_run_stays_frozen(session) -> None:
+    service = AgentConfigService(session, _settings())
+    published = service.ensure_default_agent()
+    existing = service.ensure_intake_run("existing-intake")
+    existing_snapshot = json.loads(json.dumps(existing.resolved_config_snapshot))
+    existing_hash = existing.config_hash
+    draft = service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+
+    new_intake = service.ensure_intake_run("draft-intake")
+    new_task = service.ensure_task_run("draft-task")
+    reused = service.ensure_intake_run("existing-intake")
+
+    assert existing.agent_version_id == published.id
+    assert new_intake.agent_version_id == draft.id
+    assert new_task.agent_version_id == draft.id
+    assert reused.id == existing.id
+    assert reused.agent_version_id == published.id
+    assert reused.resolved_config_snapshot == existing_snapshot
+    assert reused.config_hash == existing_hash
+
+
+def test_new_run_rejects_multiple_drafts(session) -> None:
+    service = AgentConfigService(session, _settings())
+    service.ensure_default_agent()
+    service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+    service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+
+    with pytest.raises(ValueError, match="multiple draft versions"):
+        service.ensure_intake_run("ambiguous-draft-intake")
+
+
+def test_new_run_rejects_draft_with_unsupported_schema(session) -> None:
+    service = AgentConfigService(session, _settings())
+    service.ensure_default_agent()
+    draft = service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+    draft.config_schema_version += 1
+    session.commit()
+
+    with pytest.raises(ValueError, match="Unsupported agent config schema version"):
+        service.ensure_intake_run("invalid-schema-intake")
+
+
+def test_new_run_rejects_incomplete_draft_bindings(session) -> None:
+    service = AgentConfigService(session, _settings())
+    service.ensure_default_agent()
+    draft = service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
+    binding = session.scalar(
+        select(AgentToolBinding).where(
+            AgentToolBinding.agent_version_id == draft.id,
+            AgentToolBinding.logical_tool_key == "projects.search",
+        )
+    )
+    assert binding is not None
+    session.delete(binding)
+    session.commit()
+
+    with pytest.raises(ValueError, match="missing required logical tools"):
+        service.ensure_task_run("incomplete-draft-task")
+
+
 def test_agent_admin_detail_exposes_unified_version_configuration(session) -> None:
     AgentConfigService(session, _settings()).ensure_default_agent()
 
-    summaries = list_agents(session=session)
-    detail = get_agent(DEFAULT_AGENT_DEFINITION_ID, session=session)
+    detail = get_default_agent(session=session)
 
-    assert len(summaries) == 1
-    assert summaries[0].published_version.id == detail.published_version.id
     assert {node.node_key for node in detail.published_version.nodes} == set(
         NODE_REGISTRY
     )
-    assert detail.published_version.loop["max_loops"] >= 1
-    assert detail.published_version.output["formats"]
     assert {tool.logical_tool_key for tool in detail.published_version.tools} == {
         "identity.find_candidates",
         "projects.search",
     }
+
+
+def test_agent_admin_routes_expose_fixed_agent_without_runtime_editor() -> None:
+    route_paths = {route.path for route in app.routes}
+
+    assert "/api/v1/admin/agent" in route_paths
+    assert "/api/v1/admin/agents" not in route_paths
+    assert "/api/v1/admin/agent-versions/{agent_version_id}/runtime-config" not in route_paths
+    assert (
+        "/api/v1/admin/agent-versions/{agent_version_id}/nodes/{node_key}/prompt-working-copy"
+        in route_paths
+    )
+
+
+def test_prompt_working_copy_put_passes_browser_cors_preflight() -> None:
+    with TestClient(app) as client:
+        response = client.options(
+            "/api/v1/admin/agent-versions/draft-id/nodes/intake_chat/prompt-working-copy",
+            headers={
+                "Origin": "http://localhost:3000",
+                "Access-Control-Request-Method": "PUT",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+
+    assert response.status_code == 200
+    assert "PUT" in response.headers["access-control-allow-methods"]
 
 
 def test_secret_rotation_does_not_change_agent_version(session) -> None:
@@ -186,6 +280,8 @@ def test_behavior_change_publishes_new_version_without_changing_old_run(session)
     old_run = first_service.ensure_intake_run("intake-1")
     first_service.link_research_task("intake-1", "task-1")
     old_snapshot = json.loads(json.dumps(old_run.resolved_config_snapshot))
+    assert old_snapshot["loop"]["max_loops"] >= 1
+    assert old_snapshot["output"]["formats"]
 
     second_service = AgentConfigService(session, _settings(llm_model="model-v2"))
     second_version = second_service.ensure_default_agent()
@@ -203,42 +299,6 @@ def test_behavior_change_publishes_new_version_without_changing_old_run(session)
     ] == "model-v2"
     assert session.get(Tenant, SYSTEM_TENANT_ID) is not None
     assert session.scalar(select(func.count()).select_from(AgentRun)) == 2
-
-
-def test_draft_runtime_config_only_changes_new_runs(session) -> None:
-    service = AgentConfigService(session, _settings())
-    service.ensure_default_agent()
-    old_run = service.ensure_intake_run("runtime-old")
-    draft = service.create_draft(DEFAULT_AGENT_DEFINITION_ID)
-    service.set_draft_runtime_config(
-        draft.id,
-        loop={
-            "max_loops": 12,
-            "max_tool_calls": 30,
-            "max_repeated_actions": 4,
-            "identity_auto_accept_threshold": 0.91,
-            "intake_agent_v2_enabled": True,
-            "intake_entity_resolution_enabled": True,
-            "intake_react_enabled": True,
-        },
-        output={
-            "formats": ["detailed_markdown"],
-            "evidence_validation_required": False,
-        },
-    )
-    published = service.publish_draft(draft.id)
-    new_run = service.ensure_intake_run("runtime-new")
-
-    assert old_run.resolved_config_snapshot["loop"]["max_loops"] != 12
-    assert new_run.agent_version_id == published.id
-    assert new_run.resolved_config_snapshot["loop"]["max_loops"] == 12
-    assert new_run.resolved_config_snapshot["output"]["formats"] == [
-        "detailed_markdown"
-    ]
-    assert new_run.resolved_config_snapshot["output"][
-        "evidence_validation_required"
-    ] is False
-    assert new_run.resolved_config_snapshot["output"]["templates"]
 
 
 def test_resolver_rejects_mutated_published_binding(session) -> None:

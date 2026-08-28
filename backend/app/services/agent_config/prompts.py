@@ -223,6 +223,81 @@ class PromptConfigService:
         resolved = self.resolve_revision(revision_id)
         return resolved["validation_report"]
 
+    def build_working_copy(
+        self,
+        base_revision_id: str,
+        *,
+        expected_node_key: str,
+        content: str | None = None,
+        skills: list[dict] | None = None,
+    ) -> dict:
+        base = self.resolve_revision(
+            base_revision_id,
+            expected_node_key=expected_node_key,
+        )
+        normalized_content = (
+            base["content"] if content is None else content.strip() + "\n"
+        )
+        normalized_skills, report = self.validate_prompt(
+            node_key=expected_node_key,
+            content=normalized_content,
+            skills=base["skills"] if skills is None else skills,
+        )
+        payload = self._revision_payload(
+            node_key=expected_node_key,
+            content=normalized_content,
+            skills=normalized_skills,
+            required_variables=report["required_variables"],
+        )
+        working_hash = canonical_hash(
+            {
+                "prompt_definition_id": base["prompt_definition_id"],
+                "base_revision_id": base_revision_id,
+                **payload,
+            }
+        )
+        return {
+            "prompt_definition_id": base["prompt_definition_id"],
+            "revision_id": base_revision_id,
+            "base_revision_id": base_revision_id,
+            "version": base["version"],
+            "node_key": expected_node_key,
+            "content_hash": canonical_hash(normalized_content),
+            "config_hash": working_hash,
+            "content": normalized_content,
+            "source": "working",
+            "required_variables": report["required_variables"],
+            "skills": normalized_skills,
+            "validation_report": report,
+            "smoke_test_status": "NOT_RUN",
+            "working": True,
+        }
+
+    def resolve_working_copy(
+        self,
+        prompt_config: dict,
+        *,
+        base_revision_id: str,
+        expected_node_key: str,
+    ) -> dict:
+        if prompt_config.get("working") is not True:
+            raise ValueError(f"Prompt is not a Working Copy: {expected_node_key}")
+        if prompt_config.get("base_revision_id") != base_revision_id:
+            raise ValueError(
+                f"Working Prompt base revision mismatch: {expected_node_key}"
+            )
+        expected = self.build_working_copy(
+            base_revision_id,
+            expected_node_key=expected_node_key,
+            content=str(prompt_config.get("content", "")),
+            skills=prompt_config.get("skills"),
+        )
+        if canonical_hash(prompt_config) != canonical_hash(expected):
+            raise ValueError(
+                f"Working Prompt failed integrity validation: {expected_node_key}"
+            )
+        return expected
+
     def validate_prompt(
         self,
         *,

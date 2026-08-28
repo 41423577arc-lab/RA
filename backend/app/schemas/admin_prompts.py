@@ -53,3 +53,8 @@ class PromptValidationResponse(BaseModel):
 
 class NodePromptBindingRequest(BaseModel):
     prompt_revision_id: str
+
+
+class PromptWorkingCopyUpdate(BaseModel):
+    content: str = Field(min_length=1, max_length=200_000)
+    skills: list[PromptSkillInput] | None = Field(default=None, max_length=20)
